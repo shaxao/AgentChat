@@ -1,4 +1,4 @@
-# WorkBuddy / MuHuo AI Platform
+# MuHuo AI Platform
 
 一个面向真实业务的 AI 对话与代码开发平台。项目由 Java 主系统、React 前端、Python AutoCode Agent 平台、Windows 本地连接器和学习文档站组成，覆盖模型渠道管理、聊天对话、用户与订阅、支付计费、工作流、代码开发 Agent、本地项目执行等能力。
 

@@ -347,4 +347,4 @@ npm run docs:dev
 
 ## License
 
-本项目使用 [MIT License](./LICENSE)。
+本项目使用 [GNU Affero General Public License v3.0](./LICENSE)（AGPL-3.0）。

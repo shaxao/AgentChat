@@ -347,4 +347,4 @@ npm run docs:dev
 
 ## License
 
-当前仓库尚未声明开源许可证。上传 GitHub 前请根据你的发布目标补充 `LICENSE` 文件。
+本项目使用 [MIT License](./LICENSE)。

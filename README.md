@@ -345,6 +345,10 @@ npm run docs:dev
 - AutoCode 的高风险命令必须走审批策略，本地连接器不应绕过权限控制。
 - 生产环境建议开启 HTTPS，并通过 Nginx 统一转发 `/api/`、`/autocode-api/`、`/autocode/`、`/learn/`。
 
+## 友情链接
+
+- [Linux.do](https://linux.do/)
+
 ## License
 
 本项目使用 [GNU Affero General Public License v3.0](./LICENSE)（AGPL-3.0）。

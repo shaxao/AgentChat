@@ -1,0 +1,11 @@
+package com.aiplatform.backend.billing;
+
+public enum BillingErrorCode {
+    OK,
+    SCENE_DISABLED,
+    SCENE_QUOTA_INSUFFICIENT,
+    USER_WALLET_INSUFFICIENT,
+    USER_WALLET_FALLBACK_EXHAUSTED,
+    UPSTREAM_QUOTA_INSUFFICIENT,
+    INTERNAL_ERROR
+}

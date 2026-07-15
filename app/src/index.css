@@ -1,0 +1,599 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ===== Base Theme Variables ===== */
+@layer base {
+  :root {
+    --mobile-nav-height: 3.5rem;
+    --mobile-safe-bottom: max(env(safe-area-inset-bottom), 8px);
+    --mobile-browser-bottom: 0px;
+    --mobile-bottom-nav-space: calc(var(--mobile-nav-height) + var(--mobile-safe-bottom) + var(--mobile-browser-bottom));
+    --background: 0 0% 100%;
+    --foreground: 222.2 84% 4.9%;
+    --card: 0 0% 100%;
+    --card-foreground: 222.2 84% 4.9%;
+    --popover: 0 0% 100%;
+    --popover-foreground: 222.2 84% 4.9%;
+    --primary: 221.2 83.2% 53.3%;
+    --primary-foreground: 210 40% 98%;
+    --secondary: 210 40% 96.1%;
+    --secondary-foreground: 222.2 47.4% 11.2%;
+    --muted: 210 40% 96.1%;
+    --muted-foreground: 215.4 16.3% 46.9%;
+    --accent: 210 40% 96.1%;
+    --accent-foreground: 222.2 47.4% 11.2%;
+    --destructive: 0 84.2% 60.2%;
+    --destructive-foreground: 210 40% 98%;
+    --border: 214.3 31.8% 91.4%;
+    --input: 214.3 31.8% 91.4%;
+    --ring: 221.2 83.2% 53.3%;
+    --radius: 0.75rem;
+    --sidebar-background: 220 20% 97%;
+    --sidebar-foreground: 222.2 84% 4.9%;
+    --sidebar-primary: 221.2 83.2% 53.3%;
+    --sidebar-primary-foreground: 210 40% 98%;
+    --sidebar-accent: 210 40% 94%;
+    --sidebar-accent-foreground: 222.2 47.4% 11.2%;
+    --sidebar-border: 214.3 31.8% 89%;
+    --sidebar-ring: 221.2 83.2% 53.3%;
+  }
+
+  /*
+   * ════════════════════════════════════════════
+   *  Dark Theme — "Obsidian" (OpenRouter / Linear 风格)
+   *
+   *  设计哲学：纯黑底色 + 中性灰层级 + 极简边框
+   *  - 背景：近纯黑，无蓝/紫色调
+   *  - 层级：bg(3.5%) < card(7%) < muted(10%) < secondary(11%) < border(14%)
+   *  - 边框：极低对比度（14%），几乎不可见，靠明暗区分而非线条
+   *  - 主色：保持品牌色（默认蓝），仅在交互元素上出现
+   *  - 文字：高对比度白/浅灰，辅助信息用中性灰弱化
+   * ════════════════════════════════════════════
+   */
+  .dark {
+    /* ── 底色层 ─────────────────────────────── */
+    --background: 0 0% 3.5%;           /* #090909 近纯黑 */
+    --foreground: 0 0% 96%;            /* #f5f5f5 接近纯白 */
+
+    /* ── 卡片 / 弹出层 ───────────────────────── */
+    --card: 0 0% 7%;                   /* #121212 略高于底色 */
+    --card-foreground: 0 0% 96%;
+    --popover: 0 0% 7%;
+    --popover-foreground: 0 0% 96%;
+
+    /* ── 品牌主色（仅用于按钮、链接、焦点环）─── */
+    --primary: 217 91% 60%;            /* #3b82f6 干净的蓝 */
+    --primary-foreground: 0 0% 100%;   /* #fff 白字 */
+
+    /* ── 次要表面（按钮次要态、标签背景）────── */
+    --secondary: 0 0% 11%;             /* #1c1c1c */
+    --secondary-foreground: 0 0% 85%;
+
+    /* ── 弱化区域（悬停、AI 气泡、代码行）──── */
+    --muted: 0 0% 10%;                 /* #1a1a1a */
+    --muted-foreground: 0 0% 45%;      /* #737373 中性灰，无色调 */
+
+    /* ── 强调区（选中项、active 状态）───────── */
+    --accent: 0 0% 10%;
+    --accent-foreground: 0 0% 95%;
+
+    /* ── 危险色 ─────────────────────────────── */
+    --destructive: 0 72% 51%;          /* #dc2626 纯正红 */
+    --destructive-foreground: 0 0% 98%;
+
+    /* ── 边框 & 输入框（极低对比度）─────────── */
+    --border: 0 0% 14%;                /* #242424 几乎不可见 */
+    --input: 0 0% 14%;
+
+    /* ── 焦点环（比 primary 更沉稳）─────────── */
+    --ring: 217 91% 55%;
+
+    /* ── 侧边栏 ─────────────────────────────── */
+    --sidebar-background: 0 0% 3%;     /* #080808 同族但略深于主背景 */
+    --sidebar-foreground: 0 0% 88%;    /* #e0e0e0 */
+    --sidebar-primary: 217 91% 60%;
+    --sidebar-primary-foreground: 0 0% 100%;
+    --sidebar-accent: 0 0% 10%;
+    --sidebar-accent-foreground: 0 0% 92%;
+    --sidebar-border: 0 0% 12%;         /* #1f1f1f */
+    --sidebar-ring: 217 91% 55%;
+  }
+
+  /* Green theme */
+  .theme-green {
+    --primary: 142.1 76.2% 36.3%;
+    --primary-foreground: 355.7 100% 97.3%;
+    --ring: 142.1 76.2% 36.3%;
+    --sidebar-primary: 142.1 76.2% 36.3%;
+  }
+
+  /* Purple theme */
+  .theme-purple {
+    --primary: 262.1 83.3% 57.8%;
+    --primary-foreground: 210 40% 98%;
+    --ring: 262.1 83.3% 57.8%;
+    --sidebar-primary: 262.1 83.3% 57.8%;
+  }
+
+  /* Orange theme */
+  .theme-orange {
+    --primary: 24.6 95% 53.1%;
+    --primary-foreground: 60 9.1% 97.8%;
+    --ring: 24.6 95% 53.1%;
+    --sidebar-primary: 24.6 95% 53.1%;
+  }
+
+  /* Rose theme */
+  .theme-rose {
+    --primary: 346.8 77.2% 49.8%;
+    --primary-foreground: 355.7 100% 97.3%;
+    --ring: 346.8 77.2% 49.8%;
+    --sidebar-primary: 346.8 77.2% 49.8%;
+  }
+
+  * {
+    @apply border-border;
+  }
+
+  html, body {
+    height: 100%;
+    overflow: hidden;
+    overscroll-behavior: none;
+    -webkit-overflow-scrolling: touch;
+  }
+
+  body {
+    @apply bg-background text-foreground;
+    font-feature-settings: "rlig" 1, "calt" 1;
+  }
+}
+
+/* ===== Scrollbar ===== */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: hsl(var(--muted-foreground) / 0.3);
+  border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: hsl(var(--muted-foreground) / 0.5);
+}
+
+/* ===== Code Highlight ===== */
+/* 只覆盖背景，不覆盖颜色，让 github-dark 主题的 token 颜色生效 */
+.hljs {
+  background: hsl(0 0% 7%) !important;   /* 与 --card 对齐 */
+  padding: 0 !important;  /* padding 由外层 pre 控制 */
+  font-size: 0.875rem !important;
+  line-height: 1.5 !important;
+}
+
+/* ===== Chat message prose ===== */
+.chat-prose {
+  @apply text-sm leading-relaxed;
+  /* 防止长内容（URL、代码）撑破父容器 */
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  min-width: 0;
+  max-width: 100%;
+  /* 让内容换行而非隐藏 */
+  overflow: visible;
+}
+
+/* 约束 HTML 渲染的 div 不超出气泡 */
+.chat-prose > div {
+  max-width: 100%;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  min-width: 0;
+}
+
+.chat-prose p {
+  @apply mb-2 last:mb-0;
+}
+
+.chat-prose pre {
+  @apply my-3 rounded-lg overflow-x-auto;
+  max-width: 100%;
+}
+
+.chat-prose pre code {
+  white-space: pre; /* 保持代码格式，依靠父级 overflow-x: auto 滚动 */
+  word-break: normal;
+  overflow-wrap: normal;
+  display: block; /* 覆盖 style.css 中全局 code 的 inline-flex，避免破坏 pre 滚动 */
+  padding: 0;
+  background: transparent;
+}
+
+.chat-prose code:not(pre code) {
+  @apply bg-muted px-1.5 py-0.5 rounded text-xs font-mono;
+}
+
+.chat-prose .math-inline,
+.thinking-content .math-inline {
+  display: inline-block;
+  max-width: 100%;
+  vertical-align: -0.12em;
+}
+
+.chat-prose .math-block,
+.thinking-content .math-block {
+  display: block;
+  max-width: 100%;
+  margin: 0.75rem 0;
+  overflow-x: auto;
+  overflow-y: hidden;
+  padding: 0.25rem 0;
+}
+
+.chat-prose math,
+.thinking-content math {
+  font-size: 1.05em;
+  line-height: 1.5;
+}
+
+.chat-prose .math-block math,
+.thinking-content .math-block math {
+  min-width: max-content;
+}
+
+.chat-prose .math-inline .katex,
+.thinking-content .math-inline .katex {
+  font-size: 1.05em;
+}
+
+.chat-prose .math-block .katex-display,
+.thinking-content .math-block .katex-display {
+  margin: 0;
+  overflow-x: auto;
+  overflow-y: hidden;
+  padding: 0.15rem 0;
+}
+
+.chat-prose ul,
+.chat-prose ol {
+  @apply pl-4 mb-2;
+}
+
+.chat-prose ul {
+  @apply list-disc;
+}
+
+.chat-prose ol {
+  @apply list-decimal;
+}
+
+.chat-prose li {
+  @apply mb-1;
+}
+
+.chat-prose h1, .chat-prose h2, .chat-prose h3 {
+  @apply font-semibold mb-2;
+}
+
+.chat-prose h1 { @apply text-xl; }
+.chat-prose h2 { @apply text-lg; }
+.chat-prose h3 { @apply text-base; }
+
+.chat-prose table {
+  @apply w-full border-collapse border border-border my-3 text-sm;
+  /* 覆盖 AI 内联样式，强制使用主题色 */
+  background-color: hsl(var(--card)) !important;
+  color: hsl(var(--foreground)) !important;
+}
+
+.chat-prose th {
+  @apply px-3 py-2 text-left font-medium border border-border;
+  background-color: hsl(var(--muted)) !important;
+  color: hsl(var(--foreground)) !important;
+}
+
+.chat-prose td {
+  @apply px-3 py-2 border border-border;
+  background-color: hsl(var(--card)) !important;
+  color: hsl(var(--foreground)) !important;
+}
+
+/* 深色模式下，覆盖 AI 常见白色/浅色背景的内联样式 */
+.dark .chat-prose [style*="background-color: #fff"],
+.dark .chat-prose [style*="background-color:#fff"],
+.dark .chat-prose [style*="background-color: rgb(255"],
+.dark .chat-prose [style*="background-color:rgb(255"],
+.dark .chat-prose [style*="background: #fff"],
+.dark .chat-prose [style*="background:#fff"],
+.dark .chat-prose [style*="background: rgb(255"],
+.dark .chat-prose [style*="background:rgb(255"],
+.dark .chat-prose [style*="background-color: white"],
+.dark .chat-prose [style*="background-color:white"] {
+  background-color: hsl(var(--card)) !important;
+  color: hsl(var(--foreground)) !important;
+}
+
+.chat-prose blockquote {
+  @apply border-l-4 border-primary pl-4 my-2 italic text-muted-foreground;
+}
+
+/* ===== Typing cursor ===== */
+.typing-cursor::after {
+  content: '▋';
+  animation: typing 1s infinite;
+  margin-left: 2px;
+}
+
+/* ===== Animation ===== */
+@keyframes message-in {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.message-animate {
+  animation: message-in 0.2s ease-out;
+  /* 🔴 OOM 防御 — CSS 渲染隔离（浏览器进程级 OOM 修复）
+   *
+   * content-visibility: auto — 浏览器自动跳过视口外元素的内容渲染
+   * （布局、绘制都不做），节省 90%+ 渲染内存。
+   *
+   * contain: layout style paint — CSS containment，隔离每条消息的
+   * 布局/样式/绘制影响范围，防止一个消息的 layout-recalc 扩散到整页。
+   *
+   * contain-intrinsic-size — 提供预估高度，让滚动条位置正确。
+   *
+   * 为何需要？Virtuoso 虚拟滚动已移除，50 条消息全在 DOM 中，
+   * 每条消息 through marked + dangerouslySetInnerHTML 产生 100+ DOM 节点，
+   * 无优化时浏览器需要对 5000+ 节点做完整 layout → 渲染进程 OOM。
+   */
+  content-visibility: auto;
+  contain: layout style;
+  contain-intrinsic-size: auto 80px;
+}
+
+/* ===== Resize handle ===== */
+[data-panel-group-direction="horizontal"] > [data-resize-handle] {
+  width: 4px;
+  background: hsl(var(--border));
+  transition: background 0.2s;
+  cursor: col-resize;
+}
+
+[data-panel-group-direction="horizontal"] > [data-resize-handle]:hover,
+[data-panel-group-direction="horizontal"] > [data-resize-handle][data-resize-handle-active] {
+  background: hsl(var(--primary));
+}
+
+/* ===== Mobile Optimizations ===== */
+
+/* 防止移动端双击缩放 */
+button, a, input, textarea, select {
+  touch-action: manipulation;
+}
+
+/* iOS 安全区域适配 */
+.safe-area-bottom {
+  padding-bottom: env(safe-area-inset-bottom, 0px);
+}
+
+.app-viewport {
+  height: 100vh;
+  height: 100svh;
+  height: 100dvh;
+  min-height: 0;
+}
+
+.autocode-mobile-shell {
+  height: calc(100dvh - var(--mobile-bottom-nav-space));
+  min-height: 0;
+}
+
+@media (min-width: 1024px) {
+  .autocode-mobile-shell {
+    height: 100%;
+  }
+}
+
+@media (min-width: 768px) {
+  :root {
+    --mobile-nav-height: 0px;
+    --mobile-safe-bottom: 0px;
+    --mobile-browser-bottom: 0px;
+    --mobile-bottom-nav-space: 0px;
+  }
+}
+
+.mobile-scroll-bottom-safe {
+  scroll-padding-bottom: calc(var(--mobile-bottom-nav-space) + 1rem);
+}
+
+@media (max-width: 767px) {
+  .mobile-scroll-bottom-safe {
+    padding-bottom: calc(var(--mobile-bottom-nav-space) + 1rem);
+  }
+
+  .mobile-scroll-bottom-safe > :last-child {
+    margin-bottom: 0;
+  }
+}
+
+/* 移动端代码块水平滚动 */
+@media (max-width: 640px) {
+  .chat-scroll-container {
+    scroll-padding-bottom: calc(var(--mobile-bottom-nav-space) + 8rem);
+  }
+
+  .mobile-ai-message {
+    width: 100%;
+    max-width: 100%;
+  }
+
+  .mobile-ai-message .chat-prose {
+    font-size: 0.95rem;
+    line-height: 1.82;
+    letter-spacing: 0;
+  }
+
+  .mobile-ai-message .chat-prose h1,
+  .mobile-ai-message .chat-prose h2 {
+    margin-top: 1rem;
+    margin-bottom: 0.75rem;
+    line-height: 1.25;
+  }
+
+  .mobile-ai-message .chat-prose p,
+  .mobile-ai-message .chat-prose li {
+    word-break: break-word;
+    overflow-wrap: anywhere;
+  }
+
+  .mobile-ai-message .rounded-xl,
+  .mobile-ai-message .rounded-2xl {
+    max-width: 100%;
+  }
+
+  .mobile-ai-message iframe {
+    min-height: 18rem;
+  }
+
+  .chat-prose pre {
+    @apply my-2;
+    /* 代码块自己可横向滚动，不撑破父容器 */
+    max-width: 100%;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+  }
+
+  .chat-prose pre code {
+    font-size: 0.78rem !important;
+    line-height: 1.55 !important;
+    white-space: pre; /* 保持代码格式，依靠父级 overflow-x: auto 滚动 */
+  }
+
+  /* 表格横向滚动 */
+  .chat-prose table {
+    display: block;
+    max-width: 100%;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+  }
+
+  /* HTML 内嵌 div 横向约束 */
+  .chat-prose > div,
+  .chat-prose > div > div {
+    max-width: 100% !important;
+    overflow-wrap: anywhere !important;
+    word-break: break-word !important;
+  }
+
+  /* 移动端输入框聚焦时防止页面缩放 */
+  input, textarea, select {
+    font-size: 16px !important;
+  }
+}
+
+/* 移动端底部抽屉动画 */
+@keyframes slide-up {
+  from { transform: translateY(100%); }
+  to { transform: translateY(0); }
+}
+
+.mobile-sheet-enter {
+  animation: slide-up 0.3s ease-out;
+}
+
+/* ===== Animated Avatar (LobeChat-style) ===== */
+/* 参考 LobeChat 头像动效：呼吸 + 脉动光晕 + 缓慢旋转 */
+
+/* 呼吸灯效果 — 流式输出时头像背景柔和地明暗变化 */
+@keyframes avatar-breathe {
+  0%, 100% {
+    background-image: linear-gradient(135deg, hsl(var(--primary)), hsl(var(--primary) / 0.8));
+  }
+  50% {
+    background-image: linear-gradient(135deg, hsl(var(--primary) / 0.85), hsl(var(--primary)));
+  }
+}
+
+.animate-avatar-breathe {
+  animation: avatar-breathe 2.5s ease-in-out infinite;
+}
+
+/* 外层脉动光晕 — 从中心向外扩散的柔和光环 */
+@keyframes avatar-glow-outer {
+  0%, 100% {
+    transform: scale(1);
+    opacity: 0.4;
+  }
+  50% {
+    transform: scale(1.25);
+    opacity: 0.15;
+  }
+}
+
+.animate-avatar-glow-outer {
+  animation: avatar-glow-outer 2s ease-in-out infinite;
+}
+
+/* 内层脉动光晕 — 稍快一点，形成层次感 */
+@keyframes avatar-glow-inner {
+  0%, 100% {
+    transform: scale(1);
+    opacity: 0.5;
+  }
+  50% {
+    transform: scale(1.12);
+    opacity: 0.25;
+  }
+}
+
+.animate-avatar-glow-inner {
+  animation: avatar-glow-inner 2s ease-in-out infinite;
+  animation-delay: 0.3s; /* 与外层错开相位 */
+}
+
+/* 整体脉冲 — 让整个头像区域有轻微缩放 */
+@keyframes avatar-pulse {
+  0%, 100% {
+    box-shadow: 0 0 0 0 hsl(var(--primary) / 0.3);
+  }
+  50% {
+    box-shadow: 0 0 0 6px hsl(var(--primary) / 0);
+  }
+}
+
+.animate-avatar-pulse {
+  animation: avatar-pulse 2s ease-in-out infinite;
+}
+
+/* 缓慢旋转指示器 — 模拟"思考中"状态 */
+@keyframes avatar-spin-slow {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
+.animate-avatar-spin-slow {
+  animation: avatar-spin-slow 3s linear infinite;
+}
+
+/* 🔥 内联输入框生成中脉冲边框动画 */
+@keyframes pulse-border {
+  0%, 100% { border-color: hsl(var(--primary) / 0.3); }
+  50% { border-color: hsl(var(--primary) / 0.6); }
+}
+
+.animate-pulse-border {
+  animation: pulse-border 2s ease-in-out infinite;
+}

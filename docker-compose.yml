@@ -1,0 +1,217 @@
+services:
+
+  # ========== MySQL 数据库 ==========
+  mysql:
+    image: mysql:8.0
+    container_name: aiplatform-mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-rootpassword}
+      MYSQL_DATABASE: ${DB_NAME:-aiplatform}
+      MYSQL_USER: ${DB_USERNAME:-aiplatform}
+      MYSQL_PASSWORD: ${DB_PASSWORD:-changeme}
+      TZ: Asia/Shanghai
+      # 默认字符集，确保数据库和表使用 UTF-8
+      MYSQL_CHARACTER_SET_SERVER: utf8mb4
+      MYSQL_COLLATION_SERVER: utf8mb4_unicode_ci
+    volumes:
+      - mysql_data:/var/lib/mysql
+      # 首次启动自动执行 schema.sql 初始化表结构和基础数据
+      - ./backend/src/main/resources/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+      - ./backend/src/main/resources/data.sql:/docker-entrypoint-initdb.d/02-data.sql:ro
+    ports:
+      - "${MYSQL_PORT:-3306}:3306"
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-p${MYSQL_ROOT_PASSWORD:-rootpassword}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    networks:
+      - aiplatform-net
+
+  # ========== Redis 缓存 ==========
+  redis:
+    image: redis:7-alpine
+    container_name: aiplatform-redis
+    restart: unless-stopped
+    command: >
+      redis-server
+      --requirepass ${REDIS_PASSWORD:-redispassword}
+      --maxmemory 256mb
+      --maxmemory-policy allkeys-lru
+      --save 60 1
+      --appendonly yes
+    environment:
+      TZ: Asia/Shanghai
+    volumes:
+      - redis_data:/data
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD:-redispassword}", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - aiplatform-net
+
+  # ========== Spring Boot 后端 ==========
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: aiplatform-backend
+    restart: unless-stopped
+    environment:
+      TZ: Asia/Shanghai
+      # 数据库
+      DB_HOST: mysql
+      DB_PORT: 3306
+      DB_NAME: ${DB_NAME:-aiplatform}
+      DB_USERNAME: ${DB_USERNAME:-aiplatform}
+      DB_PASSWORD: ${DB_PASSWORD:-changeme}
+      # Redis
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-redispassword}
+      # JWT
+      JWT_SECRET: ${JWT_SECRET:-change-this-to-a-very-long-random-secret-key-at-least-64-characters}
+      # 邮件
+      MAIL_HOST: ${MAIL_HOST:-smtp.qq.com}
+      MAIL_PORT: ${MAIL_PORT:-587}
+      MAIL_USERNAME: ${MAIL_USERNAME}
+      MAIL_PASSWORD: ${MAIL_PASSWORD}
+      # AI API
+      AI_API_KEY: ${AI_API_KEY:-}
+      AI_BASE_URL: ${AI_BASE_URL:-https://api.openai.com/v1}
+      AI_DEFAULT_MODEL: ${AI_DEFAULT_MODEL:-gpt-4o-mini}
+    volumes:
+      - backend_logs:/app/logs
+    ports:
+      - "${BACKEND_PORT:-8080}:8080"
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/api/plans"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    networks:
+      - aiplatform-net
+
+  # ========== React 前端 + Nginx ==========
+  frontend:
+    build:
+      context: ./app
+      dockerfile: Dockerfile
+      args:
+        # 使用相对路径 /api，由 Nginx 代理到后端（不暴露后端地址）
+        VITE_API_URL: /api
+        VITE_AUTOCODE_API_URL: /autocode-api
+        VITE_DEMO_MODE: "false"
+    container_name: aiplatform-frontend
+    restart: unless-stopped
+    environment:
+      TZ: Asia/Shanghai
+    ports:
+      - "${FRONTEND_PORT:-80}:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    networks:
+      - aiplatform-net
+
+  # ========== AutoCode Backend (FastAPI Agent 编排) ==========
+  autocode-backend:
+    build:
+      context: ./agent-platform/backend
+      dockerfile: Dockerfile
+    container_name: autocode-backend
+    restart: unless-stopped
+    environment:
+      TZ: Asia/Shanghai
+      # 从 MuhugoChat 渠道表自动读取 Anthropic 凭据
+      # 注意：默认值使用生产环境真实配置（.env 优先覆盖）
+      MUHUGOCHAT_DB_HOST: ${MUHUGOCHAT_DB_HOST:-aiplatform-mysql}
+      MUHUGOCHAT_DB_PORT: ${MUHUGOCHAT_DB_PORT:-3306}
+      MUHUGOCHAT_DB_NAME: ${MUHUGOCHAT_DB_NAME:-MuHuoAi}
+      MUHUGOCHAT_DB_USER: ${MUHUGOCHAT_DB_USER:-muhuoai}
+      MUHUGOCHAT_DB_PASSWORD: ${MUHUGOCHAT_DB_PASSWORD:-changeme}
+      # Workspace 目录
+      WORKSPACE_BASE_DIR: /app/workspaces
+      # Docker-in-Docker（通过挂载宿主机 socket）
+      DOCKER_HOST: unix:///var/run/docker.sock
+      # Vercel Token（可选，用于一键部署）
+      VERCEL_API_TOKEN: ${VERCEL_API_TOKEN:-}
+    volumes:
+      # Workspace 持久化
+      - autocode_workspaces:/app/workspaces
+      # 挂载宿主机 Docker socket（容器内通过 Docker SDK 操控宿主机 Docker）
+      - /var/run/docker.sock:/var/run/docker.sock
+    ports:
+      - "${AUTOCODE_BACKEND_PORT:-8000}:8000"
+    depends_on:
+      mysql:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    networks:
+      - aiplatform-net
+
+  # ========== AutoCode Frontend (Next.js 15) ==========
+  autocode-frontend:
+    build:
+      context: ./agent-platform/frontend
+      dockerfile: Dockerfile
+      args:
+        # 构建时注入：浏览器通过此地址访问后端（走宿主机 localhost）
+        NEXT_PUBLIC_API_URL: ${AUTOCODE_API_URL:-http://localhost:8000}
+    container_name: autocode-frontend
+    restart: unless-stopped
+    environment:
+      TZ: Asia/Shanghai
+      # 运行时：容器内部 Node 进程通过此地址调用后端（走 Docker 内网）
+      NEXT_PUBLIC_API_URL: http://autocode-backend:8000
+    ports:
+      - "${AUTOCODE_FRONTEND_PORT:-3000}:3000"
+    depends_on:
+      autocode-backend:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:3000"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 40s
+    networks:
+      - aiplatform-net
+
+# ========== 数据卷 ==========
+volumes:
+  mysql_data:
+    driver: local
+  redis_data:
+    driver: local
+  backend_logs:
+    driver: local
+  autocode_workspaces:
+    driver: local
+
+# ========== 网络 ==========
+networks:
+  aiplatform-net:
+    driver: bridge

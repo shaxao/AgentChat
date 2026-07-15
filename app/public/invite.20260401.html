@@ -1,0 +1,432 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>邀请加入 - MuHuoChat</title>
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', sans-serif;
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 20px;
+    }
+
+    .invite-container {
+      background: white;
+      border-radius: 16px;
+      box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
+      max-width: 480px;
+      width: 100%;
+      padding: 40px;
+      text-align: center;
+    }
+
+    .logo {
+      width: 80px;
+      height: 80px;
+      margin: 0 auto 24px;
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      border-radius: 20px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 36px;
+      color: white;
+      font-weight: bold;
+    }
+
+    h1 {
+      font-size: 28px;
+      color: #1a1a1a;
+      margin-bottom: 12px;
+      font-weight: 600;
+    }
+
+    .invite-info {
+      color: #666;
+      font-size: 16px;
+      line-height: 1.6;
+      margin-bottom: 32px;
+    }
+
+    .inviter-name {
+      color: #667eea;
+      font-weight: 600;
+    }
+
+    .workspace-info {
+      background: #f8f9fa;
+      border-radius: 12px;
+      padding: 20px;
+      margin-bottom: 24px;
+      text-align: left;
+    }
+
+    .workspace-name {
+      font-size: 18px;
+      font-weight: 600;
+      color: #1a1a1a;
+      margin-bottom: 8px;
+    }
+
+    .workspace-desc {
+      font-size: 14px;
+      color: #666;
+      line-height: 1.5;
+    }
+
+    .hint-text {
+      background: #fff3cd;
+      border: 1px solid #ffc107;
+      border-radius: 8px;
+      padding: 16px;
+      margin-bottom: 16px;
+      color: #856404;
+      font-size: 14px;
+      line-height: 1.6;
+    }
+
+    .btn {
+      width: 100%;
+      padding: 14px 24px;
+      border: none;
+      border-radius: 8px;
+      font-size: 16px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 0.3s ease;
+      margin-bottom: 12px;
+    }
+
+    .btn-primary {
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      color: white;
+    }
+
+    .btn-primary:hover {
+      transform: translateY(-2px);
+      box-shadow: 0 8px 20px rgba(102, 126, 234, 0.4);
+    }
+
+    .btn-secondary {
+      background: white;
+      color: #667eea;
+      border: 2px solid #667eea;
+    }
+
+    .btn-secondary:hover {
+      background: #f8f9fa;
+    }
+
+    .btn-create {
+      background: #28a745;
+      color: white;
+    }
+
+    .btn-create:hover {
+      background: #218838;
+      transform: translateY(-2px);
+      box-shadow: 0 8px 20px rgba(40, 167, 69, 0.4);
+    }
+
+    /* 弹窗样式 */
+    .modal-overlay {
+      display: none;
+      position: fixed;
+      top: 0;
+      left: 0;
+      right: 0;
+      bottom: 0;
+      background: rgba(0, 0, 0, 0.5);
+      align-items: center;
+      justify-content: center;
+      z-index: 1000;
+    }
+
+    .modal-overlay.active {
+      display: flex;
+    }
+
+    .modal {
+      background: white;
+      border-radius: 16px;
+      padding: 32px;
+      max-width: 400px;
+      width: 90%;
+      box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
+    }
+
+    .modal h2 {
+      font-size: 24px;
+      color: #1a1a1a;
+      margin-bottom: 16px;
+      font-weight: 600;
+    }
+
+    .modal p {
+      color: #666;
+      font-size: 14px;
+      line-height: 1.6;
+      margin-bottom: 24px;
+    }
+
+    .form-group {
+      margin-bottom: 20px;
+      text-align: left;
+    }
+
+    .form-group label {
+      display: block;
+      font-size: 14px;
+      font-weight: 600;
+      color: #1a1a1a;
+      margin-bottom: 8px;
+    }
+
+    .form-group input {
+      width: 100%;
+      padding: 12px 16px;
+      border: 2px solid #e0e0e0;
+      border-radius: 8px;
+      font-size: 16px;
+      transition: border-color 0.3s ease;
+    }
+
+    .form-group input:focus {
+      outline: none;
+      border-color: #667eea;
+    }
+
+    .modal-actions {
+      display: flex;
+      gap: 12px;
+      margin-top: 24px;
+    }
+
+    .modal-actions .btn {
+      margin-bottom: 0;
+    }
+
+    .modal-actions .btn:first-child {
+      flex: 1;
+    }
+
+    .modal-actions .btn:last-child {
+      flex: 2;
+    }
+
+    .loading {
+      display: none;
+      margin-top: 12px;
+      color: #667eea;
+      font-size: 14px;
+    }
+
+    .loading.active {
+      display: block;
+    }
+
+    .error-message {
+      display: none;
+      margin-top: 12px;
+      color: #dc3545;
+      font-size: 14px;
+      padding: 8px 12px;
+      background: #f8d7da;
+      border-radius: 6px;
+    }
+
+    .error-message.active {
+      display: block;
+    }
+
+    .success-message {
+      display: none;
+      margin-top: 12px;
+      color: #155724;
+      font-size: 14px;
+      padding: 8px 12px;
+      background: #d4edda;
+      border-radius: 6px;
+    }
+
+    .success-message.active {
+      display: block;
+    }
+  </style>
+</head>
+<body>
+  <div class="invite-container">
+    <div class="logo">M</div>
+    <h1>邀请您加入工作空间</h1>
+    <div class="invite-info">
+      <span class="inviter-name">张三</span> 邀请您加入工作空间
+    </div>
+
+    <div class="workspace-info">
+      <div class="workspace-name">📁 项目协作空间</div>
+      <div class="workspace-desc">这是一个团队协作工作空间，用于项目讨论和文件共享。</div>
+    </div>
+
+    <!-- 没有工作空间的提示 -->
+    <div class="hint-text">
+      ℹ️ 您当前没有工作空间。请先创建一个工作空间以接受邀请。
+    </div>
+
+    <!-- 新建工作空间按钮 -->
+    <button class="btn btn-create" onclick="openCreateModal()">
+      + 新建工作空间
+    </button>
+
+    <button class="btn btn-primary" onclick="acceptInvite()">
+      接受邀请
+    </button>
+    <button class="btn btn-secondary" onclick="declineInvite()">
+      拒绝邀请
+    </button>
+  </div>
+
+  <!-- 新建工作空间弹窗 -->
+  <div class="modal-overlay" id="createModal">
+    <div class="modal">
+      <h2>新建工作空间</h2>
+      <p>创建一个新工作空间以加入团队协作。</p>
+
+      <div class="form-group">
+        <label for="workspaceName">工作空间名称</label>
+        <input
+          type="text"
+          id="workspaceName"
+          placeholder="请输入工作空间名称"
+          onkeypress="if(event.key==='Enter') createWorkspace()"
+        >
+      </div>
+
+      <div class="error-message" id="errorMessage"></div>
+      <div class="success-message" id="successMessage"></div>
+      <div class="loading" id="loading">正在创建...</div>
+
+      <div class="modal-actions">
+        <button class="btn btn-secondary" onclick="closeCreateModal()">取消</button>
+        <button class="btn btn-primary" onclick="createWorkspace()">创建</button>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    // 打开创建弹窗
+    function openCreateModal() {
+      document.getElementById('createModal').classList.add('active');
+      document.getElementById('workspaceName').focus();
+    }
+
+    // 关闭创建弹窗
+    function closeCreateModal() {
+      document.getElementById('createModal').classList.remove('active');
+      document.getElementById('workspaceName').value = '';
+      document.getElementById('errorMessage').classList.remove('active');
+      document.getElementById('successMessage').classList.remove('active');
+      document.getElementById('loading').classList.remove('active');
+    }
+
+    // 创建工作空间
+    async function createWorkspace() {
+      const nameInput = document.getElementById('workspaceName');
+      const name = nameInput.value.trim();
+
+      if (!name) {
+        showError('请输入工作空间名称');
+        nameInput.focus();
+        return;
+      }
+
+      // 显示加载状态
+      document.getElementById('loading').classList.add('active');
+      document.getElementById('errorMessage').classList.remove('active');
+      document.getElementById('successMessage').classList.remove('active');
+
+      try {
+        // TODO: 替换为实际的工作空间创建 API
+        // 示例 API 调用（需要根据实际后端 API 调整）
+        const response = await fetch('/api/workspaces', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            // 'Authorization': `Bearer ${getToken()}`
+          },
+          body: JSON.stringify({
+            name: name,
+            description: ''
+          })
+        });
+
+        if (!response.ok) {
+          throw new Error('创建工作空间失败');
+        }
+
+        const data = await response.json();
+
+        // 显示成功消息
+        document.getElementById('loading').classList.remove('active');
+        document.getElementById('successMessage').textContent = '✅ 工作空间创建成功！';
+        document.getElementById('successMessage').classList.add('active');
+
+        // 2秒后自动关闭弹窗
+        setTimeout(() => {
+          closeCreateModal();
+          // TODO: 可以跳转到工作空间或刷新页面
+          alert('工作空间已创建！您现在可以接受邀请了。');
+        }, 2000);
+
+      } catch (error) {
+        document.getElementById('loading').classList.remove('active');
+        showError(error.message || '创建工作空间失败，请重试');
+      }
+    }
+
+    // 显示错误信息
+    function showError(message) {
+      const errorEl = document.getElementById('errorMessage');
+      errorEl.textContent = '❌ ' + message;
+      errorEl.classList.add('active');
+    }
+
+    // 接受邀请
+    function acceptInvite() {
+      alert('邀请已接受！（需要实现实际的邀请接受逻辑）');
+      // TODO: 调用接受邀请的 API
+    }
+
+    // 拒绝邀请
+    function declineInvite() {
+      if (confirm('确定要拒绝此邀请吗？')) {
+        alert('邀请已拒绝。（需要实现实际的邀请拒绝逻辑）');
+        // TODO: 调用拒绝邀请的 API
+      }
+    }
+
+    // 获取 Token（如果需要认证）
+    function getToken() {
+      // 从 localStorage 获取 token
+      try {
+        const raw = localStorage.getItem('auth-store');
+        if (!raw) return null;
+        const store = JSON.parse(raw);
+        return store?.state?.token || null;
+      } catch {
+        return null;
+      }
+    }
+  </script>
+</body>
+</html>

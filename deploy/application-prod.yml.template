@@ -1,0 +1,55 @@
+spring:
+  datasource:
+    url: jdbc:mysql://${DB_HOST:localhost}:${DB_PORT:3000}/${DB_NAME:MuHuoAi}?useUnicode=true&characterEncoding=UTF-8&useSSL=false&serverTimezone=Asia/Shanghai&allowPublicKeyRetrieval=true&connectionCollation=utf8mb4_unicode_ci
+    driver-class-name: com.mysql.cj.jdbc.Driver
+    username: ${DB_USERNAME:muhuoai}
+    password: ${DB_PASSWORD:changeme}
+    hikari:
+      maximum-pool-size: 15
+      minimum-idle: 3
+      connection-timeout: 30000
+      idle-timeout: 600000
+      max-lifetime: 1800000
+
+  h2:
+    console:
+      enabled: false
+
+  sql:
+    init:
+      mode: never
+
+  servlet:
+    multipart:
+      max-file-size: 1024MB
+      max-request-size: 1100MB
+
+mybatis-plus:
+  configuration:
+    log-impl: org.apache.ibatis.logging.nologging.NoLoggingImpl
+
+app:
+  base-url: ${APP_BASE_URL:}
+
+autocode:
+  api-url: ${AUTOCODE_API_URL:http://localhost:8000}
+
+logging:
+  level:
+    com.aiplatform: INFO
+    org.springframework.mail: WARN
+  file:
+    name: /opt/muhugochat/logs/backend.log
+  logback:
+    rollingpolicy:
+      max-file-size: 50MB
+      max-history: 30
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics
+  endpoint:
+    health:
+      show-details: when-authorized

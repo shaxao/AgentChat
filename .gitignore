@@ -1,0 +1,71 @@
+# Local review/quarantine folder
+clear/
+
+# Dependencies
+node_modules/
+venv/
+.venv/
+
+# Build outputs
+dist/
+out/
+target/
+.next/
+.vitepress/dist/
+
+# Local caches
+.turbo/
+.cache/
+.tmp/
+.cargo/
+.rustup/
+.localappdata/
+__pycache__/
+*.pyc
+*.tsbuildinfo
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.jks
+
+# Logs and temporary outputs
+*.log
+*.tmp
+*-output.txt
+*_output.txt
+BUILD_RESULT.txt
+tests/reports/
+nul
+
+# Packaged artifacts and generated binaries
+*.jar
+*.class
+*.b64
+*.base64
+*.tar.gz
+*.zip
+*.exe
+*.bak
+
+# IDE/user-local state
+.idea/
+.agents/
+.claude/
+.codebuddy/
+.codex-*/
+.workbuddy/
+UsersAdministrator.workbuddyplans/
+
+# One-off generated/debug folders
+autocode-preview-*/
+autocode_*_tmp/
+autocode_fallback_check_*/
+git_*_check*/
+phase_artifact_*/
+_skill_build/
+_skill_zip_inspect/

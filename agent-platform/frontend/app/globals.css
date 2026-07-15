@@ -1,0 +1,212 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --background: 0 0% 100%;
+    --foreground: 222 47% 11%;
+    --card: 0 0% 100%;
+    --card-foreground: 222 47% 11%;
+    --primary: 217 91% 60%;
+    --primary-foreground: 210 40% 98%;
+    --secondary: 210 40% 96%;
+    --secondary-foreground: 222 47% 11%;
+    --muted: 210 40% 96%;
+    --muted-foreground: 215 16% 47%;
+    --accent: 210 40% 96%;
+    --accent-foreground: 222 47% 11%;
+    --destructive: 0 84% 60%;
+    --destructive-foreground: 210 40% 98%;
+    --border: 214 32% 91%;
+    --input: 214 32% 91%;
+    --ring: 217 91% 60%;
+    --radius: 0.75rem;
+  }
+
+  .dark {
+    --background: 222 47% 6%;
+    --foreground: 210 40% 98%;
+    --card: 222 47% 8%;
+    --card-foreground: 210 40% 98%;
+    --primary: 217 91% 60%;
+    --primary-foreground: 222 47% 11%;
+    --secondary: 217 33% 17%;
+    --secondary-foreground: 210 40% 98%;
+    --muted: 217 33% 17%;
+    --muted-foreground: 215 20% 65%;
+    --accent: 217 33% 17%;
+    --accent-foreground: 210 40% 98%;
+    --destructive: 0 84% 60%;
+    --destructive-foreground: 210 40% 98%;
+    --border: 217 33% 20%;
+    --input: 217 33% 20%;
+    --ring: 217 91% 60%;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+  body {
+    @apply bg-background text-foreground;
+    font-feature-settings: "rlig" 1, "calt" 1;
+  }
+}
+
+/* 滚动条 */
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: hsl(214 32% 91% / 0.5); }
+::-webkit-scrollbar-thumb { background: hsl(217 91% 60% / 0.2); border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: hsl(217 91% 60% / 0.4); }
+.dark ::-webkit-scrollbar-track { background: hsl(222 47% 6% / 0.5); }
+.dark ::-webkit-scrollbar-thumb { background: hsl(217 91% 60% / 0.3); }
+.dark ::-webkit-scrollbar-thumb:hover { background: hsl(217 91% 60% / 0.5); }
+
+/* 终端滚动条 */
+.xterm-scroll::-webkit-scrollbar { width: 6px; }
+.xterm-scroll::-webkit-scrollbar-track { background: transparent; }
+.xterm-scroll::-webkit-scrollbar-thumb { background: hsl(215 16% 47% / 0.3); border-radius: 3px; }
+
+/* Git 分支线条 */
+.git-timeline-line {
+  position: relative;
+}
+.git-timeline-line::before {
+  content: '';
+  position: absolute;
+  left: 11px;
+  top: 28px;
+  bottom: 0;
+  width: 2px;
+  background: linear-gradient(to bottom, hsl(217 91% 60% / 0.3), transparent);
+}
+.dark .git-timeline-line::before {
+  background: linear-gradient(to bottom, hsl(217 91% 60% / 0.5), transparent);
+}
+
+/* 科技组件 */
+@layer components {
+  .tech-card {
+    @apply bg-card border rounded-xl relative overflow-hidden;
+    border-color: hsl(214 32% 91%);
+    transition: all 0.3s ease;
+  }
+  .dark .tech-card {
+    border-color: hsl(217 33% 20%);
+  }
+  .tech-card::before {
+    content: '';
+    position: absolute;
+    inset: 0;
+    border-radius: inherit;
+    padding: 1px;
+    background: linear-gradient(135deg, hsl(217 91% 60% / 0.15), transparent 50%, hsl(270 60% 50% / 0.1));
+    -webkit-mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
+    -webkit-mask-composite: xor;
+    mask-composite: exclude;
+    pointer-events: none;
+    opacity: 0;
+    transition: opacity 0.3s ease;
+  }
+  .tech-card:hover::before {
+    opacity: 1;
+  }
+  .tech-card:hover {
+    border-color: hsl(217 91% 60% / 0.4);
+    box-shadow: 0 0 20px hsl(217 91% 60% / 0.08), 0 4px 20px rgba(0,0,0,0.06);
+    transform: translateY(-2px);
+  }
+  .dark .tech-card:hover {
+    box-shadow: 0 0 20px hsl(217 91% 60% / 0.1), 0 4px 20px rgba(0,0,0,0.3);
+  }
+
+  .tech-glow {
+    box-shadow: 0 0 15px hsl(217 91% 60% / 0.1), inset 0 1px 0 hsl(255 255% 255% / 0.05);
+  }
+
+  .tech-gradient-text {
+    background: linear-gradient(135deg, hsl(217 91% 60%), hsl(270 60% 50%));
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+  }
+
+  .tech-badge {
+    @apply px-2 py-0.5 rounded-full text-xs font-medium;
+    background: hsl(210 40% 96%);
+    border: 1px solid hsl(214 32% 91%);
+    color: hsl(215 16% 47%);
+  }
+  .dark .tech-badge {
+    background: hsl(217 33% 17%);
+    border: 1px solid hsl(217 33% 25%);
+    color: hsl(210 40% 80%);
+  }
+
+  .tech-btn-primary {
+    @apply px-4 py-2 rounded-lg text-sm font-medium transition-all relative overflow-hidden;
+    background: linear-gradient(135deg, hsl(217 91% 55%), hsl(250 60% 55%));
+    color: white;
+    box-shadow: 0 0 15px hsl(217 91% 60% / 0.2);
+  }
+  .tech-btn-primary:hover {
+    box-shadow: 0 0 25px hsl(217 91% 60% / 0.35);
+    transform: translateY(-1px);
+  }
+
+  .tech-btn-secondary {
+    @apply px-4 py-2 rounded-lg text-sm font-medium transition-all border;
+    background: hsl(210 40% 96%);
+    border-color: hsl(214 32% 91%);
+    color: hsl(222 47% 11%);
+  }
+  .tech-btn-secondary:hover {
+    background: hsl(210 40% 92%);
+    border-color: hsl(217 91% 60% / 0.4);
+    box-shadow: 0 0 15px hsl(217 91% 60% / 0.06);
+  }
+  .dark .tech-btn-secondary {
+    background: hsl(217 33% 12%);
+    border-color: hsl(217 33% 25%);
+    color: hsl(210 40% 90%);
+  }
+  .dark .tech-btn-secondary:hover {
+    background: hsl(217 33% 17%);
+    border-color: hsl(217 91% 60% / 0.4);
+    box-shadow: 0 0 15px hsl(217 91% 60% / 0.1);
+  }
+
+  .tech-header {
+    background: hsl(0 0% 100% / 0.85);
+    backdrop-filter: blur(12px);
+    border-bottom: 1px solid hsl(214 32% 91% / 0.8);
+  }
+  .dark .tech-header {
+    background: hsl(222 47% 6% / 0.8);
+    border-bottom: 1px solid hsl(217 33% 20% / 0.5);
+  }
+
+  .tech-stat-card {
+    @apply relative overflow-hidden rounded-xl p-4;
+    background: linear-gradient(135deg, hsl(0 0% 100%), hsl(210 40% 96%));
+    border: 1px solid hsl(214 32% 91%);
+  }
+  .dark .tech-stat-card {
+    background: linear-gradient(135deg, hsl(222 47% 8%), hsl(222 47% 10%));
+    border: 1px solid hsl(217 33% 20%);
+  }
+  .tech-stat-card::after {
+    content: '';
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    height: 1px;
+    background: linear-gradient(90deg, transparent, hsl(217 91% 60% / 0.2), transparent);
+  }
+  .dark .tech-stat-card::after {
+    background: linear-gradient(90deg, transparent, hsl(217 91% 60% / 0.3), transparent);
+  }
+}

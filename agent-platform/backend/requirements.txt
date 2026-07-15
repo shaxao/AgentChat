@@ -1,0 +1,39 @@
+# Web Framework
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.6
+python-multipart>=0.0.12
+
+# Anthropic Claude SDK
+anthropic>=0.40.0
+
+# Docker SDK
+docker>=7.1.0
+
+# Git
+GitPython>=3.1.43
+dulwich>=0.22.0
+
+# Async / Queue
+redis>=5.2.0
+rq>=1.18.1
+websockets>=13.1
+
+# Utils
+loguru>=0.7.2
+pydantic>=2.9.2
+pydantic-settings>=2.5.2
+python-dotenv>=1.0.1
+httpx>=0.27.2
+aiofiles>=24.1.0
+watchdog>=5.0.2
+shellingham>=1.3.1
+pymysql>=1.1.1
+
+# Security
+python-jose[cryptography]>=3.3.0
+passlib[bcrypt]>=1.7.4
+
+# ── 显式版本声明（避免 pip 解析到不兼容版本导致构建失败）────
+# cryptography>=43 需 Rust>=1.65，bcrypt>=4.1 需 Rust；已通过 rustup 解决
+cryptography>=42.0.0
+bcrypt>=4.0.0

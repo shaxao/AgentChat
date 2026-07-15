@@ -1,0 +1,34 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "AutoCode Local Connector",
+  "version": "0.4.7",
+  "identifier": "com.muhuo.autocode.localconnector",
+  "build": {
+    "beforeDevCommand": "npm run dev:web",
+    "beforeBuildCommand": "npm run build:web",
+    "devUrl": "http://localhost:5173",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "AutoCode Local Connector",
+        "width": 960,
+        "height": 720,
+        "resizable": true
+      }
+    ]
+  },
+  "bundle": {
+    "active": true,
+    "useLocalToolsDir": true,
+    "targets": ["nsis"]
+  },
+  "plugins": {
+    "deep-link": {
+      "desktop": {
+        "schemes": ["muhuo-autocode"]
+      }
+    }
+  }
+}

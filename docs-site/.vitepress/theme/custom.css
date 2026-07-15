@@ -1,0 +1,119 @@
+/* ============================================================
+   学习文档站 - 自定义主题样式
+   在 VitePress 默认主题基础上覆盖品牌色与交互组件样式
+   ============================================================ */
+
+:root {
+  /* 品牌主色 - 沿用平台的紫蓝渐变 */
+  --vp-c-brand-1: #6d5efc;
+  --vp-c-brand-2: #7c6ffd;
+  --vp-c-brand-3: #8f84ff;
+  --vp-c-brand-soft: rgba(109, 94, 252, 0.14);
+
+  /* 首页 Hero 渐变 */
+  --vp-home-hero-name-color: transparent;
+  --vp-home-hero-name-background: linear-gradient(120deg, #6d5efc 30%, #41d1ff);
+  --vp-home-hero-image-background-image: linear-gradient(120deg, #6d5efc 30%, #41d1ff 70%);
+  --vp-home-hero-image-filter: blur(48px);
+}
+
+.dark {
+  --vp-c-brand-1: #8f84ff;
+  --vp-c-brand-2: #7c6ffd;
+  --vp-c-brand-3: #6d5efc;
+}
+
+/* ============================================================
+   交互组件通用容器
+   ============================================================ */
+
+.demo-block {
+  margin: 20px 0;
+  padding: 20px;
+  border: 1px solid var(--vp-c-divider);
+  border-radius: 12px;
+  background: var(--vp-c-bg-soft);
+}
+
+.demo-block__title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0 0 4px;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--vp-c-text-1);
+}
+
+.demo-block__desc {
+  margin: 0 0 16px;
+  font-size: 13px;
+  color: var(--vp-c-text-2);
+}
+
+.demo-block__badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 600;
+  background: var(--vp-c-brand-soft);
+  color: var(--vp-c-brand-1);
+}
+
+/* 通用按钮 */
+.demo-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 14px;
+  border: 1px solid var(--vp-c-brand-1);
+  border-radius: 8px;
+  background: var(--vp-c-brand-1);
+  color: #fff;
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: opacity 0.2s, transform 0.1s;
+}
+.demo-btn:hover { opacity: 0.88; }
+.demo-btn:active { transform: translateY(1px); }
+.demo-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+.demo-btn--ghost {
+  background: transparent;
+  color: var(--vp-c-brand-1);
+}
+
+/* 代码编辑区 */
+.demo-editor {
+  width: 100%;
+  min-height: 160px;
+  padding: 12px 14px;
+  border: 1px solid var(--vp-c-divider);
+  border-radius: 8px;
+  background: var(--vp-code-block-bg, #1e1e1e);
+  color: #d4d4d4;
+  font-family: var(--vp-font-family-mono);
+  font-size: 13px;
+  line-height: 1.6;
+  resize: vertical;
+  tab-size: 2;
+}
+
+.demo-output {
+  margin-top: 12px;
+  padding: 12px 14px;
+  border-radius: 8px;
+  background: var(--vp-c-bg);
+  border: 1px solid var(--vp-c-divider);
+  font-family: var(--vp-font-family-mono);
+  font-size: 13px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  min-height: 40px;
+  max-height: 320px;
+  overflow: auto;
+}
+.demo-output--error { color: #f97583; }
+.demo-output--muted { color: var(--vp-c-text-3); }

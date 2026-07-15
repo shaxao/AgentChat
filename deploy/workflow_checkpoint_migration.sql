@@ -1,0 +1,22 @@
+CREATE TABLE IF NOT EXISTS workflow_execution_checkpoint (
+    id              BIGINT AUTO_INCREMENT PRIMARY KEY,
+    execution_id    BIGINT       NOT NULL COMMENT 'Execution ID',
+    workflow_id     BIGINT       NOT NULL COMMENT 'Workflow ID',
+    step_id         VARCHAR(64)  NOT NULL COMMENT 'DSL step ID',
+    step_record_id  BIGINT       COMMENT 'workflow_execution_step.id',
+    status          VARCHAR(20)  NOT NULL DEFAULT 'completed' COMMENT 'completed/skipped/failed/cancelled',
+    input_json      TEXT         COMMENT 'Checkpoint input JSON',
+    output_json     MEDIUMTEXT   COMMENT 'Checkpoint output JSON',
+    error_msg       TEXT         COMMENT 'Error message',
+    duration_ms     INT          DEFAULT 0 COMMENT 'Duration in milliseconds',
+    completed_at    DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT 'Checkpoint completion time',
+    created_at      DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at      DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    deleted         TINYINT      NOT NULL DEFAULT 0,
+    UNIQUE KEY uk_wec_execution_step (execution_id, step_id, deleted),
+    INDEX idx_wec_execution_id (execution_id),
+    INDEX idx_wec_workflow_id (workflow_id),
+    INDEX idx_wec_step_id (step_id),
+    INDEX idx_wec_status (status),
+    INDEX idx_wec_completed_at (completed_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='Workflow execution checkpoint table';

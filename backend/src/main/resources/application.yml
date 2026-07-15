@@ -1,0 +1,182 @@
+server:
+  port: 8080
+  # 禁用响应缓冲，确保 SSE 实时推送
+  servlet:
+    encoding:
+      charset: UTF-8
+      force: true
+
+spring:
+  application:
+    name: ai-chat-platform
+
+  # 数据库配置 - 默认使用 H2 内嵌数据库(开发模式)，生产环境切换 MySQL
+  datasource:
+    url: jdbc:h2:mem:aiplatform;DB_CLOSE_DELAY=-1;MODE=MySQL;NON_KEYWORDS=USER
+    driver-class-name: org.h2.Driver
+    username: sa
+    password:
+
+  h2:
+    console:
+      enabled: ${H2_CONSOLE_ENABLED:false}
+      path: /h2-console
+
+  sql:
+    init:
+      mode: always
+      schema-locations: classpath:schema.sql
+      data-locations: classpath:data.sql,classpath:data-skills.sql
+
+  # Redis 配置
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+      password: ${REDIS_PASSWORD:}
+      database: 0
+      lettuce:
+        pool:
+          max-active: 8
+          max-idle: 8
+          min-idle: 0
+
+  # 邮件配置
+  mail:
+    host: ${MAIL_HOST:smtp.qq.com}
+    port: ${MAIL_PORT:587}
+    username: ${MAIL_USERNAME:415240147@qq.com}
+    password: ${MAIL_PASSWORD:ksisnhlyjebkcaeb}
+    default-encoding: UTF-8
+    properties:
+      mail:
+        smtp:
+          auth: true
+          starttls:
+            enable: true
+            required: true
+
+  jackson:
+    date-format: yyyy-MM-dd HH:mm:ss
+    time-zone: Asia/Shanghai
+
+# MyBatis Plus 配置
+mybatis-plus:
+  configuration:
+    map-underscore-to-camel-case: true
+    log-impl: org.apache.ibatis.logging.stdout.StdOutImpl
+  global-config:
+    db-config:
+      logic-delete-field: deleted
+      logic-delete-value: 1
+      logic-not-delete-value: 0
+
+# JWT 配置
+jwt:
+  secret: ${JWT_SECRET:}
+  expiration: 604800000  # 7天 (毫秒)
+  refresh-expiration: 2592000000  # 30天
+
+# 验证码配置
+verify:
+  code:
+    expire: 300  # 5分钟过期(秒)
+    length: 6
+
+# 邮件发件人显示名
+app:
+  mail:
+    from: 木火智能对话 <mhchatal@qq.com>
+  frontend:
+    url: http://localhost:5173
+  # CORS 允许的来源，多个用逗号分隔，* 表示不限制
+  cors:
+    allowed-origins: ${CORS_ALLOWED_ORIGINS:https://muhuo.site,http://localhost:5173,http://localhost:3000}
+  # AI 默认配置（当数据库无可用渠道时的兜底）
+  ai:
+    default-api-key: ${AI_API_KEY:}
+    default-base-url: ${AI_BASE_URL:https://api.openai.com/v1}
+    default-model: ${AI_DEFAULT_MODEL:gpt-4o-mini}
+    timeout: 300
+  # 文件上传和台账输出目录
+  upload-dir: ${UPLOAD_DIR:${java.io.tmpdir}/aiplatform/uploads}
+  ledger-output-dir: ${LEDGER_OUTPUT_DIR:${java.io.tmpdir}/aiplatform/ledgers}
+  # 应用公网基础地址（用于生成完整下载链接，如 https://your-domain.com）
+  base-url: ${APP_BASE_URL:}
+  # OpenAI Vision API 配置（供 LedgerToolService 调用）
+  openai-api-key: ${AI_API_KEY:}
+  openai-base-url: ${AI_BASE_URL:https://api.openai.com/v1}
+  # Linux.do OAuth login.
+  # Set these with environment variables in production. Do not commit client secrets.
+  # LINUXDO_OAUTH_REDIRECT_URI must exactly match the redirect_uri configured in Linux.do.
+  oauth:
+    linuxdo:
+      client-id: ${LINUXDO_OAUTH_CLIENT_ID:}
+      client-secret: ${LINUXDO_OAUTH_CLIENT_SECRET:}
+      redirect-uri: ${LINUXDO_OAUTH_REDIRECT_URI:}
+      frontend-success-url: ${LINUXDO_OAUTH_FRONTEND_SUCCESS_URL:}
+      authorize-endpoint: ${LINUXDO_OAUTH_AUTHORIZE_ENDPOINT:https://connect.linux.do/oauth2/authorize}
+      token-endpoint: ${LINUXDO_OAUTH_TOKEN_ENDPOINT:https://connect.linuxdo.org/oauth2/token}
+      userinfo-endpoint: ${LINUXDO_OAUTH_USERINFO_ENDPOINT:https://connect.linuxdo.org/api/user}
+  # 📦 默认 OSS 存储配置（系统启动时自动初始化，仅当数据库无任何配置时生效）
+  oss:
+    default:
+      enabled: true                 # 是否启用自动初始化
+      name: "阿里云"               # 配置名称
+      provider: aliyun               # aliyun / tencent / minio
+      endpoint: oss-cn-hongkong.aliyuncs.com
+      region: "cn-hongkong"
+      bucket: cloud-drive-pro
+      access-key: ${OSS_ACCESS_KEY:}
+      secret-key: ${OSS_SECRET_KEY:}
+      base-path: ai       # 上传文件路径前缀
+  # 🔴 OOM 监控配置
+  oom-monitor:
+    enabled: true
+    max-messages-size: 500000   # messages 列表估算字符数上限（500KB）
+    max-request-body-size: 2000000  # 请求体大小上限（2MB）
+    max-tool-result-size: 100000    # 单条工具结果大小上限（100KB）
+  # 💰 支付模块配置
+  payment:
+    # AES-256 加密密钥（用于加密存储支付配置中的敏感字段）
+    # 生产环境必须通过环境变量 PAY_AES_KEY 设置，至少32字节
+    aes-key: ${PAY_AES_KEY:}
+    # 订单号前缀
+    order-prefix: ${PAY_ORDER_PREFIX:MH}
+    # 订单默认过期时间（分钟）
+    order-expire-minutes: 30
+  workflow:
+    realtime:
+      redis:
+        # true: workflow SSE events are fanned out through Redis pub/sub for multi-instance deployments.
+        # false: use only in-process fanout; suitable for local development or single-node fallback.
+        enabled: ${WORKFLOW_REALTIME_REDIS_ENABLED:true}
+  cache-ledger:
+    base-url: ${CACHE_LEDGER_BASE_URL:http://127.0.0.1:8000/api/cache}
+    timeout-ms: ${CACHE_LEDGER_TIMEOUT_MS:2500}
+
+# Spring MVC 文件上传配置
+spring.servlet.multipart:
+  max-file-size: 1024MB
+  max-request-size: 1100MB
+
+logging:
+  level:
+    com.aiplatform: DEBUG
+    org.springframework.mail: DEBUG
+
+# Spring Boot Actuator 配置（用于监控和 OOM 诊断）
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,env,loggers
+  endpoint:
+    health:
+      show-details: always
+  simple:
+    metrics:
+      export:
+        enabled: true
+
+

@@ -41,7 +41,7 @@ __pycache__/
 BUILD_RESULT.txt
 tests/reports/
 nul
-.git-commit-msg.txt
+.git-commit-msg*.txt
 
 # Packaged artifacts and generated binaries
 *.jar

@@ -58,6 +58,7 @@ class ProjectRecon:
     total_file_count: int = 0
     risk_flags: list[str] = field(default_factory=list)
     plan_guidance: list[str] = field(default_factory=list)
+    surface_map: dict[str, list[str]] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -83,6 +84,7 @@ def run_project_recon(ws_path: Path, *, declared_type: str = "", description: st
     _detect_commands(ws_path, recon, package_data)
     _detect_stack_and_kind(ws_path, recon, package_data, declared_type, description)
     _detect_entrypoints(ws_path, recon)
+    _detect_surface_map(ws_path, recon)
     _classify_complexity(recon, declared_type, description)
     _write_recon_files(ws_path, recon)
     return recon.to_dict()
@@ -217,6 +219,67 @@ def _detect_entrypoints(ws_path: Path, recon: ProjectRecon) -> None:
                     break
 
 
+def _detect_surface_map(ws_path: Path, recon: ProjectRecon) -> None:
+    workspace_index = load_workspace_index(ws_path)
+    indexed_paths = [str(item.get("path")) for item in workspace_index.get("files") or [] if item.get("path")]
+    surface: dict[str, list[str]] = {
+        "docs_site": [],
+        "app_gui": [],
+        "backend_api": [],
+        "config_store": [],
+        "package_source": [],
+    }
+
+    def add(kind: str, path: str) -> None:
+        bucket = surface.setdefault(kind, [])
+        if path not in bucket and len(bucket) < 20:
+            bucket.append(path)
+
+    for rel in indexed_paths:
+        norm = rel.replace("\\", "/")
+        lower = norm.lower()
+        name = Path(norm).name.lower()
+        suffix = Path(norm).suffix.lower()
+
+        if lower.startswith(("docs/", "docs-site/")) or lower in {"readme.md", "documentation.md"}:
+            if suffix in {".html", ".md", ".js", ".css", ".ts", ".tsx"}:
+                add("docs_site", norm)
+
+        if (
+            lower.startswith(("ui/", "templates/", "static/"))
+            or "/ui/" in lower
+            or "/templates/" in lower
+            or name in {"web_app.py", "app.py"}
+        ):
+            if suffix in {".html", ".py", ".js", ".css", ".ts", ".tsx"}:
+                add("app_gui", norm)
+
+        if (
+            lower.startswith(("api/", "server/", "backend/"))
+            or "/api/" in lower
+            or name in {"web_app.py", "app.py", "main.py", "server.py"}
+        ):
+            if suffix in {".py", ".js", ".ts", ".java", ".go", ".kt"}:
+                add("backend_api", norm)
+
+        if (
+            "config" in lower
+            or name in {"settings.py", ".env.example", "application.yml", "application.yaml"}
+        ):
+            if suffix in {".py", ".json", ".yaml", ".yml", ".toml", ".ini", ".env", ".example"} or name == ".env.example":
+                add("config_store", norm)
+
+        if (
+            lower.startswith(("src/", "lib/"))
+            or "/_internal/" in lower
+            or lower.startswith(("wx4auto/", "wx4py/"))
+        ):
+            if suffix in SOURCE_SUFFIXES:
+                add("package_source", norm)
+
+    recon.surface_map = {key: value for key, value in surface.items() if value}
+
+
 def _classify_complexity(recon: ProjectRecon, declared_type: str, description: str) -> None:
     text = f"{declared_type} {description}".lower()
     multi_page_frontend = recon.project_kind == "frontend" and sum(1 for word in ("首页", "产品介绍", "关于我们", "联系我们", "页面") if word in text) >= 2
@@ -274,9 +337,24 @@ def _write_recon_files(ws_path: Path, recon: ProjectRecon) -> None:
     (autocode / "PROJECT_PROFILE.json").write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
     (autocode / "PROJECT_PROFILE.md").write_text(_render_profile_markdown(data), encoding="utf-8")
     (autocode / "PROJECT_MAP.md").write_text(_render_project_map(data), encoding="utf-8")
+    (autocode / "SURFACE_MAP.md").write_text(_render_surface_map(data.get("surface_map") or {}), encoding="utf-8")
     (autocode / "COMMANDS.md").write_text(_render_commands(data), encoding="utf-8")
     (autocode / "RISK_REPORT.md").write_text(_render_risks(data), encoding="utf-8")
     _write_work_files(autocode, data)
+
+
+def _render_surface_map(surface_map: dict[str, Any]) -> str:
+    if not surface_map:
+        return "# Product Surface Map\n\n- not detected\n"
+    lines = ["# Product Surface Map", ""]
+    for key in ("app_gui", "backend_api", "config_store", "docs_site", "package_source"):
+        values = surface_map.get(key) or []
+        if not values:
+            continue
+        lines.append(f"## {key}")
+        lines.extend(f"- `{item}`" for item in values[:20])
+        lines.append("")
+    return "\n".join(lines).rstrip() + "\n"
 
 
 def _write_work_files(autocode: Path, data: dict[str, Any]) -> None:

@@ -12,11 +12,13 @@ class ToolRegistryTest(unittest.TestCase):
         specs = {item["name"]: item for item in tool_registry.public_specs()}
 
         self.assertIn("read_file", specs)
+        self.assertIn("read_lines", specs)
         self.assertIn("bash", specs)
         self.assertEqual(specs["read_file"]["label"], "读取文件")
         self.assertEqual(specs["bash"]["action"], "执行命令")
         self.assertEqual(specs["bash"]["permission_default"], "ask")
         self.assertTrue(specs["bash"]["requires_confirmation"])
+        self.assertEqual(specs["read_lines"]["parameters"]["required"], ["path", "start", "end"])
         self.assertTrue(specs["apply_patch"]["mutates_workspace"])
         self.assertTrue(specs["glob"]["cacheable"])
 
@@ -36,7 +38,7 @@ class ToolRegistryTest(unittest.TestCase):
     def test_local_runner_scope_is_declared_by_registry(self):
         local_tools = tool_registry.local_runner_tools()
 
-        for name in ["read_file", "write_file", "apply_patch", "glob", "search_code", "bash", "git_diff"]:
+        for name in ["read_file", "read_lines", "write_file", "apply_patch", "glob", "search_code", "bash", "git_diff"]:
             self.assertIn(name, local_tools)
             self.assertTrue(tool_registry.can_run_locally(name))
 
@@ -53,6 +55,7 @@ class ToolRegistryTest(unittest.TestCase):
 
         for name in [
             "read_file",
+            "read_lines",
             "write_file",
             "bash",
             "glob",
@@ -65,6 +68,7 @@ class ToolRegistryTest(unittest.TestCase):
             self.assertIn(name, tools)
 
         self.assertEqual(tools["read_file"].parameters["required"], ["path"])
+        self.assertEqual(tools["read_lines"].parameters["required"], ["path", "start", "end"])
         self.assertIn("command", tools["bash"].parameters["properties"])
         self.assertEqual(tools["apply_patch"].parameters["required"], ["path", "search", "replace"])
         self.assertIn("应用补丁", tools["apply_patch"].description)
@@ -83,6 +87,7 @@ class ToolRegistryTest(unittest.TestCase):
         self.assertIn("Tool Use Contract", prompt)
         self.assertIn("Discovery tools", prompt)
         self.assertIn("read_file", prompt)
+        self.assertIn("read_lines", prompt)
         self.assertIn("search_code", prompt)
         self.assertIn("Edit tools", prompt)
         self.assertIn("apply_patch", prompt)
@@ -101,6 +106,13 @@ class ToolRegistryTest(unittest.TestCase):
         self.assertIn("正在", read_progress)
         self.assertIn("custom_tool", unknown_desc)
         self.assertIn("abc", unknown_desc)
+
+    def test_code_editor_view_progress_is_not_labeled_as_edit(self):
+        view_desc = tool_registry.describe_invocation("code_editor", {"command": "view", "path": "ui/templates/index.html"}, progress=True)
+        edit_desc = tool_registry.describe_invocation("code_editor", {"command": "str_replace", "path": "ui/templates/index.html"}, progress=True)
+
+        self.assertIn("查看文件", view_desc)
+        self.assertIn("编辑文件", edit_desc)
 
     def test_unknown_tool_defaults_to_ask_permission(self):
         decision = permission_engine.check("custom_tool", {})

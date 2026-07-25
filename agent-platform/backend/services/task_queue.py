@@ -18,12 +18,19 @@ from typing import Iterable
 
 from loguru import logger
 
-from core.agent_orchestrator import _execution_mode, agent_orchestrator
+from core.agent_orchestrator import (
+    _absolute_iteration_cap,
+    _execution_mode,
+    _progress_fingerprint,
+    _unrestricted_dev_mode,
+    agent_orchestrator,
+)
 from core.config import get_settings
 from core.project_recon import run_project_recon
 from core.redis import publish_task_event
 from core.state import _tasks
 from runtime.session_events import append_event
+from services.cache_ledger_service import stable_hash
 from services.task_repository import acquire_task_lease, load_all_tasks, release_task_lease, renew_task_lease, save_task
 from services.usage_reporter import UsageContext, _usage_context
 
@@ -31,6 +38,7 @@ from services.usage_reporter import UsageContext, _usage_context
 RUNNABLE_STATUSES = {"pending", "running", "reviewing"}
 WAITING_STATUSES = {
     "waiting_confirm",
+    "waiting_user_input",
     "waiting_plan_confirm",
     "waiting_prototype_confirm",
     "waiting_review_confirm",
@@ -126,23 +134,20 @@ class TaskQueue:
             "queue_size": self._queue.qsize(),
         }
 
-    def _auto_continuation_limits(self) -> tuple[int, int]:
+    def _stall_threshold(self) -> int:
+        """Consecutive no-progress segments tolerated before requesting human confirmation."""
         try:
-            max_segments = int(os.getenv("AUTOCODE_MAX_AUTO_CONTINUATIONS", "5"))
+            threshold = int(os.getenv("AUTOCODE_MAX_STALLED_CONTINUATIONS", "999"))
         except ValueError:
-            max_segments = 5
-        try:
-            total_iterations = int(os.getenv("AUTOCODE_TOTAL_AGENT_ITERATION_BUDGET", "120"))
-        except ValueError:
-            total_iterations = 120
-        return max(0, max_segments), max(1, total_iterations)
+            threshold = 999
+        return max(1, threshold)
 
     def _prepare_auto_continuation(self, task_id: str) -> bool:
         task = _tasks.get(task_id)
         if not task or not task.get("agent_iteration_limited"):
             return False
 
-        max_segments, total_budget = self._auto_continuation_limits()
+        cap = _absolute_iteration_cap()
         try:
             used_segments = int(task.get("auto_continuation_count") or 0)
         except (TypeError, ValueError):
@@ -151,13 +156,78 @@ class TaskQueue:
             used_iterations = int(task.get("total_agent_iterations") or task.get("agent_iteration") or 0)
         except (TypeError, ValueError):
             used_iterations = 0
+        try:
+            window_base = int(task.get("auto_continuation_budget_base") or 0)
+        except (TypeError, ValueError):
+            window_base = 0
+        # Iterations consumed since the current window opened (start / last manual approval).
+        consumed_in_window = max(0, used_iterations - window_base)
 
-        if used_segments >= max_segments or used_iterations >= total_budget:
+        # Progress-aware gating: prefer the loop-level watchdog signature. The
+        # older coarse fingerprint remains as a fallback for legacy tasks.
+        completed, total_subtasks, changed_files = _progress_fingerprint(task)
+        watchdog = task.get("progress_watchdog") if isinstance(task.get("progress_watchdog"), dict) else {}
+        watchdog_signature = watchdog.get("last_signature") if isinstance(watchdog.get("last_signature"), dict) else None
+        if watchdog_signature is not None:
+            current_fp = stable_hash(watchdog_signature)
+            prev = task.get("last_progress_watchdog_signature")
+            made_progress = prev is None or str(prev) != current_fp
+            task["last_progress_watchdog_signature"] = current_fp
+        else:
+            prev = task.get("last_progress_fingerprint")
+            prev_tuple = tuple(prev) if isinstance(prev, (list, tuple)) else None
+            current_tuple = (completed, total_subtasks, changed_files)
+            made_progress = prev_tuple is None or current_tuple != prev_tuple
+            task["last_progress_fingerprint"] = [completed, total_subtasks, changed_files]
+        if made_progress:
+            stalled_segments = 0
+        else:
+            try:
+                stalled_segments = int(task.get("stalled_continuation_count") or 0) + 1
+            except (TypeError, ValueError):
+                stalled_segments = 1
+        task["stalled_continuation_count"] = stalled_segments
+
+        limit_reason = str(task.get("agent_iteration_limit_reason") or "")
+        watchdog_stop_reason = str((watchdog or {}).get("stop_reason") or "")
+        no_change_retry = limit_reason == "agentic_no_change_retry"
+        unrestricted_mode = _unrestricted_dev_mode(task)
+        stall_threshold = self._stall_threshold()
+        hit_cap = consumed_in_window >= cap
+        watchdog_allows_stall_gate = watchdog_signature is None or watchdog_stop_reason in {"blocked_by_no_progress", "duplicate_discovery"}
+        stalled_out = (
+            stalled_segments >= stall_threshold
+            and not unrestricted_mode
+            and not no_change_retry
+            and watchdog_allows_stall_gate
+        )
+
+        if hit_cap or stalled_out:
             approval_id = f"continue-budget-{task_id}"
-            confirmation_message = (
-                f"已达到自动续跑总预算（{used_segments}/{max_segments} 次，"
-                f"{used_iterations}/{total_budget} 轮），任务已保存，需要人工确认后继续。"
-            )
+            if hit_cap:
+                confirmation_message = (
+                    f"已达到自动续跑安全上限（本轮累计 {consumed_in_window}/{cap} 轮），"
+                    f"任务已保存，需要人工确认后继续。"
+                )
+            else:
+                confirmation_message = (
+                    f"连续 {stalled_segments} 段自动续跑未产生新进展"
+                    f"（子任务 {completed}/{total_subtasks}，累计变更文件 {changed_files}），"
+                    f"任务已保存，需要人工确认后继续。"
+                )
+            gate_payload = {
+                "kind": "auto_continuation_budget",
+                "reason": "absolute_cap" if hit_cap else "stalled",
+                "used_segments": used_segments,
+                "used_iterations": used_iterations,
+                "consumed_in_window": consumed_in_window,
+                "absolute_cap": cap,
+                "stalled_segments": stalled_segments,
+                "stall_threshold": stall_threshold,
+                "completed_subtasks": completed,
+                "total_subtasks": total_subtasks,
+                "changed_files": changed_files,
+            }
             approval_event = append_event(
                 task,
                 "approval_requested",
@@ -167,13 +237,7 @@ class TaskQueue:
                     "action": "continue_task",
                     "reason": confirmation_message,
                     "message": confirmation_message,
-                    "payload": {
-                        "kind": "auto_continuation_budget",
-                        "used_segments": used_segments,
-                        "max_segments": max_segments,
-                        "used_iterations": used_iterations,
-                        "total_budget": total_budget,
-                    },
+                    "payload": gate_payload,
                     "manual_required": True,
                     "high_risk": False,
                     "auto_approve_after_seconds": 0,
@@ -191,13 +255,7 @@ class TaskQueue:
                 "reason": confirmation_message,
                 "event_id": approval_event.get("id"),
                 "approval_id": approval_id,
-                "payload": {
-                    "kind": "auto_continuation_budget",
-                    "used_segments": used_segments,
-                    "max_segments": max_segments,
-                    "used_iterations": used_iterations,
-                    "total_budget": total_budget,
-                },
+                "payload": gate_payload,
                 "manual_required": True,
                 "high_risk": False,
                 "auto_approve_after_seconds": 0,
@@ -216,12 +274,71 @@ class TaskQueue:
         task["needs_continuation"] = True
         task["execution_active"] = False
         task["status"] = "pending"
+        remaining_subtasks = max(0, total_subtasks - completed)
         task["current_step"] = (
-            f"达到单段迭代上限，已压缩上下文，自动续跑 "
-            f"{used_segments + 1}/{max_segments}（总迭代 {used_iterations}/{total_budget}）。"
+            f"达到续跑保险丝，已保存上下文，自动续跑第 {used_segments + 1} 段"
+            f"（本轮累计 {consumed_in_window}/{cap} 轮，剩余子任务 {remaining_subtasks}）。"
         )
         if task.get("last_chat_continuation_message") and not task.get("chat_continuation_message"):
             task["chat_continuation_message"] = task["last_chat_continuation_message"]
+        if no_change_retry:
+            guard = task.get("retrieval_guard") if isinstance(task.get("retrieval_guard"), dict) else {}
+            candidate_files = [
+                str(path).replace("\\", "/")
+                for path in (guard.get("candidate_files") or [])
+                if str(path).strip()
+            ][:12]
+            read_files = [
+                str(path).replace("\\", "/")
+                for path in (guard.get("read_files") or [])
+                if str(path).strip()
+            ][:20]
+            base_message = str(task.get("chat_continuation_message") or task.get("last_chat_continuation_message") or "")
+            task["chat_continuation_message"] = "\n\n".join([
+                base_message,
+                "[AUTO_CONTINUATION_NO_CHANGE]\n"
+                "上一段已经完成观察但没有产生真实文件变更。不要重新扫描项目结构，不要重复读取 read_files。"
+                "本段必须基于已有上下文直接编辑、运行验证，或给出一个具体阻塞问题。\n"
+                f"Candidate files: {', '.join(candidate_files) or '(none)'}\n"
+                f"Already read: {', '.join(read_files) or '(none)'}",
+            ]).strip()
+        execution_plan = task.get("active_execution_plan") if isinstance(task.get("active_execution_plan"), dict) else {}
+        active_route = task.get("active_intent_route") if isinstance(task.get("active_intent_route"), dict) else {}
+        if execution_plan:
+            append_event(
+                task,
+                "intent_routed",
+                {
+                    "entrypoint": "auto_continuation",
+                    "final_intent": execution_plan.get("intent"),
+                    "action": active_route.get("action") or execution_plan.get("action"),
+                    "task_family": execution_plan.get("task_family"),
+                    "target": execution_plan.get("target"),
+                    "reason": "auto_continuation_without_new_requirement",
+                    "reused": True,
+                },
+                source="queue",
+                publish=publish_task_event,
+            )
+            append_event(
+                task,
+                "execution_plan_selected",
+                {**execution_plan, "reused": True, "reuse_reason": "auto_continuation_without_new_requirement"},
+                source="queue",
+                publish=publish_task_event,
+            )
+            append_event(
+                task,
+                "execution_plan_reused",
+                {
+                    "entrypoint": "auto_continuation",
+                    "intent": execution_plan.get("intent"),
+                    "task_family": execution_plan.get("task_family"),
+                    "reason": "auto_continuation_without_new_requirement",
+                },
+                source="queue",
+                publish=publish_task_event,
+            )
         task.setdefault("logs", []).append({
             "timestamp": datetime.utcnow().isoformat(timespec="seconds") + "Z",
             "agent": "queue",
@@ -296,9 +413,9 @@ class TaskQueue:
             await agent_orchestrator.execute_task(
                 task_id,
                 task.get("description", task.get("title", "")),
-                task.get("project_type", "nextjs"),
+                task.get("project_type") or "unknown",
                 task["workspace_id"],
-                task.get("agents") or ["frontend"],
+                task.get("agents") or ["general"],
             )
             if task_id in _tasks:
                 if agent_orchestrator.prepare_wake_continuation(task_id):
@@ -317,7 +434,7 @@ class TaskQueue:
                     "timestamp": datetime.utcnow().isoformat(timespec="seconds") + "Z",
                     "agent": "queue",
                     "level": "error",
-                    "message": f"鍚庡彴浠诲姟鎵ц澶辫触: {exc}",
+                    "message": f"后台任务执行失败: {exc}",
                     "detail": str(exc),
                 })
                 save_task(dict(current))
@@ -367,14 +484,14 @@ class TaskQueue:
                     "agent": "recon",
                     "level": "info",
                     "message": (
-                        f"椤圭洰渚﹀療: {recon.get('project_kind')} / "
+                        f"项目侦察: {recon.get('project_kind')} / "
                         f"{recon.get('complexity')} / {recon.get('recommended_flow')}"
                     ),
                     "detail": json.dumps(recon, ensure_ascii=False),
                 })
                 save_task(dict(task))
             except Exception as exc:
-                logger.warning(f"[TaskQueue] 椤圭洰渚﹀療澶辫触 {task_id}: {exc}")
+                logger.warning(f"[TaskQueue] 项目侦察失败 {task_id}: {exc}")
 
         await agent_orchestrator._ensure_client(requested_model=task.get("model"))
 
@@ -384,7 +501,7 @@ class TaskQueue:
     async def _create_plan(self, task_id: str, task: dict) -> None:
         from core.task_planner import plan_task
 
-        task["current_step"] = "鍒嗘瀽闇€姹傦紝鐢熸垚浠诲姟璁″垝..."
+        task["current_step"] = "分析需求，生成任务计划..."
         task["progress"] = max(int(task.get("progress") or 0), 2)
         save_task(dict(task))
 
@@ -392,20 +509,20 @@ class TaskQueue:
         recon_summary = ""
         if recon:
             recon_summary = (
-                "\n\n椤圭洰渚﹀療缁撴灉锛歕n"
-                f"- 椤圭洰绫诲瀷: {recon.get('project_kind')}\n"
-                f"- 澶嶆潅搴? {recon.get('complexity')}\n"
-                f"- 鎺ㄨ崘娴佺▼: {recon.get('recommended_flow')}\n"
-                f"- 鎶€鏈爤: {', '.join(recon.get('likely_stack') or [])}\n"
-                f"- 鍏ュ彛鏂囦欢: {', '.join((recon.get('entrypoints') or [])[:10])}\n"
-                f"- 鍙敤鍛戒护: {json.dumps(recon.get('commands') or {}, ensure_ascii=False)}\n"
-                f"- 瑙勫垝寤鸿: {'; '.join(recon.get('plan_guidance') or [])}\n"
+                "\n\n项目侦察结果：\n"
+                f"- 项目类型: {recon.get('project_kind')}\n"
+                f"- 复杂度: {recon.get('complexity')}\n"
+                f"- 推荐流程: {recon.get('recommended_flow')}\n"
+                f"- 技术栈: {', '.join(recon.get('likely_stack') or [])}\n"
+                f"- 入口文件: {', '.join((recon.get('entrypoints') or [])[:10])}\n"
+                f"- 可用命令: {json.dumps(recon.get('commands') or {}, ensure_ascii=False)}\n"
+                f"- 规划建议: {'; '.join(recon.get('plan_guidance') or [])}\n"
             )
 
         plan_result = await plan_task(
             description=str(task.get("description") or "") + recon_summary,
-            project_type=task.get("project_type", "nextjs"),
-            agent_types=task.get("agents") or ["frontend"],
+            project_type=task.get("project_type") or "unknown",
+            agent_types=task.get("agents") or ["general"],
             llm_client=await agent_orchestrator._ensure_client(requested_model=task.get("model")),
             model=task.get("model") or agent_orchestrator._model or "",
             project_recon=recon,
@@ -414,7 +531,7 @@ class TaskQueue:
         task["plan"] = plan_result.model_dump()
         task["progress"] = 5
         if _execution_mode(task) == "planned":
-            task["current_step"] = f"瑙勫垝瀹屾垚: {len(plan_result.subtasks)} 涓瓙浠诲姟锛岀瓑寰呯‘璁?.."
+            task["current_step"] = f"规划完成: {len(plan_result.subtasks)} 个子任务，等待确认..."
             task["plan_confirmed"] = None
             task["status"] = "waiting_plan_confirm"
         else:
@@ -431,7 +548,7 @@ class TaskQueue:
             "timestamp": datetime.utcnow().isoformat(timespec="seconds") + "Z",
             "agent": "planner",
             "level": "success",
-            "message": f"璁″垝宸茬敓鎴? {len(plan_result.subtasks)} 涓瓙浠诲姟",
+            "message": f"计划已生成: {len(plan_result.subtasks)} 个子任务",
         })
         save_task(dict(task))
 

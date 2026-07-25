@@ -1,0 +1,11 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Permissions for the AutoCode IDE desktop window.",
+  "windows": ["autocode-workspace", "main"],
+  "permissions": [
+    "core:default",
+    "notification:default",
+    "updater:default"
+  ]
+}

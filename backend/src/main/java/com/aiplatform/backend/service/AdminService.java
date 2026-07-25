@@ -205,7 +205,7 @@ public class AdminService {
             HttpRequest req = HttpRequest.newBuilder()
                     .uri(URI.create(url))
                     .timeout(Duration.ofSeconds(15))
-                    .header("Authorization", "Bearer " + ch.getApiKey())
+                    .header("Authorization", "Bearer " + firstApiKey(ch.getApiKey()))
                     .GET().build();
 
             HttpResponse<String> resp = client.send(req, HttpResponse.BodyHandlers.ofString());
@@ -249,27 +249,50 @@ public class AdminService {
             HttpRequest req = HttpRequest.newBuilder()
                     .uri(URI.create(url))
                     .timeout(Duration.ofSeconds(10))
-                    .header("Authorization", "Bearer " + ch.getApiKey())
+                    .header("Authorization", "Bearer " + firstApiKey(ch.getApiKey()))
                     .GET().build();
 
             HttpResponse<String> resp = client.send(req, HttpResponse.BodyHandlers.ofString());
             int latency = (int) (System.currentTimeMillis() - start);
 
             boolean ok = resp.statusCode() == 200;
+            String message = ok
+                    ? "连接正常，延迟 " + latency + "ms"
+                    : "HTTP " + resp.statusCode() + ": " + abbreviate(resp.body(), 500);
+            ch.setStatus(ok ? "active" : "error");
+            ch.setStatusMessage(message);
             channelMapper.updateById(ch);
 
             Map<String, Object> result = new HashMap<>();
             result.put("ok", ok);
             result.put("latency", latency);
             result.put("status", resp.statusCode());
-            if (!ok) result.put("message", "HTTP " + resp.statusCode());
+            result.put("message", message);
             return result;
         } catch (Exception e) {
             int latency = (int) (System.currentTimeMillis() - start);
+            String message = e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName();
             ch.setStatus("error");
+            ch.setStatusMessage(message);
             channelMapper.updateById(ch);
-            return Map.of("ok", false, "latency", latency, "message", e.getMessage());
+            return Map.of("ok", false, "latency", latency, "message", message);
         }
+    }
+
+    private String abbreviate(String value, int maxLength) {
+        if (value == null || value.isBlank()) return "";
+        String compact = value.replaceAll("\\s+", " ").trim();
+        if (compact.length() <= maxLength) return compact;
+        return compact.substring(0, maxLength) + "...";
+    }
+
+    private String firstApiKey(String apiKey) {
+        if (apiKey == null) return "";
+        for (String part : apiKey.split("[,\\n]")) {
+            String key = part.trim();
+            if (!key.isEmpty()) return key;
+        }
+        return apiKey.trim();
     }
 
 

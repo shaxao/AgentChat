@@ -20,9 +20,11 @@ class LightScriptPlanningTest(unittest.TestCase):
             },
         )
 
-        implementation = plan.subtasks[1]
+        implementation = next(
+            subtask for subtask in plan.subtasks if "src/main.py" in subtask.estimated_files
+        )
 
-        self.assertEqual(implementation.title, "实现脚本核心行为")
+        self.assertIn("实现", implementation.title)
         self.assertIn("src/main.py", implementation.estimated_files)
         self.assertIn("src/processor.py", implementation.estimated_files)
         self.assertIn("README.md", implementation.estimated_files)
@@ -63,6 +65,7 @@ class ImplementationArtifactGateTest(unittest.TestCase):
         self.assertTrue(_subtask_expects_source(subtask, "tool"))
         self.assertFalse(_has_source_file(["SCRIPT_CONTRACT.md", ".autocode/WORK_NOTE.md"]))
         self.assertTrue(_has_source_file(["src/main.py", "README.md"]))
+        self.assertTrue(_has_source_file(["src/engine.qx"]))
 
     def test_contract_subtask_does_not_require_source_file_changes(self):
         subtask = SubTask(

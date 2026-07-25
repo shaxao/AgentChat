@@ -19,6 +19,11 @@ from core.agent_orchestrator import _execution_mode, agent_orchestrator
 from core.redis import publish_task_event, subscribe_task_events
 from core.config import get_settings
 from core.docker_manager import docker_manager
+from core.execution_protocol import (
+    EXECUTION_INTENTS,
+    build_task_capability_profile,
+    normalize_execution_plan,
+)
 from core.project_recon import run_project_recon
 from core.state import _tasks, _confirmations
 from schemas.task import TaskCreate, TaskResponse, TaskStatusResponse, AgentLogEntry
@@ -81,8 +86,9 @@ def _verify_task_ownership(task: dict, request: Request, user_id: Optional[str] 
 
 #  ?
 TERMINAL_TASK_STATUSES = {"completed", "failed", "cancelled"}
-WAITING_TASK_STATUSES = {"waiting_confirm", "waiting_plan_confirm", "waiting_prototype_confirm", "waiting_review_confirm"}
+WAITING_TASK_STATUSES = {"waiting_confirm", "waiting_user_input", "waiting_plan_confirm", "waiting_prototype_confirm", "waiting_review_confirm"}
 TOOL_POLICIES = {"ask", "auto_safe", "full_access"}
+CHAT_INTENTS = set(EXECUTION_INTENTS)
 
 
 class ToolPolicyUpdateRequest(BaseModel):
@@ -314,11 +320,11 @@ def _is_development_request(message: str) -> bool:
     change_markers = (
         "修改", "修复", "新增", "增加", "添加", "删除", "移除", "实现", "支持",
         "开发", "继续", "重试", "重新执行", "优化", "调整", "改成", "补充", "生成",
-        "完善", "重构", "接入", "适配", "升级", "扩展", "新功能", "不对", "不行",
+        "创建", "新建", "写入", "保存", "完善", "重构", "接入", "适配", "升级", "扩展", "新功能", "不对", "不行",
         "不好", "有问题", "还是这样", "没变化", "效果不好", "报错", "失败", "异常",
         "错误", "缺少", "不显示", "无法", "不能", "fix", "change", "modify", "add",
-        "remove", "delete", "implement", "develop", "retry", "rerun", "refactor", "support",
-        "optimize", "optimise",
+        "create", "new file", "write file", "save file", "remove", "delete", "implement",
+        "develop", "retry", "rerun", "refactor", "support", "optimize", "optimise",
     )
     concrete_code_markers = re.search(
         r"(`[^`]+`|[A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_][A-Za-z0-9_]*|"
@@ -334,14 +340,52 @@ def _is_development_request(message: str) -> bool:
     pure_question = bool(re.search(r"(怎么|如何|为什么|是什么|说明|解释|介绍|使用|用法|how|why|what)", text, re.I))
     change_intent = re.search(
         r"(修改|修复|新增|增加|添加|加上|删除|移除|实现|支持|开发|继续|重试|重新执行|优化|调整|改成|"
-        r"补充|生成|完善|重构|接入|适配|升级|扩展|新增功能|新功能|"
+        r"补充|生成|创建|新建|写入|保存|完善|重构|接入|适配|升级|扩展|新增功能|新功能|"
         r"不对|不行|不好|有问题|还是这样|没变化|效果不好|报错|失败|异常|错误|缺少|不显示|无法|不能|"
-        r"fix|change|modify|add|remove|delete|implement|develop|retry|rerun|refactor|support|optimi[sz]e)",
+        r"fix|change|modify|add|create|new file|write file|save file|remove|delete|implement|develop|retry|rerun|refactor|support|optimi[sz]e)",
         text,
         flags=re.I,
     )
     imperative = re.search(r"(请|帮我|给我|把|将|需要|要求|让|直接|现在|继续|开始|做|改|实现)", text, re.I)
     return bool(change_intent and (imperative or not pure_question))
+
+
+def _is_execution_imperative(message: str) -> bool:
+    """Detect imperative asks to execute/run/start something in the workspace.
+
+    Covers phrasings like "帮我启动 npm run dev", "你去执行啊", "跑一下测试",
+    which should always land in the agent loop (bash tool available) rather than
+    the passive ``answer`` branch. Read-only intents like "查看/打开" are excluded.
+    """
+    text = (message or "").strip()
+    if not text:
+        return False
+    lower = text.lower()
+    read_only_markers = ("查看", "打开", "显示", "介绍", "解释", "说明", "是什么", "为什么")
+    if any(marker in text for marker in read_only_markers):
+        return False
+    execution_verbs = re.search(
+        r"(启动|运行|执行|跑一下|跑一跑|跑起来|跑通|开一下|开一开|开起来|"
+        r"去执行|去运行|去跑|去做|去实现|去完成|去处理|去测试|去验证|去启动|"
+        r"帮我(?:启动|运行|执行|跑|开|做|实现|完成|处理|测试|验证|部署)|"
+        r"你(?:去)?(?:执行|运行|跑|做|实现|完成|处理|启动)|"
+        r"现在(?:就)?(?:执行|运行|启动|跑|开始)|"
+        r"start|run|launch|execute|kick off|fire up|boot up)",
+        text,
+        flags=re.I,
+    )
+    if not execution_verbs:
+        return False
+    target = re.search(
+        r"(npm|yarn|pnpm|pip|python|node|uv|cargo|go|make|docker|"
+        r"dev|测试|test|build|构建|部署|deploy|服务|server|流水线|pipeline|"
+        r"命令|command|脚本|script|端到端|e2e)",
+        lower,
+        flags=re.I,
+    )
+    if target:
+        return True
+    return bool(re.search(r"(你去(?:执行|做|跑)|帮我(?:去)?(?:执行|运行|跑|做))", text))
 
 
 def _looks_like_noop_menu_answer(answer: str) -> bool:
@@ -391,6 +435,411 @@ def _fallback_chat_decision(message: str, task: dict | None = None) -> dict:
     }
 
 
+def _should_reroute_command_action_to_development(message: str, decision: dict | None) -> bool:
+    """Guard against treating natural-language development requests as one-off shell commands."""
+    if not isinstance(decision, dict):
+        return False
+    if str(decision.get("action") or "").strip() != "run_command":
+        return False
+    if not _is_development_request(message):
+        return False
+    local_action = _detect_chat_action(message)
+    if not local_action:
+        return True
+    return local_action.get("type") != "run_command"
+
+
+def _should_reroute_answer_action_to_development(message: str, decision: dict | None) -> bool:
+    """Guard against classifying imperative execution requests as passive answers.
+
+    The controller sometimes picks ``answer`` for messages like "帮我启动 npm run dev"
+    or "你去执行啊", which drops the request into a text-only reply that never runs
+    tools. Reroute such answers into the real agent loop so bash/edit tools can fire.
+    """
+    if not isinstance(decision, dict):
+        return False
+    action = str(decision.get("action") or "").strip()
+    if action not in {"answer", "answer_usage"}:
+        return False
+    if action == "answer_usage":
+        return False
+    if _detect_chat_action(message):
+        return False
+    return _is_execution_imperative(message) or _is_development_request(message)
+
+
+def _clean_quoted_text(value: str) -> str:
+    text = (value or "").strip()
+    text = re.sub(r"^[“\"'「『《]+|[”\"'」』》]+$", "", text).strip()
+    return text
+
+
+def _safe_text_filename(content: str, fallback: str = "note") -> str:
+    base = _clean_quoted_text(content)[:24].strip() or fallback
+    base = re.sub(r'[\\/:*?"<>|\r\n\t]+', "_", base).strip(" ._")
+    return (base or fallback) + ".txt"
+
+
+def _normalize_local_runner_path(path: str) -> str:
+    text = str(path or "").strip()
+    if not text:
+        return ""
+    if text.startswith("\\\\?\\"):
+        return "\\\\?\\" + text[4:].replace("/", "\\")
+    if re.match(r"^[A-Za-z]:[\\/]", text):
+        return text.replace("/", "\\")
+    return text.replace("\\", "/")
+
+
+def _join_local_project_path(project_root: str, filename: str) -> str:
+    root = str(project_root or "").strip()
+    name = str(filename or "").strip().strip("\\/")
+    if not root:
+        return name
+    if root.startswith("\\\\?\\") or re.match(r"^[A-Za-z]:[\\/]", root):
+        return _normalize_local_runner_path(root.rstrip("\\/") + "\\" + name)
+    return root.rstrip("\\/") + "/" + name
+
+
+def _local_path_relative_to_root(path: str, project_root: str) -> str | None:
+    target = _normalize_local_runner_path(path)
+    root = _normalize_local_runner_path(project_root).rstrip("\\/")
+    if not target or not root:
+        return None
+    target_cmp = target.lower()
+    root_cmp = root.lower()
+    if target_cmp == root_cmp:
+        return ""
+    prefix = root_cmp + ("\\") if root.startswith("\\\\?\\") or re.match(r"^[A-Za-z]:[\\/]", root) else root_cmp + "/"
+    if target_cmp.startswith(prefix):
+        return target[len(root) + 1:].replace("\\", "/")
+    return None
+
+
+def _extract_light_local_file_spec(message: str, task: dict | None = None) -> dict | None:
+    text = (message or "").strip()
+    if not text:
+        return None
+    if _detect_chat_action(text) and re.search(r"(运行命令|执行命令|run command|execute command)", text, re.I):
+        return None
+    lower = text.lower()
+    if not re.search(r"(创建|新建|写入|保存|create|write|save)", text, re.I):
+        return None
+    if not re.search(r"(\.txt\b|txt\s*文件|文本文件|text file)", lower, re.I):
+        return None
+
+    content_match = re.search(
+        r"(?:内容(?:是|为|写入)?|写入|content\s*(?:is|=|:)?|with content)\s*[：:=]?\s*([^\r\n。；;]+)",
+        text,
+        flags=re.I,
+    )
+    content = _clean_quoted_text(content_match.group(1)) if content_match else ""
+    if not content:
+        quoted = re.search(r"[“\"「『](.+?)[”\"」』]", text)
+        content = _clean_quoted_text(quoted.group(1)) if quoted else ""
+    if not content:
+        return None
+
+    session_status = local_runner_manager.status_for_task_or_session(
+        str((task or {}).get("id") or ""),
+        str((task or {}).get("local_runner_session_id") or ""),
+    ) if task else {}
+    project_root = str(session_status.get("project_root") or "")
+    path = ""
+    absolute_file = re.search(r"([A-Za-z]:[\\/][^\r\n<>|?*]*?\.txt)", text, flags=re.I)
+    if absolute_file:
+        absolute_path = _normalize_local_runner_path(absolute_file.group(1).strip())
+        path = _local_path_relative_to_root(absolute_path, project_root) or absolute_path
+    else:
+        filename_match = re.search(r"([^\s\\/：:，。；;\"'<>|?*]+\.txt)", text, flags=re.I)
+        filename = filename_match.group(1).strip() if filename_match else _safe_text_filename(content)
+        if project_root:
+            path = filename
+        else:
+            path = filename
+
+    return {
+        "path": path,
+        "content": content,
+        "encoding": "utf-8",
+        "expected_artifacts": [{"path": path, "content": content}],
+        "completion_checks": ["file_exists", "content_matches"],
+    }
+
+
+def _coerce_chat_intent(message: str, task: dict, decision: dict | None) -> dict:
+    decision = dict(decision or {})
+    raw_intent = str(decision.get("intent") or "").strip()
+    intent = raw_intent if raw_intent in CHAT_INTENTS else ""
+    action = str(decision.get("action") or "").strip()
+    light_spec = _extract_light_local_file_spec(message, task)
+    if light_spec:
+        intent = "light_local_file_task"
+        decision.update(light_spec)
+    elif (
+        action in {"answer", "answer_usage"}
+        and intent in {"", "answer_only"}
+        and _is_execution_imperative(message)
+        and not _detect_chat_action(message)
+    ):
+        intent = "code_development"
+        decision["reason"] = "imperative_execution_override_answer"
+    elif not intent:
+        if action in {"answer", "answer_usage"}:
+            intent = "answer_only"
+        elif action in {"open_file", "show_git", "rollback_confirm", "rollback"}:
+            intent = "ide_action"
+        elif action == "run_pipeline":
+            intent = "pipeline"
+        elif action == "run_command":
+            intent = "run_command"
+        elif action == "continue_development" or _is_development_request(message):
+            intent = "code_development"
+        else:
+            intent = "answer_only"
+
+    if intent == "light_local_file_task":
+        decision["action"] = "light_local_file_task"
+    elif intent in {"artifact_creation", "workspace_action", "code_development"}:
+        decision["action"] = "continue_development"
+    elif intent == "review_only":
+        decision["action"] = "continue_from_diff"
+    elif intent == "pipeline":
+        decision["action"] = "run_pipeline"
+    elif intent == "answer_only" and action not in {"answer_usage"}:
+        decision["action"] = "answer"
+
+    decision["intent"] = intent
+    decision.setdefault("reason", "intent_coerced_by_backend")
+    return decision
+
+
+def _persist_active_intent_route(task: dict, message: str, decision: dict, *, source: str) -> dict:
+    execution_plan = normalize_execution_plan(decision, message=message, source=source)
+    route = {
+        "intent": execution_plan.get("intent"),
+        "action": decision.get("action"),
+        "task_family": execution_plan.get("task_family"),
+        "target": execution_plan.get("target"),
+        "required_capabilities": execution_plan.get("required_capabilities") or [],
+        "artifact_contracts": execution_plan.get("artifact_contracts") or [],
+        "expected_artifacts": decision.get("expected_artifacts") or [],
+        "validation_plan": execution_plan.get("validation_plan") or [],
+        "completion_checks": execution_plan.get("completion_checks") or [],
+        "retrieval_plan": execution_plan.get("retrieval_plan") or "",
+        "retrieval_seed": str(decision.get("target") or decision.get("path") or message or "")[:1200],
+        "source_message_hash": hashlib.sha256((message or "").encode("utf-8", errors="ignore")).hexdigest(),
+        "source": source,
+        "updated_at": _now_iso(),
+        "confidence": execution_plan.get("confidence"),
+        "risk_level": execution_plan.get("risk_level"),
+        "reason": execution_plan.get("reason", ""),
+    }
+    task["active_intent_route"] = route
+    task["active_execution_plan"] = execution_plan
+    return route
+
+
+async def _route_task_entry_intent(
+    task_id: str,
+    task: dict,
+    message: str,
+    request: Request,
+    *,
+    source: str,
+) -> dict:
+    """Route every natural-language task entry through the AI controller plus guards."""
+    from loguru import logger as _logger
+
+    controller_decision: dict | None = None
+    try:
+        controller_decision = await _run_chat_controller(task_id, task, message, request)
+        _append_task_log(
+            task,
+            "info",
+            f"AI controller action: {controller_decision.get('action')}",
+            agent=source,
+            detail=json.dumps(controller_decision, ensure_ascii=False)[:2000],
+        )
+        save_task(task)
+        if _controller_decision_needs_fallback(controller_decision):
+            fallback_decision = _fallback_chat_decision(message, task)
+            controller_decision = {
+                **fallback_decision,
+                "controller_fallback": True,
+                "controller_raw": controller_decision,
+            }
+            _append_task_log(
+                task,
+                "warn",
+                f"AI controller unusable, local fallback action: {controller_decision.get('action')}",
+                agent=source,
+                detail=json.dumps(controller_decision, ensure_ascii=False)[:2000],
+            )
+            save_task(task)
+    except Exception as controller_err:
+        _logger.warning(f"[{source}] AI decision failed, fallback to local detector: {controller_err}")
+        controller_decision = {
+            **_fallback_chat_decision(message, task),
+            "controller_fallback": True,
+            "controller_error": str(controller_err),
+        }
+
+    routed = _coerce_chat_intent(message, task, controller_decision)
+    active_route = _persist_active_intent_route(task, message, routed, source=source)
+    execution_plan = task.get("active_execution_plan") or {}
+    available_tools = [spec.name for spec in tool_registry.list()]
+    capability_profile = build_task_capability_profile(
+        task,
+        _workspace_root_for_task(task),
+        execution_plan,
+        available_tools=available_tools,
+    )
+    required_tools = [
+        value.split(":", 1)[1]
+        for value in execution_plan.get("required_capabilities") or []
+        if str(value).startswith("tool:")
+    ]
+    capability_profile["capability_gaps"] = [name for name in required_tools if name not in available_tools]
+    task["task_capability_profile"] = capability_profile
+    append_event(
+        task,
+        "intent_routed",
+        {
+            "entrypoint": source,
+            "message": message[:1000],
+            "ai_intent": (routed.get("controller_raw") or {}).get("intent") if isinstance(routed.get("controller_raw"), dict) else routed.get("intent"),
+            "final_intent": routed.get("intent"),
+            "action": routed.get("action"),
+            "confidence": routed.get("confidence"),
+            "target": routed.get("target") or routed.get("path"),
+            "expected_artifacts": routed.get("expected_artifacts") or [],
+            "completion_checks": routed.get("completion_checks") or [],
+            "risk_level": routed.get("risk_level"),
+            "reason": routed.get("reason", ""),
+            "active_route": active_route,
+        },
+        source=source,
+        publish=publish_task_event,
+    )
+    append_event(
+        task,
+        "capabilities_resolved",
+        capability_profile,
+        source=source,
+        publish=publish_task_event,
+    )
+    append_event(
+        task,
+        "execution_plan_selected",
+        execution_plan,
+        source=source,
+        publish=publish_task_event,
+    )
+    if capability_profile.get("capability_gaps"):
+        append_event(
+            task,
+            "capability_unavailable",
+            {"missing_tools": capability_profile["capability_gaps"], "execution_plan": execution_plan},
+            source=source,
+            publish=publish_task_event,
+        )
+    save_task(task)
+    return routed
+
+
+def _reuse_active_execution_plan(task: dict, *, source: str, reason: str) -> dict | None:
+    """Reuse a persisted AI plan for retry/resume entries that contain no new requirement."""
+    execution_plan = task.get("active_execution_plan")
+    if not isinstance(execution_plan, dict) or not execution_plan.get("intent"):
+        return None
+
+    active_route = task.get("active_intent_route")
+    active_route = dict(active_route) if isinstance(active_route, dict) else {}
+    routed = {**execution_plan, **active_route}
+    intent = str(execution_plan.get("intent") or active_route.get("intent") or "code_development")
+    action_by_intent = {
+        "answer_only": "answer",
+        "ide_action": "answer",
+        "workspace_action": "continue_development",
+        "artifact_creation": "continue_development",
+        "light_local_file_task": "light_local_file_task",
+        "code_development": "continue_development",
+        "run_command": "run_command",
+        "pipeline": "run_pipeline",
+        "review_only": "continue_from_diff",
+    }
+    routed["intent"] = intent
+    routed["action"] = str(active_route.get("action") or execution_plan.get("action") or action_by_intent.get(intent, "continue_development"))
+    routed["reused"] = True
+    routed["reuse_reason"] = reason
+
+    contracts = execution_plan.get("artifact_contracts") or []
+    if contracts and isinstance(contracts[0], dict):
+        first_contract = contracts[0]
+        routed.setdefault("path", first_contract.get("path") or execution_plan.get("target"))
+        if "content" in first_contract:
+            routed.setdefault("content", first_contract.get("content"))
+        if "encoding" in first_contract:
+            routed.setdefault("encoding", first_contract.get("encoding"))
+    expected = active_route.get("expected_artifacts") or []
+    if expected and isinstance(expected[0], dict):
+        routed.setdefault("path", expected[0].get("path"))
+        routed.setdefault("content", expected[0].get("content", ""))
+        routed.setdefault("encoding", expected[0].get("encoding", "utf-8"))
+
+    capability_profile = task.get("task_capability_profile")
+    capability_profile = dict(capability_profile) if isinstance(capability_profile, dict) else {}
+    append_event(
+        task,
+        "intent_routed",
+        {
+            "entrypoint": source,
+            "final_intent": intent,
+            "action": routed.get("action"),
+            "task_family": execution_plan.get("task_family"),
+            "target": execution_plan.get("target"),
+            "confidence": execution_plan.get("confidence"),
+            "risk_level": execution_plan.get("risk_level"),
+            "reason": reason,
+            "active_route": active_route,
+            "reused": True,
+        },
+        source=source,
+        publish=publish_task_event,
+    )
+    if capability_profile:
+        append_event(
+            task,
+            "capabilities_resolved",
+            {**capability_profile, "reused": True, "reuse_reason": reason},
+            source=source,
+            publish=publish_task_event,
+        )
+    append_event(
+        task,
+        "execution_plan_selected",
+        {**execution_plan, "reused": True, "reuse_reason": reason},
+        source=source,
+        publish=publish_task_event,
+    )
+    append_event(
+        task,
+        "execution_plan_reused",
+        {
+            "entrypoint": source,
+            "intent": intent,
+            "task_family": execution_plan.get("task_family"),
+            "source_message_hash": active_route.get("source_message_hash"),
+            "reason": reason,
+        },
+        source=source,
+        publish=publish_task_event,
+    )
+    save_task(task)
+    return routed
+
+
 def _is_clear_non_development_question(message: str) -> bool:
     text = (message or "").strip()
     if not text:
@@ -406,7 +855,7 @@ def _is_clear_non_development_question(message: str) -> bool:
         "how to use", "usage", "what is", "why",
     )):
         return True
-    return bool(re.search(r"(鎬庝箞鐢▅濡備綍浣跨敤|浣跨敤鏂规硶|鐢ㄦ硶|鎬庝箞杩愯|濡備綍杩愯|瑙ｉ噴|璇存槑|鏄粈涔坾涓轰粈涔坾鐘舵€亅鎬荤粨|how to use|usage|what is|why)", text, re.I))
+    return False
 
 
 def _is_vague_continue_confirmation(message: str) -> bool:
@@ -415,6 +864,73 @@ def _is_vague_continue_confirmation(message: str) -> bool:
         "继续", "继续修改", "继续开发", "继续任务", "继续修改当前项目",
         "是", "是的", "对", "确认", "按你说的继续", "就这样继续",
     }
+
+
+def _detect_review_confirmation_message(message: str) -> bool | None:
+    text = re.sub(r"\s+", "", message or "").lower()
+    if not text:
+        return None
+    reject_markers = {
+        "拒绝", "取消", "停止", "不通过", "不要继续", "不继续", "否", "不是", "不确认",
+        "reject", "cancel", "stop", "do not continue", "dont continue", "don't continue",
+    }
+    if text in reject_markers or any(marker in text for marker in ("拒绝审查", "取消任务", "停止任务", "rejectreview")):
+        return False
+    confirm_markers = {
+        "继续", "继续执行", "继续任务", "确认", "确认继续", "通过", "同意", "没问题", "可以", "是", "是的",
+        "approve", "approved", "confirm", "continue", "ok", "yes",
+    }
+    if text in confirm_markers or any(marker in text for marker in ("确认审查", "审查通过", "继续执行", "approve review")):
+        return True
+    return None
+
+
+def _apply_review_confirmation_from_chat(task_id: str, task: dict, confirmed: bool, message: str) -> None:
+    review = task.get("review", {}) if isinstance(task.get("review"), dict) else {}
+    review_score = review.get("score", 0)
+    issue_count = len(review.get("issues", []) or [])
+    task["review_confirmed"] = confirmed
+    if confirmed:
+        task["status"] = "running"
+        task["execution_active"] = False
+        task["current_step"] = "产物审查已通过聊天确认，继续执行。"
+        task.setdefault("logs", []).append({
+            "timestamp": datetime.utcnow().isoformat(),
+            "agent": "chat_controller",
+            "level": "success",
+            "message": f"产物审查已通过聊天确认：评分 {review_score}，问题 {issue_count} 个",
+        })
+        append_event(
+            task,
+            "review_confirmation_resolved",
+            {
+                "confirmed": True,
+                "source": "chat",
+                "message": message[:1000],
+                "score": review_score,
+                "issue_count": issue_count,
+            },
+            source="chat_controller",
+        )
+        save_task(dict(task))
+        task_queue.enqueue(task_id, "review confirmed by chat")
+        return
+    task["status"] = "cancelled"
+    task["execution_active"] = False
+    task["current_step"] = "用户通过聊天拒绝了产物审查"
+    append_event(
+        task,
+        "review_confirmation_resolved",
+        {
+            "confirmed": False,
+            "source": "chat",
+            "message": message[:1000],
+            "score": review_score,
+            "issue_count": issue_count,
+        },
+        source="chat_controller",
+    )
+    save_task(dict(task))
 
 
 def _build_chat_continuation_message(task: dict, current_message: str) -> str:
@@ -456,6 +972,7 @@ def _prepare_task_for_chat_continuation(task: dict, continuation_message: str) -
     task.pop("error", None)
     task.pop("failure_type", None)
     task.pop("pending_confirmation", None)
+    task.pop("pending_user_input", None)
     task["current_step"] = "AI 助手已接管，等待后台增量执行"
     append_event(
         task,
@@ -651,9 +1168,18 @@ async def _run_chat_controller(task_id: str, task: dict, message: str, request: 
     data = decision.raw or {}
     data.update({
         "action": decision.action,
+        "intent": decision.intent,
         "confidence": decision.confidence,
         "answer": decision.answer,
     })
+    if decision.reason:
+        data["reason"] = decision.reason
+    if decision.expected_artifacts:
+        data["expected_artifacts"] = decision.expected_artifacts
+    if decision.completion_checks:
+        data["completion_checks"] = decision.completion_checks
+    if decision.risk_level is not None:
+        data["risk_level"] = decision.risk_level
     if decision.path:
         data["path"] = decision.path
     if decision.line:
@@ -669,7 +1195,7 @@ def _detect_chat_action(message: str) -> dict | None:
     if not text:
         return None
 
-    if re.search(r"(鎬庝箞鐢▅濡備綍浣跨敤|浣跨敤鏂规硶|鐢ㄦ硶|how to use|usage)", text, flags=re.I):
+    if re.search(r"(怎么用|如何使用|使用方法|用法|how to use|usage)", text, flags=re.I):
         return {"type": "answer_usage"}
 
     file_line_match = re.search(
@@ -684,36 +1210,36 @@ def _detect_chat_action(message: str) -> dict | None:
         return action
 
     file_match = re.search(
-        r"(?:鎵撳紑|鏌ョ湅|open|show)\s*(?:鏂囦欢)?\s*([A-Za-z0-9_.@()+\-/\\]+?\.(?:tsx|ts|jsx|js|mjs|cjs|vue|css|scss|html|md|json|py|java|go|rs|php|rb|sh|ps1|sql|yml|yaml|toml|xml|txt))",
+        r"(?:打开|查看|open|show)\s*(?:文件)?\s*([A-Za-z0-9_.@()+\-/\\]+?\.(?:tsx|ts|jsx|js|mjs|cjs|vue|css|scss|html|md|json|py|java|go|rs|php|rb|sh|ps1|sql|yml|yaml|toml|xml|txt))",
         text,
         flags=re.I,
     )
     if file_match:
         return {"type": "open_file", "path": file_match.group(1).replace("\\", "/").lstrip("/")}
 
-    if re.search(r"(pipeline|ci|娴佹按绾縷瀹屾暣楠岃瘉)", text, flags=re.I):
+    if re.search(r"(pipeline|ci|流水线|完整验证)", text, flags=re.I):
         return {"type": "run_pipeline"}
 
-    command_match = re.search(r"(?:run command|execute command|杩愯鍛戒护|鎵ц鍛戒护)\s*[:锛歖?\s*(.+)$", text, flags=re.I)
+    command_match = re.search(r"(?:run command|execute command|运行命令|执行命令)\s*[:：]?\s*(.+)$", text, flags=re.I)
     if command_match:
         command = command_match.group(1).strip()
         if command:
             return {"type": "run_command", "command": command}
 
-    if re.search(r"(杩愯|鎵ц|璺?.{0,8}(test|tests|娴嬭瘯|build|鏋勫缓)", text, flags=re.I):
-        if re.search(r"(build|鏋勫缓)", text, flags=re.I):
+    if re.search(r"(运行|执行|跑).{0,8}(test|tests|测试|build|构建)", text, flags=re.I):
+        if re.search(r"(build|构建)", text, flags=re.I):
             return {"type": "run_command", "command": "build"}
         return {"type": "run_command", "command": "test"}
 
-    if re.search(r"(鏌ョ湅|鎵撳紑|鏄剧ず).{0,8}(diff|鍙樻洿|git)", text, flags=re.I):
+    if re.search(r"(查看|打开|显示).{0,8}(diff|变更|git)", text, flags=re.I):
         return {"type": "show_git", "target": "working"}
 
-    rollback_confirm_match = re.search(r"(?:纭鍥為€€|纭鎾ら攢).{0,12}([0-9a-f]{7,40}|涓婁竴鐗坾涓婁竴娆??", text, flags=re.I)
+    rollback_confirm_match = re.search(r"(?:确认回退|确认撤销).{0,12}([0-9a-f]{7,40}|上一版本|上一次)", text, flags=re.I)
     if rollback_confirm_match:
         target = rollback_confirm_match.group(1)
         return {"type": "rollback_confirm", "target": "previous" if not target or target in ("上一版", "上一次") else target}
 
-    rollback_match = re.search(r"(?:鍥為€€|鎾ら攢|rollback|revert).{0,12}([0-9a-f]{7,40}|涓婁竴鐗坾涓婁竴娆??", text, flags=re.I)
+    rollback_match = re.search(r"(?:回退|撤销|rollback|revert).{0,12}([0-9a-f]{7,40}|上一版本|上一次)", text, flags=re.I)
     if rollback_match:
         target = rollback_match.group(1)
         return {"type": "rollback_confirm", "target": "previous" if not target or target in ("上一版", "上一次") else target}
@@ -726,11 +1252,11 @@ def _detect_chat_action(message: str) -> dict | None:
     if not text:
         return None
 
-    if re.search(r"(鎬庝箞鐢▅濡備綍浣跨敤|浣跨敤鏂规硶|鐢ㄦ硶|how to use|usage)", text, flags=re.I):
+    if re.search(r"(怎么用|如何使用|使用方法|用法|how to use|usage)", text, flags=re.I):
         return {"type": "answer_usage"}
 
     file_match = re.search(
-        r"(?:鎵撳紑|鏌ョ湅|瀹氫綅|open|show)\s*(?:鏂囦欢)?\s*([A-Za-z0-9_.@()+\-/\\]+?\.(?:tsx|ts|jsx|js|mjs|cjs|vue|css|scss|html|md|json|py|java|go|rs|php|rb|sh|ps1|sql|yml|yaml|toml|xml|txt))(?:[:#L\s]+(\d+))?",
+        r"(?:打开|查看|定位|open|show)\s*(?:文件)?\s*([A-Za-z0-9_.@()+\-/\\]+?\.(?:tsx|ts|jsx|js|mjs|cjs|vue|css|scss|html|md|json|py|java|go|rs|php|rb|sh|ps1|sql|yml|yaml|toml|xml|txt))(?:[:#L\s]+(\d+))?",
         text,
         flags=re.I,
     )
@@ -740,27 +1266,27 @@ def _detect_chat_action(message: str) -> dict | None:
             action["line"] = int(file_match.group(2))
         return action
 
-    if re.search(r"(pipeline|ci|娴佹按绾縷瀹屾暣楠岃瘉|绔埌绔獙璇?", text, flags=re.I):
+    if re.search(r"(pipeline|ci|流水线|完整验证|端到端验证)", text, flags=re.I):
         return {"type": "run_pipeline"}
 
-    command_match = re.search(r"(?:run command|execute command|杩愯鍛戒护|鎵ц鍛戒护)\s*[:锛歖?\s*(.+)$", text, flags=re.I)
+    command_match = re.search(r"(?:run command|execute command|运行命令|执行命令)\s*[:：]?\s*(.+)$", text, flags=re.I)
     if command_match:
         command = command_match.group(1).strip()
         if command:
             return {"type": "run_command", "command": command}
 
-    if re.search(r"(杩愯|鎵ц).{0,8}(test|tests|娴嬭瘯|build|鏋勫缓)", text, flags=re.I):
-        return {"type": "run_command", "command": "build" if re.search(r"(build|鏋勫缓)", text, flags=re.I) else "test"}
+    if re.search(r"(运行|执行).{0,8}(test|tests|测试|build|构建)", text, flags=re.I):
+        return {"type": "run_command", "command": "build" if re.search(r"(build|构建)", text, flags=re.I) else "test"}
 
-    if re.search(r"(鏌ョ湅|鎵撳紑|鏄剧ず).{0,8}(diff|鍙樻洿|git|鎻愪氦)", text, flags=re.I):
+    if re.search(r"(查看|打开|显示).{0,8}(diff|变更|git|提交)", text, flags=re.I):
         return {"type": "show_git", "target": "working"}
 
-    rollback_confirm_match = re.search(r"(?:纭鍥為€€|纭鎾ら攢).{0,12}([0-9a-f]{7,40}|涓婁竴鐗坾涓婁竴娆??", text, flags=re.I)
+    rollback_confirm_match = re.search(r"(?:确认回退|确认撤销).{0,12}([0-9a-f]{7,40}|上一版本|上一次)", text, flags=re.I)
     if rollback_confirm_match:
         target = rollback_confirm_match.group(1)
         return {"type": "rollback_confirm", "target": "previous" if not target or target in ("上一版", "上一次") else target}
 
-    rollback_match = re.search(r"(?:鍥為€€|鎾ら攢|rollback|revert).{0,12}([0-9a-f]{7,40}|涓婁竴鐗坾涓婁竴娆??", text, flags=re.I)
+    rollback_match = re.search(r"(?:回退|撤销|rollback|revert).{0,12}([0-9a-f]{7,40}|上一版本|上一次)", text, flags=re.I)
     if rollback_match:
         target = rollback_match.group(1)
         return {"type": "rollback_confirm", "target": "previous" if not target or target in ("上一版", "上一次") else target}
@@ -789,30 +1315,58 @@ def _publish_command_history(task_id: str, task: dict) -> None:
     _publish_task_update(task_id, "command_history", {"commands": task.get("command_history", [])[-100:]})
 
 def _infer_workspace_command(task_id: str, kind: str | None) -> str:
+    task = _tasks.get(task_id) or {}
+    plan = task.get("active_execution_plan") or {}
+    requested = str(kind or "").lower()
+    accepted = {requested, "command", "validation", "validate", "check"}
+    if requested == "test":
+        accepted.add("tests")
+    for step in plan.get("validation_plan") or []:
+        if not isinstance(step, dict):
+            continue
+        command = str(step.get("command") or "").strip()
+        step_kind = str(step.get("kind") or "command").lower()
+        if command and step_kind in accepted:
+            return command
+
     ws_root = _resolve_workspace_path(task_id, "/")
     package_json = ws_root / "package.json"
     if package_json.exists():
         try:
             pkg = json.loads(package_json.read_text(encoding="utf-8"))
             scripts = pkg.get("scripts") or {}
-            if kind == "build" and "build" in scripts:
-                return "npm run build"
-            if kind == "test":
-                for script in ("test", "unit", "test:unit", "vitest"):
-                    if script in scripts:
-                        return f"npm run {script}"
-                if "build" in scripts:
-                    return "npm run build"
+            candidates = ("test", "unit", "test:unit", "vitest") if requested == "test" else ("build", "typecheck", "lint", "check")
+            for script in candidates:
+                if script not in scripts:
+                    continue
+                if (ws_root / "pnpm-lock.yaml").exists():
+                    return f"pnpm run {script}"
+                if (ws_root / "yarn.lock").exists():
+                    return f"yarn {script}"
+                if (ws_root / "bun.lockb").exists() or (ws_root / "bun.lock").exists():
+                    return f"bun run {script}"
+                return f"npm run {script}"
         except Exception:
             pass
-    if (ws_root / "pytest.ini").exists() or (ws_root / "pyproject.toml").exists():
-        return "pytest -q" if kind == "test" else "python -m compileall ."
+    if (ws_root / "pytest.ini").exists() or (ws_root / "pyproject.toml").exists() or any(ws_root.glob("*.py")):
+        return "python -m pytest" if requested == "test" else "python -m compileall -q ."
     if (ws_root / "pom.xml").exists():
-        return "mvn test" if kind == "test" else "mvn -DskipTests package"
+        return "mvn test" if requested == "test" else "mvn -DskipTests package"
+    if (ws_root / "gradlew").exists():
+        return "./gradlew test" if requested == "test" else "./gradlew build"
     if (ws_root / "go.mod").exists():
-        return "go test ./..." if kind == "test" else "go build ./..."
-    return "npm test" if kind == "test" else "npm run build"
-
+        return "go test ./..." if requested == "test" else "go build ./..."
+    if (ws_root / "Cargo.toml").exists():
+        return "cargo test" if requested == "test" else "cargo build"
+    if any(ws_root.glob("*.sln")) or any(ws_root.glob("*.csproj")):
+        return "dotnet test" if requested == "test" else "dotnet build"
+    if (ws_root / "mix.exs").exists():
+        return "mix test" if requested == "test" else "mix compile"
+    if (ws_root / "pubspec.yaml").exists():
+        return "dart test" if requested == "test" else "dart analyze"
+    if (ws_root / "Package.swift").exists():
+        return "swift test" if requested == "test" else "swift build"
+    return ""
 
 def _command_label_for_kind(kind: str | None, command: str) -> str:
     if kind == "test":
@@ -1101,7 +1655,7 @@ async def _stream_chat_action(task_id: str, task: dict, message: str, action: di
             })
         elif action["type"] == "rollback_confirm":
             target = action.get("target", "previous")
-            explicit_confirm = bool(re.search(r"(纭鍥為€€|纭鎾ら攢|confirm rollback|confirm revert)", message, flags=re.I))
+            explicit_confirm = bool(re.search(r"(确认回退|确认撤销|confirm rollback|confirm revert)", message, flags=re.I))
             if explicit_confirm:
                 result = _rollback_task_to_target(task_id, task, target)
                 yield _sse("runtime_event", (task.get("events") or [])[-1], task_id)
@@ -1302,29 +1856,29 @@ def _detect_chat_action(message: str) -> dict | None:
             action["line"] = int(file_match.group(2))
         return action
 
-    if re.search(r"(娴佹按绾縷瀹屾暣楠岃瘉|绔埌绔獙璇亅鍏ㄩ噺楠岃瘉|pipeline|ci)", text, flags=re.I):
+    if re.search(r"(流水线|完整验证|端到端验证|全量验证|pipeline|ci)", text, flags=re.I):
         return {"type": "run_pipeline"}
 
-    command_match = re.search(r"(?:杩愯鍛戒护|鎵ц鍛戒护|run command|execute command)\s*[:锛歖?\s*(.+)$", text, flags=re.I)
+    command_match = re.search(r"(?:运行命令|执行命令|run command|execute command)\s*[:：]?\s*(.+)$", text, flags=re.I)
     if command_match:
         command = command_match.group(1).strip()
         if command:
             return {"type": "run_command", "command": command}
 
-    if re.search(r"(杩愯|鎵ц).{0,8}(娴嬭瘯|test|tests)", text, flags=re.I):
+    if re.search(r"(运行|执行).{0,8}(测试|test|tests)", text, flags=re.I):
         return {"type": "run_command", "command": "test"}
-    if re.search(r"(杩愯|鎵ц).{0,8}(鏋勫缓|build)", text, flags=re.I):
+    if re.search(r"(运行|执行).{0,8}(构建|build)", text, flags=re.I):
         return {"type": "run_command", "command": "build"}
 
-    if re.search(r"(鏌ョ湅|鎵撳紑|鏄剧ず).{0,8}(diff|鍙樻洿|git|鎻愪氦)", text, flags=re.I):
+    if re.search(r"(查看|打开|显示).{0,8}(diff|变更|git|提交)", text, flags=re.I):
         return {"type": "show_git", "target": "working"}
 
-    rollback_confirm_match = re.search(r"(?:纭鍥為€€|纭鎾ら攢).{0,12}([0-9a-f]{7,40}|涓婁竴鐗坾涓婁竴娆??", text, flags=re.I)
+    rollback_confirm_match = re.search(r"(?:确认回退|确认撤销).{0,12}([0-9a-f]{7,40}|上一版本|上一次)", text, flags=re.I)
     if rollback_confirm_match:
         target = rollback_confirm_match.group(1)
         return {"type": "rollback_confirm", "target": "previous" if not target or target in ("上一版", "上一次") else target}
 
-    rollback_match = re.search(r"(?:鍥為€€|鎾ら攢|rollback|revert).{0,12}([0-9a-f]{7,40}|涓婁竴鐗坾涓婁竴娆??", text, flags=re.I)
+    rollback_match = re.search(r"(?:回退|撤销|rollback|revert).{0,12}([0-9a-f]{7,40}|上一版本|上一次)", text, flags=re.I)
     if rollback_match:
         target = rollback_match.group(1)
         return {"type": "rollback_confirm", "target": "previous" if not target or target in ("上一版", "上一次") else target}
@@ -1354,7 +1908,7 @@ async def _stream_chat_action(task_id: str, task: dict, message: str, action: di
                 "type": "open_file",
                 "path": rel_path,
                 "line": action.get("line"),
-                "message": f"宸叉墦寮€ `{rel_path}`",
+                "message": f"已打开 `{rel_path}`",
                 "timestamp": _now_iso(),
             }, task_id)
 
@@ -1386,7 +1940,7 @@ async def _stream_chat_action(task_id: str, task: dict, message: str, action: di
         elif action["type"] in ("rollback_confirm", "rollback"):
             target = action.get("target", "previous")
             explicit_confirm = action["type"] == "rollback" or bool(
-                re.search(r"(纭鍥為€€|纭鎾ら攢|confirm rollback|confirm revert)", message, flags=re.I)
+                re.search(r"(确认回退|确认撤销|confirm rollback|confirm revert)", message, flags=re.I)
             )
             if not explicit_confirm:
                 _append_task_log(task, "chat_assistant", f"Rollback confirmation requested: {target}", agent="assistant")
@@ -1480,7 +2034,7 @@ async def _stream_chat_action(task_id: str, task: dict, message: str, action: di
                         if not conf.get("approved", conf.get("confirmed")):
                             save_task(task)
                             yield _sse("message", {
-                                "content": f"宸叉嫆缁濇墽琛屽懡浠わ細`{command}`",
+                                "content": f"已拒绝执行命令：`{command}`",
                                 "timestamp": _now_iso(),
                             }, task_id)
                             return
@@ -1548,35 +2102,41 @@ async def _stream_chat_action(task_id: str, task: dict, message: str, action: di
 
 
 def _detect_chat_action(message: str) -> dict | None:
-    """UTF-8 AutoCode chat control fallback.
-
-    This final definition intentionally overrides earlier legacy fallback blocks.
-    """
+    """UTF-8, format-agnostic fallback used after the AI controller."""
     text = (message or "").strip()
     if not text:
         return None
     lower = text.lower()
 
-    if any(marker in lower for marker in ("怎么用", "如何使用", "使用方法", "用法", "怎么运行", "如何运行", "how to use", "usage")):
-        return {"type": "answer_usage"}
-
-    if re.search(r"(鎬庝箞鐢▅濡備綍浣跨敤|浣跨敤鏂规硶|鐢ㄦ硶|鎬庝箞杩愯|濡備綍杩愯|how to use|usage)", text, flags=re.I):
+    if any(marker in lower for marker in (
+        "怎么用", "如何使用", "使用方法", "用法", "怎么运行", "如何运行",
+        "how to use", "usage",
+    )):
         return {"type": "answer_usage"}
 
     file_match = re.search(
-        r"(?:鎵撳紑|鏌ョ湅|瀹氫綅|open|show)\s*(?:鏂囦欢)?\s*([A-Za-z0-9_.@()+\-/\\]+?\.(?:tsx|ts|jsx|js|mjs|cjs|vue|css|scss|html|md|json|py|java|go|rs|php|rb|sh|ps1|sql|yml|yaml|toml|xml|txt))(?:[:#L\s]+(\d+))?",
+        r"(?:打开|查看|定位|open|show)\s*(?:文件)?\s*(?:\x60([^\x60]+)\x60|\"([^\"]+)\"|'([^']+)'|([^\s]+))",
         text,
         flags=re.I,
     )
     if file_match:
-        action = {"type": "open_file", "path": file_match.group(1).replace("\\", "/").lstrip("/")}
-        if file_match.group(2):
-            action["line"] = int(file_match.group(2))
+        raw_path = next((group for group in file_match.groups() if group), "").strip().rstrip("，。,.")
+        line = None
+        inline_line = re.match(r"^(.*?)(?::|#L)(\d+)$", raw_path, flags=re.I)
+        if inline_line:
+            raw_path = inline_line.group(1)
+            line = int(inline_line.group(2))
+        else:
+            trailing_line = re.search(r"(?:第|#L|L)?\s*(\d+)\s*行?", text[file_match.end():], flags=re.I)
+            if trailing_line:
+                line = int(trailing_line.group(1))
+        action = {"type": "open_file", "path": raw_path.replace("\\", "/").lstrip("/")}
+        if line is not None:
+            action["line"] = line
         return action
 
     if re.search(r"(根据|基于).{0,8}(diff|变更|改动).{0,12}(继续|修改|修复|调整)", text, flags=re.I):
         return {"type": "continue_from_diff"}
-
     if re.search(r"(流水线|完整验证|端到端验证|全量验证|pipeline|ci)", text, flags=re.I):
         return {"type": "run_pipeline"}
 
@@ -1585,43 +2145,30 @@ def _detect_chat_action(message: str) -> dict | None:
         command = command_match.group(1).strip()
         if command:
             return {"type": "run_command", "command": command}
-
     if re.search(r"(运行|执行).{0,8}(测试|test|tests)", text, flags=re.I):
         return {"type": "run_command", "command": "test"}
     if re.search(r"(运行|执行).{0,8}(构建|build)", text, flags=re.I):
         return {"type": "run_command", "command": "build"}
-
     if re.search(r"(查看|打开|显示).{0,8}(diff|变更|改动|git|提交)", text, flags=re.I):
         return {"type": "show_git", "target": "working"}
 
-    rollback_confirm_match = re.search(
-        r"(?:纭鍥為€€|纭鎾ら攢|confirm rollback|confirm revert).{0,12}([0-9a-f]{7,40}|涓婁竴鐗坾涓婁竴娆涓婁竴鏉涓婁釜鐗堟湰)?",
+    rollback_confirm = re.search(
+        r"(?:确认回退|确认撤销|confirm rollback|confirm revert).{0,12}([0-9a-f]{7,40}|上一版|上一次|上一条|上个版本)?",
         text,
         flags=re.I,
     )
-    rollback_confirm_real = re.search(r"(?:确认回退|确认撤销|confirm rollback|confirm revert).{0,12}([0-9a-f]{7,40}|上一版|上一次|上一条|上个版本)?", text, flags=re.I)
-    if rollback_confirm_real:
-        target = rollback_confirm_real.group(1)
+    if rollback_confirm:
+        target = rollback_confirm.group(1)
         return {"type": "rollback_confirm", "target": "previous" if not target or target in {"上一版", "上一次", "上一条", "上个版本"} else target}
 
-    if rollback_confirm_match:
-        target = rollback_confirm_match.group(1)
-        return {"type": "rollback_confirm", "target": "previous" if not target or target in {"上一版", "上一次", "上一条", "上个版本"} else target}
-
-    rollback_match = re.search(
-        r"(?:鍥為€€|鎾ら攢|rollback|revert).{0,12}([0-9a-f]{7,40}|涓婁竴鐗坾涓婁竴娆涓婁竴鏉涓婁釜鐗堟湰)?",
+    rollback = re.search(
+        r"(?:回退|撤销|rollback|revert).{0,12}([0-9a-f]{7,40}|上一版|上一次|上一条|上个版本)?",
         text,
         flags=re.I,
     )
-    rollback_real = re.search(r"(?:回退|撤销|rollback|revert).{0,12}([0-9a-f]{7,40}|上一版|上一次|上一条|上个版本)?", text, flags=re.I)
-    if rollback_real:
-        target = rollback_real.group(1)
+    if rollback:
+        target = rollback.group(1)
         return {"type": "rollback_confirm", "target": "previous" if not target or target in {"上一版", "上一次", "上一条", "上个版本"} else target}
-
-    if rollback_match:
-        target = rollback_match.group(1)
-        return {"type": "rollback_confirm", "target": "previous" if not target or target in {"上一版", "上一次", "上一条", "上个版本"} else target}
-
     return None
 
 
@@ -1679,7 +2226,7 @@ async def _stream_chat_action(task_id: str, task: dict, message: str, action: di
         elif action["type"] in ("rollback_confirm", "rollback"):
             target = action.get("target", "previous")
             explicit_confirm = action["type"] == "rollback" or bool(
-                re.search(r"(纭鍥為€€|纭鎾ら攢|confirm rollback|confirm revert)", message, flags=re.I)
+                re.search(r"(确认回退|确认撤销|confirm rollback|confirm revert)", message, flags=re.I)
             )
             if not explicit_confirm:
                 _append_task_log(task, "chat_assistant", f"Rollback confirmation requested: {target}", agent="assistant")
@@ -1773,7 +2320,7 @@ async def _stream_chat_action(task_id: str, task: dict, message: str, action: di
                         if not conf.get("approved", conf.get("confirmed")):
                             save_task(task)
                             yield _sse("message", {
-                                "content": f"宸叉嫆缁濇墽琛屽懡浠わ細`{command}`",
+                                "content": f"已拒绝执行命令：`{command}`",
                                 "timestamp": _now_iso(),
                             }, task_id)
                             return
@@ -1809,6 +2356,14 @@ async def _stream_chat_action(task_id: str, task: dict, message: str, action: di
                 "message": f"命令执行完成，退出码：{record.get('exit_code')}",
                 "timestamp": _now_iso(),
             }, task_id)
+            command_message = _command_result_chat_message(record)
+            _append_task_log(task, "chat_assistant", command_message, agent="assistant")
+            append_event(task, "assistant_message", {"content": command_message}, source="assistant")
+            save_task(task)
+            yield _sse("message", {
+                "content": command_message,
+                "timestamp": _now_iso(),
+            }, task_id)
 
         elif action["type"] == "run_pipeline":
             yield _sse("action", {
@@ -1834,6 +2389,194 @@ async def _stream_chat_action(task_id: str, task: dict, message: str, action: di
         save_task(task)
         yield _sse("message", {"content": f"操作失败：{str(e)}", "timestamp": _now_iso()}, task_id)
         yield _sse("done", {"status": task.get("status", "unknown"), "preview_url": task.get("preview_url")}, task_id)
+
+
+async def _execute_light_local_file_task_once(
+    task_id: str,
+    task: dict,
+    message: str,
+    action: dict,
+    *,
+    source: str = "chat_controller",
+    record_user_message: bool = True,
+    restore_status_on_failure: bool = True,
+) -> dict:
+    """Execute one bounded local text-file task and enforce its completion checks."""
+    if record_user_message:
+        _append_task_log(task, "chat_user", message, agent="user")
+    previous_status = str(task.get("status") or "pending")
+    previous_step = str(task.get("current_step") or "")
+    path = str(action.get("path") or "").strip()
+    content = str(action.get("content") or "")
+    encoding = str(action.get("encoding") or "utf-8")
+    notices: list[dict] = []
+    append_event(
+        task,
+        "light_task_started",
+        {"intent": "light_local_file_task", "path": path, "encoding": encoding},
+        source=source,
+        publish=publish_task_event,
+    )
+    save_task(task)
+
+    try:
+        status = local_runner_manager.status_for_task_or_session(
+            task_id,
+            str(task.get("local_runner_session_id") or ""),
+        )
+        if not status.get("connected"):
+            raise RuntimeError("本地项目未连接。请先打开 AutoCode Local Connector 并连接授权项目目录。")
+        if not path:
+            raise RuntimeError("未能确定要写入的本地文件路径。")
+
+        notices.append({
+            "content": f"我会用结构化本地文件工具写入 `{path}`，然后读取校验内容。",
+            "timestamp": _now_iso(),
+        })
+
+        try:
+            write_result = await local_runner_manager.execute_tool(
+                task_id,
+                "local_write_text_file",
+                {"path": path, "content": content, "encoding": encoding},
+                timeout=40,
+            )
+            read_tool = "local_read_text_file"
+            if (
+                not write_result.get("ok", True)
+                and "unsupported tool" in str(write_result.get("error") or write_result.get("result") or "").lower()
+            ):
+                raise RuntimeError(str(write_result.get("error") or write_result.get("result") or "unsupported tool"))
+        except Exception as exc:
+            if "unsupported tool" not in str(exc).lower():
+                raise
+            append_event(
+                task,
+                "local_runner_tool_fallback",
+                {
+                    "from_tool": "local_write_text_file",
+                    "to_tool": "write_file",
+                    "reason": str(exc),
+                },
+                source=source,
+                publish=publish_task_event,
+            )
+            write_result = await local_runner_manager.execute_tool(
+                task_id,
+                "write_file",
+                {"path": path, "content": content},
+                timeout=40,
+            )
+            read_tool = "read_file"
+        if not write_result.get("ok"):
+            raise RuntimeError(str(write_result.get("error") or write_result.get("result") or "本地写入失败"))
+
+        read_result = await local_runner_manager.execute_tool(
+            task_id,
+            read_tool,
+            {"path": path, "encoding": encoding},
+            timeout=30,
+        )
+        if not read_result.get("ok"):
+            raise RuntimeError(str(read_result.get("error") or read_result.get("result") or "本地读取验证失败"))
+
+        actual = str(read_result.get("content") if read_result.get("content") is not None else read_result.get("result") or "")
+        if actual != content:
+            raise RuntimeError(f"文件内容验证失败：期望 {content!r}，实际 {actual!r}")
+
+        absolute_path = str(read_result.get("absolute_path") or write_result.get("absolute_path") or path)
+        size = read_result.get("size") if read_result.get("size") is not None else write_result.get("size")
+        completed_event = append_event(
+            task,
+            "light_task_completed",
+            {
+                "intent": "light_local_file_task",
+                "path": absolute_path,
+                "content": content,
+                "encoding": encoding,
+                "size": size,
+                "completion_checks": ["file_exists", "content_matches"],
+            },
+            source="local_runner",
+        )
+        append_event(
+            task,
+            "task_stop_guard_triggered",
+            {
+                "reason": "light_local_file_task_completed",
+                "path": absolute_path,
+                "checks": ["file_exists", "content_matches"],
+            },
+            source=source,
+            publish=publish_task_event,
+        )
+        task["status"] = "completed"
+        task["progress"] = 100
+        task["execution_active"] = False
+        task["needs_continuation"] = False
+        task.pop("chat_continuation_message", None)
+        task.pop("agent_iteration_limited", None)
+        task["current_step"] = "轻量本地文件任务已完成"
+        final_message = (
+            f"任务完成。已创建/更新本地文件 `{absolute_path}`，内容为「{content}」，"
+            f"并已读取验证一致。"
+        )
+        _append_task_log(task, "chat_assistant", final_message, agent="assistant")
+        append_event(task, "assistant_message", {"content": final_message}, source="assistant", publish=publish_task_event)
+        save_task(task)
+        notices.append({"content": final_message, "timestamp": _now_iso()})
+        return {
+            "ok": True,
+            "message": final_message,
+            "notices": notices,
+            "runtime_events": [completed_event],
+            "status": task.get("status", "completed"),
+            "preview_url": task.get("preview_url"),
+        }
+    except Exception as exc:
+        task["status"] = previous_status if restore_status_on_failure else "failed"
+        if not restore_status_on_failure:
+            task["progress"] = 0
+        task["execution_active"] = False
+        task["needs_continuation"] = False
+        task["current_step"] = previous_step if restore_status_on_failure and previous_step else "轻量本地文件任务失败"
+        error_message = f"轻量本地文件任务失败：{exc}"
+        _append_task_log(task, "error", error_message, agent="local_runner")
+        append_event(
+            task,
+            "light_task_failed",
+            {"intent": "light_local_file_task", "path": path, "error": str(exc)},
+            source="local_runner",
+            publish=publish_task_event,
+        )
+        save_task(task)
+        notices.append({"content": error_message, "timestamp": _now_iso()})
+        return {
+            "ok": False,
+            "message": error_message,
+            "notices": notices,
+            "runtime_events": [],
+            "status": task.get("status", "failed"),
+            "preview_url": task.get("preview_url"),
+        }
+
+
+async def _stream_light_local_file_task(task_id: str, task: dict, message: str, action: dict):
+    """Execute a bounded local text-file task without entering the full Agent loop."""
+    result = await _execute_light_local_file_task_once(
+        task_id,
+        task,
+        message,
+        action,
+        source="chat_controller",
+        record_user_message=True,
+        restore_status_on_failure=True,
+    )
+    for event in result.get("runtime_events") or []:
+        yield _sse("runtime_event", event, task_id)
+    for notice in result.get("notices") or []:
+        yield _sse("message", notice, task_id)
+    yield _sse("done", {"status": result.get("status") or task.get("status", "unknown"), "preview_url": result.get("preview_url") or task.get("preview_url")}, task_id)
 
 
 def _runtime_fields(task: dict) -> dict:
@@ -1864,6 +2607,7 @@ def _task_response_payload(task: dict) -> dict:
     payload = dict(task)
     if payload.get("status") in TERMINAL_TASK_STATUSES or payload.get("status") == "stopped":
         payload.pop("pending_confirmation", None)
+        payload.pop("pending_user_input", None)
     payload.update(_runtime_fields(task))
     payload.setdefault("command_history", task.get("command_history", []))
     payload.setdefault("pipeline_runs", task.get("pipeline_runs", []))
@@ -1872,8 +2616,13 @@ def _task_response_payload(task: dict) -> dict:
     payload.setdefault("preview_status", task.get("preview_status"))
     payload.setdefault("preview_error", task.get("preview_error"))
     payload.setdefault("queued_at", task.get("queued_at"))
+    payload.setdefault("autonomy_mode", task.get("autonomy_mode") or "strong")
+    payload.setdefault("completion_report", task.get("completion_report"))
     payload["tool_policy"] = _normalize_tool_policy(task.get("tool_policy"))
     payload["local_execution_enabled"] = bool(task.get("local_execution_enabled"))
+    payload["execution_target"] = task.get("execution_target") or (
+        "local_ide" if task.get("local_import_mode") or task.get("local_execution_enabled") else "cloud_workspace"
+    )
     payload["local_runner"] = local_runner_manager.status_for_task_or_session(
         str(task.get("id") or ""),
         str(task.get("local_runner_session_id") or ""),
@@ -1920,7 +2669,7 @@ def _ensure_task_queue_running() -> None:
                 task for task in _tasks.values()
                 if task.get("status") in {"pending", "running", "reviewing"}
             ]
-            task_queue.requeue_many(runnable, "闃熷垪鑷剤鎭㈠")
+            task_queue.requeue_many(runnable, "队列自愈恢复")
     except RuntimeError:
         # No running event loop; queue will be started during app lifespan.
         return
@@ -1949,7 +2698,7 @@ def restore_tasks():
             previous_step = t.get("current_step") or ""
             t["status"] = "pending"
             t["execution_active"] = False
-            t["current_step"] = "..."
+            t["current_step"] = "正在重试，复用已有执行计划和工作区..."
             t.setdefault("logs", []).append({
                 "timestamp": _now_iso(),
                 "agent": "queue",
@@ -1989,7 +2738,7 @@ async def create_task(payload: TaskCreate, request: Request):
         "workspace_id": f"ws-{uuid.uuid4().hex[:12]}",
         "user_id": str(user_id) if user_id else None,
         "request_ip": _get_request_ip(request),
-        "agents": payload.agent_types or ["frontend"],
+        "agents": payload.agent_types or ["general"],
         "logs": [],
         "commit_history": [],
         "preview_url": None,
@@ -1998,6 +2747,7 @@ async def create_task(payload: TaskCreate, request: Request):
         "enable_smart_planning": payload.enable_smart_planning,
         "model": payload.model,
         "tool_policy": _normalize_tool_policy(getattr(payload, "tool_policy", None)),
+        "autonomy_mode": getattr(payload, "autonomy_mode", None) or "strong",
         "spec": payload.spec,
         "plan_confirmed": None,       # 
         "prototype": None,            # Excalidraw JSON 
@@ -2013,9 +2763,10 @@ async def create_task(payload: TaskCreate, request: Request):
         {
             "title": payload.title,
             "project_type": payload.project_type,
-            "agents": payload.agent_types or ["frontend"],
+            "agents": payload.agent_types or ["general"],
             "model": payload.model,
             "tool_policy": _normalize_tool_policy(getattr(payload, "tool_policy", None)),
+            "autonomy_mode": getattr(payload, "autonomy_mode", None) or "strong",
         },
         source="api",
     )
@@ -2028,7 +2779,7 @@ async def create_task(payload: TaskCreate, request: Request):
         request={
             "title": payload.title,
             "project_type": payload.project_type,
-            "agents": payload.agent_types or ["frontend"],
+            "agents": payload.agent_types or ["general"],
             "smart_planning": payload.enable_smart_planning,
         },
         context={"workspace_id": task["workspace_id"]},
@@ -2039,6 +2790,32 @@ async def create_task(payload: TaskCreate, request: Request):
         await asyncio.to_thread(save_task, task)
     except Exception:
         pass  # DB ?
+
+    controller_decision = await _route_task_entry_intent(
+        task_id,
+        task,
+        payload.description,
+        request,
+        source="task_create",
+    )
+    if controller_decision.get("intent") == "light_local_file_task":
+        result = await _execute_light_local_file_task_once(
+            task_id,
+            task,
+            payload.description,
+            controller_decision,
+            source="task_create",
+            record_user_message=True,
+            restore_status_on_failure=False,
+        )
+        if not result.get("ok"):
+            task["status"] = "failed"
+            task["progress"] = 0
+            task["current_step"] = str(result.get("message") or "轻量本地文件任务失败")
+            task["execution_active"] = False
+            task["needs_continuation"] = False
+            save_task(task)
+        return TaskResponse(**_task_response_payload(task))
 
     # ?asyncio.create_task  BackgroundTasks
     async def _safe_execute():
@@ -2058,9 +2835,9 @@ async def create_task(payload: TaskCreate, request: Request):
                     workspace_path.mkdir(parents=True, exist_ok=True)
                     spec_path = workspace_path / "SPEC.md"
                     spec_path.write_text(payload.spec, encoding="utf-8")
-                    logger.info(f"[Task {task_id}] SPEC.md ? {spec_path}")
+                    logger.info(f"[Task {task_id}] SPEC.md 已写入 {spec_path}")
                 except Exception as spec_err:
-                    logger.warning(f"[Task {task_id}]  SPEC.md : {spec_err}")
+                    logger.warning(f"[Task {task_id}] 写入 SPEC.md 失败: {spec_err}")
 
             #  LLM ?
             try:
@@ -2098,7 +2875,7 @@ async def create_task(payload: TaskCreate, request: Request):
                 logger.error(f"[Task {task_id}] LLM : {e}")
                 _tasks[task_id]["status"] = "failed"
                 _tasks[task_id]["progress"] = 0
-                _tasks[task_id]["current_step"] = ""
+                _tasks[task_id]["current_step"] = "LLM 初始化失败"
                 _tasks[task_id]["logs"].append({
                     "timestamp": datetime.utcnow().isoformat(),
                     "agent": "system",
@@ -2226,7 +3003,7 @@ async def create_task(payload: TaskCreate, request: Request):
                     "timestamp": datetime.utcnow().isoformat(),
                     "agent": "system",
                     "level": "error",
-                    "message": f": {e}",
+                    "message": f"重试执行失败: {e}",
                     "detail": str(e),
                 })
                 save_task(_tasks[task_id])
@@ -2466,8 +3243,8 @@ async def enable_task_smart_planning(task_id: str, request: Request):
 
         plan_result = await plan_task(
             description=plan_description + recon_summary,
-            project_type=t.get("project_type") or "nextjs",
-            agent_types=t.get("agents") or ["frontend"],
+            project_type=t.get("project_type") or "unknown",
+            agent_types=t.get("agents") or ["general"],
             llm_client=await agent_orchestrator._ensure_client(requested_model=t.get("model")),
             model=t.get("model") or agent_orchestrator._model or "default",
             project_recon=recon_for_plan,
@@ -2517,7 +3294,7 @@ async def update_task_tool_policy(task_id: str, payload: ToolPolicyUpdateRequest
     _append_task_log(
         t,
         "info",
-        f"宸ュ叿鏉冮檺绛栫暐宸插垏鎹负 {policy}",
+        f"工具权限策略已切换为 {policy}",
         agent="system",
         tool_policy=policy,
     )
@@ -2553,7 +3330,10 @@ async def get_task_status(task_id: str, request: Request):
         workspace_id=t.get("workspace_id"),
         model=t.get("model"),
         tool_policy=_normalize_tool_policy(t.get("tool_policy")),
+        autonomy_mode=t.get("autonomy_mode") or "strong",
+        completion_report=t.get("completion_report"),
         pending_confirmation=t.get("pending_confirmation"),
+        pending_user_input=t.get("pending_user_input"),
         plan=t.get("plan"),
         review=t.get("review"),
         phase_reviews=t.get("phase_reviews", []),
@@ -2623,6 +3403,10 @@ async def stream_task_events(task_id: str, request: Request, user_id: Optional[s
                     "plan_confirmed": t.get("plan_confirmed"),
                     "prototype_confirmed": t.get("prototype_confirmed"),
                     "review_confirmed": t.get("review_confirmed"),
+                    "pending_confirmation": t.get("pending_confirmation"),
+                    "pending_user_input": t.get("pending_user_input"),
+                    "autonomy_mode": t.get("autonomy_mode") or "strong",
+                    "completion_report": t.get("completion_report"),
                     "execution_active": runtime.get("execution_active"),
                     "runtime_state": runtime.get("runtime_state"),
                     "runtime_note": runtime.get("runtime_note"),
@@ -2664,6 +3448,8 @@ async def stream_task_events(task_id: str, request: Request, user_id: Optional[s
                         "plan": plan_data,
                         "current_subtask_id": t.get("current_subtask_id"),
                         "phase_reviews": t.get("phase_reviews", []),
+                        "pending_confirmation": t.get("pending_confirmation"),
+                        "pending_user_input": t.get("pending_user_input"),
                         "execution_active": runtime.get("execution_active"),
                         "runtime_state": runtime.get("runtime_state"),
                         "runtime_note": runtime.get("runtime_note"),
@@ -2741,6 +3527,22 @@ async def get_task_events(
 class ApprovalResolvePayload(BaseModel):
     approved: bool = Field(..., description="true=approve, false=reject")
     note: Optional[str] = Field(default=None, description="Optional user note")
+
+
+def _reset_auto_continuation_window(task: dict) -> None:
+    """Open a fresh progress-aware continuation window after a manual approval.
+
+    Rebases the per-window iteration budget to the iterations already spent and
+    clears the stall counter, so an explicit human "continue" grants the task a
+    full new safety window instead of immediately re-tripping the same gate.
+    """
+    try:
+        used_iterations = int(task.get("total_agent_iterations") or task.get("agent_iteration") or 0)
+    except (TypeError, ValueError):
+        used_iterations = 0
+    task["auto_continuation_budget_base"] = used_iterations
+    task["stalled_continuation_count"] = 0
+    task.pop("last_progress_fingerprint", None)
 
 
 def _ensure_waiting_confirm_approval_event(task: dict, event_id: str) -> dict | None:
@@ -2834,6 +3636,7 @@ async def resolve_task_approval(task_id: str, event_id: str, payload: ApprovalRe
                     task["status"] = "pending"
                     task["execution_active"] = False
                     task["needs_continuation"] = True
+                    _reset_auto_continuation_window(task)
                     task["current_step"] = "已批准继续执行，任务已重新进入队列。"
                     task_queue.enqueue(task_id, "manual confirmation: continue task")
                 else:
@@ -2863,6 +3666,7 @@ async def resolve_task_approval(task_id: str, event_id: str, payload: ApprovalRe
             task["execution_active"] = False
             task["needs_continuation"] = True
             task["current_step"] = "已批准继续执行，任务已重新进入队列。"
+            _reset_auto_continuation_window(task)
         else:
             task["status"] = "running"
             task["current_step"] = "已批准操作，继续执行..."
@@ -3018,21 +3822,21 @@ async def confirm_review(task_id: str, payload: ReviewConfirmPayload, request: R
     if payload.confirmed:
         t["review_confirmed"] = True
         t["status"] = "running"
-        t["current_step"] = "代码审查已确认，继续执行。"
+        t["current_step"] = "产物审查已确认，继续执行。"
         t["logs"].append({
             "timestamp": datetime.utcnow().isoformat(),
             "agent": "system",
             "level": "success",
-            "message": f"代码审查已确认：评分 {review_score}，问题 {issue_count} 个",
+            "message": f"产物审查已确认：评分 {review_score}，问题 {issue_count} 个",
         })
         save_task(dict(t))
         task_queue.enqueue(task_id, "review confirmed")
-        return {"ok": True, "message": "代码审查已确认，任务已继续执行"}
+        return {"ok": True, "message": "产物审查已确认，任务已继续执行"}
     t["review_confirmed"] = False
     t["status"] = "cancelled"
-    t["current_step"] = "用户拒绝了代码审查"
+    t["current_step"] = "用户拒绝了产物审查"
     save_task(dict(t))
-    return {"ok": True, "message": "代码审查已拒绝，任务已取消"}
+    return {"ok": True, "message": "产物审查已拒绝，任务已取消"}
 
 #  POST /api/tasks/{task_id}/stop ? 
 @router.post("/{task_id}/stop")
@@ -3046,10 +3850,10 @@ async def stop_task(task_id: str, request: Request):
     agent_orchestrator.cancel_task(task_id)
     return {"ok": True}
 
-#  POST /api/tasks/{task_id}/retry ? 
+# POST /api/tasks/{task_id}/retry
 @router.post("/{task_id}/retry", response_model=TaskResponse)
 async def retry_task(task_id: str, request: Request):
-    """/?"""
+    """Retry a failed or cancelled task using its existing workspace and execution plan."""
     from loguru import logger as _logger
 
     if task_id not in _tasks:
@@ -3058,7 +3862,7 @@ async def retry_task(task_id: str, request: Request):
 
     t = _tasks[task_id]
     if t["status"] not in ("failed", "cancelled"):
-        raise HTTPException(status_code=400, detail=f"?{t['status']} ?failed/cancelled ?")
+        raise HTTPException(status_code=400, detail=f"当前状态 {t['status']} 不允许重试，仅 failed/cancelled 可重试")
 
     # ?
     previous_status = t.get("status")
@@ -3068,7 +3872,7 @@ async def retry_task(task_id: str, request: Request):
     t["status"] = "pending"
     t["progress"] = 0
     t["current_step"] = "..."
-    t["logs"] = t.get("logs", [])[-5:]  # ?5 ?
+    t["logs"] = t.get("logs", [])[-5:]  # Keep the latest context for the retry.
     t["preview_url"] = None
     t["error_detail"] = None
     t["review_confirmed"] = None
@@ -3076,16 +3880,16 @@ async def retry_task(task_id: str, request: Request):
     _append_task_log(
         t,
         "warn",
-        "?",
+        "任务已重新进入执行队列",
         agent="queue",
-        detail=f"? {previous_status}; ? {previous_step}",
+        detail=f"上次状态: {previous_status}; 上次步骤: {previous_step}",
     )
     _append_command_record(
         t,
         f"autocode retry {task_id}",
         "running",
-        label="",
-        output=f"? {previous_status}\n? {previous_step}",
+        label="重试任务",
+        output=f"上次状态: {previous_status}\n上次步骤: {previous_step}",
         source="system",
     )
 
@@ -3096,7 +3900,7 @@ async def retry_task(task_id: str, request: Request):
 
     if needs_cont:
         # EMORY.md  Agent 
-        _logger.info(f"[Task {task_id}] ? {old_workspace_id}")
+        _logger.info(f"[Task {task_id}] 继续使用工作区 {old_workspace_id}")
         new_workspace_id = old_workspace_id
         t.pop("needs_continuation", None)  # 
     else:
@@ -3138,9 +3942,9 @@ async def retry_task(task_id: str, request: Request):
             #  LLM ?
             try:
                 _ = await agent_orchestrator._ensure_client(requested_model=t.get("model"))
-                _logger.info(f"[Task {task_id} retry] LLM : {agent_orchestrator._model}")
+                _logger.info(f"[Task {task_id} retry] LLM 已就绪: {agent_orchestrator._model}")
             except RuntimeError as e:
-                _logger.error(f"[Task {task_id} retry] LLM : {e}")
+                _logger.error(f"[Task {task_id} retry] LLM 初始化失败: {e}")
                 _tasks[task_id]["status"] = "failed"
                 _tasks[task_id]["current_step"] = ""
                 _tasks[task_id]["logs"].append({
@@ -3155,14 +3959,14 @@ async def retry_task(task_id: str, request: Request):
             await agent_orchestrator.execute_task(
                 task_id,
                 t.get("description", t["title"]),
-                t.get("project_type", "website"),
+                t.get("project_type") or "unknown",
                 t["workspace_id"],
-                t.get("agents", ["frontend"]),
+                t.get("agents") or ["general"],
             )
             if task_id in _tasks:
                 save_task(_tasks[task_id])
         except Exception as e:
-            _logger.error(f"[Task {task_id} retry] : {e}")
+            _logger.error(f"[Task {task_id} retry] 执行失败: {e}")
             if task_id in _tasks:
                 _tasks[task_id]["status"] = "failed"
                 _tasks[task_id]["logs"].append({
@@ -3173,6 +3977,39 @@ async def retry_task(task_id: str, request: Request):
                     "detail": str(e),
                 })
                 save_task(_tasks[task_id])
+
+    retry_message = str(t.get("chat_continuation_message") or t.get("last_chat_continuation_message") or t.get("description") or t.get("title") or "")
+    controller_decision = _reuse_active_execution_plan(
+        t,
+        source="task_retry",
+        reason="retry_without_new_requirement",
+    )
+    if controller_decision is None:
+        controller_decision = await _route_task_entry_intent(
+            task_id,
+            t,
+            retry_message,
+            request,
+            source="task_retry",
+        )
+    if controller_decision.get("intent") == "light_local_file_task":
+        result = await _execute_light_local_file_task_once(
+            task_id,
+            t,
+            retry_message,
+            controller_decision,
+            source="task_retry",
+            record_user_message=False,
+            restore_status_on_failure=False,
+        )
+        if not result.get("ok"):
+            t["status"] = "failed"
+            t["progress"] = 0
+            t["current_step"] = str(result.get("message") or "轻量本地文件任务失败")
+            t["execution_active"] = False
+            t["needs_continuation"] = False
+            save_task(t)
+        return TaskResponse(**_task_response_payload(t))
 
     task_queue.enqueue(task_id, "")
     return TaskResponse(**_task_response_payload(t))
@@ -3227,17 +4064,31 @@ class ChatFileAttachment(PydanticBaseModel):
 class ChatMessageRequest(PydanticBaseModel):
     message: str
     files: list[ChatFileAttachment] = []
+    model: Optional[str] = None
 
 @router.post("/{task_id}/chat")
 async def chat_with_agent(task_id: str, payload: ChatMessageRequest, request: Request):
     """Chat with the AutoCode IDE controller."""
-    from loguru import logger as _logger
-
     if task_id not in _tasks:
         raise HTTPException(status_code=404, detail="Task not found")
     _verify_task_ownership(_tasks[task_id], request)
 
     t = _tasks[task_id]
+    requested_model = (payload.model or "").strip()
+    if requested_model and requested_model.lower() != "auto" and requested_model != t.get("model"):
+        previous_model = t.get("model")
+        t["model"] = requested_model
+        append_event(
+            t,
+            "task_model_updated",
+            {
+                "old_model": previous_model,
+                "new_model": requested_model,
+                "source": "chat_continuation",
+            },
+            source="chat_controller",
+        )
+        save_task(t)
 
     full_message = payload.message
     if payload.files:
@@ -3245,41 +4096,126 @@ async def chat_with_agent(task_id: str, payload: ChatMessageRequest, request: Re
         for f in payload.files:
             file_info = f"- [{f.name}]({f.url}) ({f.type}, {f.size} bytes)"
             file_descriptions.append(file_info)
-        full_message = f"{payload.message}\n\n闄勪欢锛歕n" + "\n".join(file_descriptions)
+        full_message = f"{payload.message}\n\n附件：\n" + "\n".join(file_descriptions)
 
-    controller_decision: dict | None = None
-    try:
-        controller_decision = await _run_chat_controller(task_id, t, full_message, request)
+    pending_user_input = t.get("pending_user_input") if isinstance(t.get("pending_user_input"), dict) else {}
+    if pending_user_input:
+        append_event(
+            t,
+            "user_input_resolved",
+            {
+                "event_id": pending_user_input.get("event_id"),
+                "signature": pending_user_input.get("signature"),
+                "message": full_message[:1200],
+                "intervention": pending_user_input.get("intervention"),
+            },
+            source="user",
+            publish=publish_task_event,
+        )
+        append_event(
+            t,
+            "intervention_resolved",
+            {
+                "event_id": pending_user_input.get("event_id"),
+                "signature": pending_user_input.get("signature"),
+                "message": full_message[:1200],
+                "intervention": pending_user_input.get("intervention"),
+            },
+            source="user",
+            publish=publish_task_event,
+        )
+        t.pop("pending_user_input", None)
+        if re.search(r"^(停止等待|暂停|先暂停|stop|pause)\b", full_message.strip(), re.I):
+            t["status"] = "stopped"
+            t["execution_active"] = False
+            t["needs_continuation"] = False
+            t["current_step"] = "用户选择暂停当前阻塞任务。"
+            save_task(t)
+            return StreamingResponse(
+                _stream_chat_answer(task_id, t, full_message, "已暂停当前任务。你补充信息后可以继续唤醒我。"),
+                media_type="text/event-stream",
+            )
+        t["status"] = "pending"
+        t["execution_active"] = False
+        t["needs_continuation"] = True
+        t["current_step"] = "已收到用户选择或补充信息，准备继续执行。"
+        save_task(t)
+
+    if t.get("status") == "waiting_review_confirm":
+        confirmed = _detect_review_confirmation_message(payload.message)
+        if confirmed is None:
+            answer = (
+                "当前任务停在产物审查确认阶段。请先确认是否继续：回复“确认/继续”会接受审查结果并继续执行；"
+                "回复“拒绝/取消”会停止任务。你也可以在“产物审查”面板点击确认或拒绝按钮。"
+            )
+            return StreamingResponse(
+                _stream_chat_answer(task_id, t, full_message, answer),
+                media_type="text/event-stream",
+            )
+        _apply_review_confirmation_from_chat(task_id, t, confirmed, payload.message)
+        answer = "已确认产物审查，后台会继续执行。" if confirmed else "已拒绝产物审查，任务已停止。"
+        return StreamingResponse(
+            _stream_chat_answer(task_id, t, full_message, answer),
+            media_type="text/event-stream",
+        )
+
+    controller_decision = None
+    if _is_vague_continue_confirmation(payload.message):
+        controller_decision = _reuse_active_execution_plan(
+            t,
+            source="chat_continue",
+            reason="manual_continue_without_new_requirement",
+        )
+    if controller_decision is None:
+        controller_decision = await _route_task_entry_intent(
+            task_id,
+            t,
+            full_message,
+            request,
+            source="chat_controller",
+        )
+    if controller_decision.get("intent") == "light_local_file_task":
+        return StreamingResponse(
+            _stream_light_local_file_task(task_id, t, full_message, controller_decision),
+            media_type="text/event-stream",
+        )
+
+    if _should_reroute_command_action_to_development(full_message, controller_decision):
         _append_task_log(
             t,
-            "info",
-            f"AI controller action: {controller_decision.get('action')}",
+            "warn",
+            "AI controller command action rerouted to development continuation",
             agent="chat_controller",
             detail=json.dumps(controller_decision, ensure_ascii=False)[:2000],
         )
-        save_task(t)
-        if _controller_decision_needs_fallback(controller_decision):
-            fallback_decision = _fallback_chat_decision(payload.message, t)
-            controller_decision = {
-                **fallback_decision,
-                "controller_fallback": True,
-                "controller_raw": controller_decision,
-            }
-            _append_task_log(
-                t,
-                "warn",
-                f"AI controller unusable, local fallback action: {controller_decision.get('action')}",
-                agent="chat_controller",
-                detail=json.dumps(controller_decision, ensure_ascii=False)[:2000],
-            )
-            save_task(t)
-    except Exception as controller_err:
-        _logger.warning(f"[ChatController] AI decision failed, fallback to local detector: {controller_err}")
         controller_decision = {
-            **_fallback_chat_decision(payload.message, t),
-            "controller_fallback": True,
-            "controller_error": str(controller_err),
+            **controller_decision,
+            "action": "continue_development",
+            "answer": (
+                "我会把这次需求作为开发任务继续处理：先检查当前工作区，再完成修改、验证结果并说明本轮是否完成。"
+            ),
+            "rerouted_from": "run_command",
         }
+        save_task(t)
+
+    if _should_reroute_answer_action_to_development(full_message, controller_decision):
+        _append_task_log(
+            t,
+            "warn",
+            "AI controller answer action rerouted to development continuation",
+            agent="chat_controller",
+            detail=json.dumps(controller_decision, ensure_ascii=False)[:2000],
+        )
+        controller_decision = {
+            **controller_decision,
+            "action": "continue_development",
+            "intent": "code_development",
+            "answer": (
+                "我会把这个执行请求作为开发任务接手：读取工作区状态、执行必要命令、观察结果并给你反馈。"
+            ),
+            "rerouted_from": controller_decision.get("action") or "answer",
+        }
+        save_task(t)
 
     decided_action = str(controller_decision.get("action") or "answer")
     if decided_action == "continue_development":
@@ -3351,6 +4287,60 @@ async def rollback_task(task_id: str, commit_hash: str, request: Request):
     _verify_task_ownership(task, request)
     result = _rollback_task_to_target(task_id, task, commit_hash)
     return {"ok": True, "rolled_back_to": result["commit_hash"]}
+
+# 撤销 code_editor 的最后一次文件编辑（前端 FileEditCard 撤销按钮调用）
+@router.post("/{task_id}/code-editor-undo")
+async def code_editor_undo(task_id: str, request: Request):
+    if task_id not in _tasks:
+        raise HTTPException(status_code=404, detail="Task not found")
+    task = _tasks[task_id]
+    _verify_task_ownership(task, request)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    path = str((body or {}).get("path") or "").strip().replace("\\", "/").lstrip("/")
+    if not path:
+        raise HTTPException(status_code=400, detail="path is required")
+
+    if _is_local_only_task(task):
+        local_status = local_runner_manager.status_for_task(task_id)
+        if not local_status.get("connected"):
+            raise HTTPException(status_code=409, detail="本地 Runner 未连接，无法撤销")
+        try:
+            result = await local_runner_manager.execute_tool(
+                task_id,
+                "code_editor",
+                {"command": "undo_edit", "path": path},
+                timeout=30,
+            )
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"撤销执行失败: {exc}")
+        if not result.get("ok"):
+            raise HTTPException(status_code=409, detail=str(result.get("result") or "无可撤销的编辑"))
+        # 本地撤销后同步镜像到服务端工作区镜像
+        ws_id = task.get("workspace_id")
+        if ws_id:
+            from core.config import get_settings
+            ws_path = get_settings().workspace_base_dir / ws_id
+            from core.agent_orchestrator import _safe_workspace_path
+            mirror_path = _safe_workspace_path(ws_path, path, must_exist=False)
+            if result.get("deleted"):
+                mirror_path.unlink(missing_ok=True)
+            elif isinstance(result.get("content"), str):
+                mirror_path.parent.mkdir(parents=True, exist_ok=True)
+                mirror_path.write_text(result["content"], encoding="utf-8")
+        return {"ok": True, "result": result.get("result") or "", "deleted": bool(result.get("deleted"))}
+
+    # 容器链路：弹编排器撤销栈
+    from core.agent_orchestrator import code_editor_undo_for_workspace
+    workspace_id = task.get("workspace_id")
+    if not workspace_id:
+        raise HTTPException(status_code=409, detail="任务没有关联工作区")
+    outcome = code_editor_undo_for_workspace(workspace_id, path)
+    if outcome is None:
+        raise HTTPException(status_code=409, detail="没有可撤销的编辑")
+    return {"ok": True, "result": outcome}
 
 #  GET /api/tasks/{task_id}/dev-server ?Dev Server ?
 @router.get("/{task_id}/dev-server")
@@ -3520,25 +4510,23 @@ class CommandRunRequest(BaseModel):
 
 
 def _pipeline_commands(task_id: str) -> list[tuple[str, str]]:
-    ws_root = _resolve_workspace_path(task_id, "/")
+    task = _tasks.get(task_id) or {}
+    plan = task.get("active_execution_plan") or {}
     commands: list[tuple[str, str]] = []
-    package_json = ws_root / "package.json"
-    if package_json.exists():
-        try:
-            pkg = json.loads(package_json.read_text(encoding="utf-8"))
-            scripts = pkg.get("scripts") or {}
-        except Exception:
-            scripts = {}
-        commands.append(("install", "npm install"))
-        if "lint" in scripts:
-            commands.append(("lint", "npm run lint"))
-        if "test" in scripts:
-            commands.append(("test", "npm test"))
-        elif "build" in scripts:
-            commands.append(("test", "npm run build"))
-        if "build" in scripts:
-            commands.append(("build", "npm run build"))
+    for step in plan.get("validation_plan") or []:
+        if not isinstance(step, dict):
+            continue
+        command = str(step.get("command") or "").strip()
+        kind = str(step.get("kind") or "command").lower()
+        if command and kind not in {"artifact_check", "preview", "render", "visual"}:
+            commands.append((str(step.get("description") or kind), command))
+    if commands:
         return commands
+
+    inferred = _infer_workspace_command(task_id, "test") or _infer_workspace_command(task_id, "build")
+    if inferred:
+        commands.append(("validation", inferred))
+    return commands
 
 def _write_pipeline_report(task: dict, reports: list[dict]) -> None:
     try:
@@ -3648,7 +4636,7 @@ async def _execute_pipeline(task_id: str, task: dict):
             if ws_id:
                 from core.config import get_settings
                 cfg = get_settings()
-                project_type = task.get("project_type", "default")
+                project_type = task.get("project_type") or "unknown"
                 await dev_server_manager.stop_dev_server(ws_id)
                 result = await dev_server_manager.start_dev_server(
                     ws_id,

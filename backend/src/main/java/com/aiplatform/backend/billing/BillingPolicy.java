@@ -41,6 +41,9 @@ public class BillingPolicy {
     /** 额度耗尽后是否使用钱包余额兜底 */
     private boolean walletFallbackEnabled = false;
 
+    /** walletFallbackEnabled 是否在套餐 features 中显式配置过 */
+    private boolean walletFallbackConfigured = false;
+
     /** 钱包兜底月度上限（0/null 表示不限，但 walletFallbackEnabled=false 时不生效） */
     private BigDecimal walletFallbackMonthlyLimit;
 

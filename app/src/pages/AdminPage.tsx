@@ -1,7 +1,7 @@
 ﻿import { useState, useMemo, useEffect, useRef } from 'react'
 import { useAdminStore, useAuthStore, User, ModelChannel, Model, Subscription, LogEntry } from '@/store'
 import { useCallback } from 'react'
-import { adminApi, isDemoMode, planApi, agentRegistryApi, walletApi, ttsApi, translateApi, rbacApi, type SysRoleVO, type AgentRegistryDetail, type AgentFileNode } from '@/lib/api'
+import { adminApi, isDemoMode, planApi, agentRegistryApi, walletApi, ttsApi, translateApi, rbacApi, type SysRoleVO, type AgentRegistryDetail, type AgentFileNode, type ModelPriceLibraryResponse, type ModelPricePreviewItem, type ModelPriceTarget } from '@/lib/api'
 import type { SubscriptionPlanVO } from '@/lib/api'
 import { DEMO_PLANS } from '@/pages/SubscriptionPage'
 import { cn, formatDate, formatNumber } from '@/lib/utils'
@@ -735,10 +735,12 @@ function OverviewTab() {
       try { return JSON.parse(c.tags) } catch { return String(c.tags).split(',').map((s: string) => s.trim()).filter(Boolean) }
     })(),
     status: c.status || 'active',
+    statusMessage: c.statusMessage || c.status_message || '',
     priority: c.priority || 1,
     rateLimit: c.rateLimit || 60,
     createdAt: c.createdAt || '',
     channelType: c.channelType || 'chat',
+    apiFormat: c.apiFormat || 'chat_completions',
   }), [])
 
   const mapOverviewLog = useCallback((l: any): LogEntry => ({
@@ -1437,15 +1439,18 @@ function ChannelsTab() {
         })(),
         ttsVoices: c.ttsVoices || '',          // TTS 音色配置 JSON
         translateLangs: c.translateLangs || '',   // 翻译语言配置 JSON
-        status: c.status || 'active', priority: c.priority || 1,
+        status: c.status || 'active',
+        statusMessage: c.statusMessage || c.status_message || '',
+        priority: c.priority || 1,
         rateLimit: c.rateLimit || 60, createdAt: c.createdAt || '',
         channelType: c.channelType || 'chat',
+        apiFormat: c.apiFormat || 'chat_completions',
       } as any))
       setChannels(mapped)
     }).catch(console.warn)
   }, [])
 
-  const emptyForm = { name: '', provider: 'OpenAI', apiKeys: '', baseUrl: '', models: '', channelType: 'chat', tags: '', ttsVoices: '', translateLangs: '', rateLimit: 60, priority: channels.length + 1 }
+  const emptyForm = { name: '', provider: 'OpenAI', apiKeys: '', baseUrl: '', models: '', channelType: 'chat', apiFormat: 'chat_completions', tags: '', ttsVoices: '', translateLangs: '', rateLimit: 60, priority: channels.length + 1 }
   const [form, setForm] = useState(emptyForm)
 
   const providers = ['OpenAI', 'Anthropic', 'Google', 'DeepSeek', 'Alibaba', 'Doubao', 'Baidu', 'Zhipu', 'Minimax', 'Mistral', 'Cohere', 'Custom']
@@ -1488,7 +1493,8 @@ function ChannelsTab() {
       name: ch.name, provider: ch.provider,
       apiKeys: ch.apiKey,  // apiKey 字段里可能已存储多个（逗号分隔），展示时换行显示
       baseUrl: ch.baseUrl, models: ch.models.join(','),
-      channelType: ch.channelType || 'chat', rateLimit: ch.rateLimit, priority: ch.priority,
+      channelType: ch.channelType || 'chat', apiFormat: (ch as any).apiFormat || 'chat_completions',
+      rateLimit: ch.rateLimit, priority: ch.priority,
       tags: (ch.tags || []).join(','),
       ttsVoices: ch.ttsVoices || '',
       translateLangs: ch.translateLangs || '',
@@ -1505,7 +1511,7 @@ function ChannelsTab() {
     const keys = parseApiKeys(form.apiKeys)
     // 多个 Key 以逗号拼接存储，后端请求时轮询使用
     const apiKey = keys.join(',')
-    const data = { name: form.name, provider: form.provider, apiKey, baseUrl: form.baseUrl, models: form.models.split(',').map(s => s.trim()).filter(Boolean), channelType: (form as any).channelType || 'chat', tags: (form as any).tags ? (form as any).tags.split(',').map((s: string) => s.trim()).filter(Boolean) : [], rateLimit: form.rateLimit, priority: form.priority, ttsVoices: form.ttsVoices || '', translateLangs: form.translateLangs || '' }
+    const data = { name: form.name, provider: form.provider, apiKey, baseUrl: form.baseUrl, models: form.models.split(',').map(s => s.trim()).filter(Boolean), channelType: (form as any).channelType || 'chat', apiFormat: (form as any).apiFormat || 'chat_completions', tags: (form as any).tags ? (form as any).tags.split(',').map((s: string) => s.trim()).filter(Boolean) : [], rateLimit: form.rateLimit, priority: form.priority, ttsVoices: form.ttsVoices || '', translateLangs: form.translateLangs || '' }
     if (editChannel) {
       if (!isDemoMode()) { try { await adminApi.updateChannel(editChannel.id, data) } catch (e) { alert((e as any).message || '更新失败'); return } }
       updateChannel(editChannel.id, data)
@@ -1523,17 +1529,19 @@ function ChannelsTab() {
     if (isDemoMode()) {
       await new Promise(r => setTimeout(r, 1200))
       const ok = Math.random() > 0.3
-      setTestResult(prev => ({ ...prev, [id]: { state: ok ? 'ok' : 'fail', latency: Math.floor(Math.random() * 500) + 100 } }))
-      updateChannel(id, { status: ok ? 'active' : 'error' }); return
+      const latency = Math.floor(Math.random() * 500) + 100
+      const message = ok ? `连接正常，延迟 ${latency}ms` : '连接超时'
+      setTestResult(prev => ({ ...prev, [id]: { state: ok ? 'ok' : 'fail', latency, msg: message } }))
+      updateChannel(id, { status: ok ? 'active' : 'error', statusMessage: message }); return
     }
     try {
       const res = await adminApi.testChannel(id)
       setTestResult(prev => ({ ...prev, [id]: { state: res.ok ? 'ok' : 'fail', latency: res.latency, msg: res.message } }))
-      updateChannel(id, { status: res.ok ? 'active' : 'error' })
+      updateChannel(id, { status: res.ok ? 'active' : 'error', statusMessage: res.message || (res.ok ? '连接正常' : '连接失败') })
     } catch (e) {
       const err = e as any
       setTestResult(prev => ({ ...prev, [id]: { state: 'fail', msg: err.message } }))
-      updateChannel(id, { status: 'error' })
+      updateChannel(id, { status: 'error', statusMessage: err.message || '测试连接失败' })
     }
     setTimeout(() => setTestResult(prev => { const n = { ...prev }; delete n[id]; return n }), 5000)
   }
@@ -1657,7 +1665,11 @@ function ChannelsTab() {
                   <Badge variant="outline" className={cn('text-xs', getProviderFormat(ch.provider).className)} title={getProviderFormat(ch.provider).detail}>
                     {getProviderFormat(ch.provider).label}
                   </Badge>
-                  <Badge variant={ch.status === 'active' ? 'success' : ch.status === 'error' ? 'destructive' : 'secondary'} className="text-xs">
+                  <Badge
+                    variant={ch.status === 'active' ? 'success' : ch.status === 'error' ? 'destructive' : 'secondary'}
+                    className="text-xs"
+                    title={ch.statusMessage || undefined}
+                  >
                     {ch.status === 'active' ? '正常' : ch.status === 'error' ? '异常' : '禁用'}
                   </Badge>
                   {(ch as any).channelType && (ch as any).channelType !== 'chat' && (
@@ -1677,6 +1689,16 @@ function ChannelsTab() {
                     {showKey[ch.id] ? <EyeOff className="w-3 h-3" /> : <Eye className="w-3 h-3" />}
                   </button>
                 </div>
+                {ch.statusMessage && (
+                  <div className={cn(
+                    'mb-2 rounded-md border px-2 py-1 text-xs',
+                    ch.status === 'error'
+                      ? 'border-destructive/30 bg-destructive/5 text-destructive'
+                      : 'border-emerald-500/20 bg-emerald-500/5 text-emerald-700 dark:text-emerald-300'
+                  )}>
+                    状态详情：{ch.statusMessage}
+                  </div>
+                )}
                 <div className="flex flex-wrap gap-1 max-w-md">
                   {(() => {
                     const MAX_VISIBLE = 6
@@ -1775,6 +1797,20 @@ function ChannelsTab() {
                 </SelectContent>
               </Select>
               <p className="text-[10px] text-muted-foreground">翻译、TTS、ASR、搜索渠道会优先用于对应功能；豆包搜索使用 Bearer API Key</p>
+            </div>
+            <div className="space-y-1.5">
+              <Label>出站接口格式</Label>
+              <Select value={(form as any).apiFormat || 'chat_completions'} onValueChange={v => setForm({ ...form, apiFormat: v } as any)}>
+                <SelectTrigger><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="chat_completions">Chat Completions（OpenAI 兼容，默认）</SelectItem>
+                  <SelectItem value="responses">Responses（OpenAI /v1/responses）</SelectItem>
+                  <SelectItem value="messages">Messages（Anthropic /v1/messages）</SelectItem>
+                </SelectContent>
+              </Select>
+              <p className="text-[10px] text-muted-foreground">
+                平台调用上游时使用的接口格式。默认按供应商自动选择；设为 Responses / Messages 可强制走对应端点（覆盖供应商默认）。
+              </p>
             </div>
             <div className="space-y-1.5">
               <Label>
@@ -1907,6 +1943,22 @@ function ModelsTab() {
   const [showImportDialog, setShowImportDialog] = useState(false)
   const [importCandidates, setImportCandidates] = useState<string[]>([])
   const [importSelected, setImportSelected] = useState<Set<string>>(new Set())
+  const [importPreview, setImportPreview] = useState<ModelPricePreviewItem[]>([])
+  const [importLoading, setImportLoading] = useState(false)
+  // 官方价格库导入
+  const [showPriceLibraryDialog, setShowPriceLibraryDialog] = useState(false)
+  const [priceLibrary, setPriceLibrary] = useState<ModelPriceLibraryResponse | null>(null)
+  const [priceLibraryLoading, setPriceLibraryLoading] = useState(false)
+  const [priceLibraryApplying, setPriceLibraryApplying] = useState(false)
+  const [priceLibraryPreview, setPriceLibraryPreview] = useState<ModelPricePreviewItem[]>([])
+  const [priceLibrarySelected, setPriceLibrarySelected] = useState<Set<string>>(new Set())
+  const [priceLibraryProvider, setPriceLibraryProvider] = useState('__all__')
+  const [priceLibrarySearch, setPriceLibrarySearch] = useState('')
+  const [priceLibrarySourceMode, setPriceLibrarySourceMode] = useState<'all' | 'channelMissing' | 'current'>('channelMissing')
+  const [priceLibraryExchangeRate, setPriceLibraryExchangeRate] = useState('7.30')
+  const [priceLibraryMultiplier, setPriceLibraryMultiplier] = useState('1.00')
+  const [priceLibraryCreateMissing, setPriceLibraryCreateMissing] = useState(true)
+  const [priceLibraryOverwrite, setPriceLibraryOverwrite] = useState(false)
   // 批量编辑
   const [batchSelected, setBatchSelected] = useState<Set<string>>(new Set())
   const [showBatchEdit, setShowBatchEdit] = useState(false)
@@ -1914,7 +1966,7 @@ function ModelsTab() {
 
   // 模型管理：按渠道分组折叠 + 内联编辑
   const PRESET_CAPS = getAllApiTags() as Model['capabilities']
-  const emptyForm = { name: '', provider: 'OpenAI', description: '', contextLength: 128000, inputPrice: 0, cachedInputPrice: 0, outputPrice: 0, capabilities: [] as Model['capabilities'], enabled: true }
+  const emptyForm = { name: '', provider: 'OpenAI', description: '', contextLength: 128000, inputPrice: 0, cachedInputPrice: 0, outputPrice: 0, capabilities: [] as Model['capabilities'], aliases: '', enabled: true }
   const [modelChannelCollapsed, setModelChannelCollapsed] = useState<Set<string>>(new Set())
   const [inlineEditId, setInlineEditId] = useState<string | null>(null)
   const [inlineForm, setInlineForm] = useState<typeof emptyForm>(emptyForm)
@@ -1942,6 +1994,28 @@ function ModelsTab() {
   }, [])
   const scrollToTop = () => { modelListRef.current?.scrollTo({ top: 0, behavior: 'smooth' }) }
 
+  const mapApiModel = (m: any): Model => ({
+    id: m.modelId || String(m.id),
+    name: m.name || m.modelId || '',
+    provider: m.provider || '',
+    description: m.description || '',
+    contextLength: m.contextLength || 128000,
+    inputPrice: Number(m.inputPrice ?? 0),
+    cachedInputPrice: Number(m.cachedInputPrice ?? 0),
+    outputPrice: Number(m.outputPrice ?? 0),
+    capabilities: (typeof m.capabilities === 'string' ? m.capabilities.split(',').filter(Boolean) : Array.isArray(m.capabilities) ? m.capabilities : ['text']) as Model['capabilities'],
+    aliases: m.aliases || '',
+    enabled: m.enabled !== false,
+  })
+
+  const refreshModelsFromApi = async () => {
+    if (isDemoMode()) return
+    const result = await adminApi.listModels()
+    if (Array.isArray(result)) {
+      setModels(result.map(mapApiModel))
+    }
+  }
+
   // 页面挂载时从数据库加载模型列表（覆盖 localStorage 持久化的本地副本）
   useEffect(() => {
     if (isDemoMode()) return
@@ -1950,18 +2024,7 @@ function ModelsTab() {
       try {
         const result = await adminApi.listModels()
         if (cancelled || !Array.isArray(result)) return
-        const mapped: Model[] = result.map((m: any) => ({
-          id: m.modelId || String(m.id),
-          name: m.name || m.modelId || '',
-          provider: m.provider || '',
-          description: m.description || '',
-          contextLength: m.contextLength || 128000,
-          inputPrice: Number(m.inputPrice ?? 0),
-          cachedInputPrice: Number(m.cachedInputPrice ?? 0),
-          outputPrice: Number(m.outputPrice ?? 0),
-          capabilities: (typeof m.capabilities === 'string' ? m.capabilities.split(',').filter(Boolean) : Array.isArray(m.capabilities) ? m.capabilities : ['text']) as Model['capabilities'],
-          enabled: m.enabled !== false,
-        }))
+        const mapped: Model[] = result.map(mapApiModel)
         setModels(mapped)
       } catch (e) {
         console.warn('从数据库加载模型列表失败:', e)
@@ -1972,29 +2035,95 @@ function ModelsTab() {
   }, [])
 
   // 从渠道批量导入模型
-  const openImportDialog = () => {
+  const getChannelModels = (ch: ModelChannel): string[] => Array.isArray(ch.models)
+    ? ch.models.filter(Boolean)
+    : String((ch as any).models || '').split(',').map(s => s.trim()).filter(Boolean)
+
+  const findProviderForModel = (modelId: string) => {
+    for (const ch of channels) {
+      if (getChannelModels(ch).includes(modelId)) return ch.provider || 'OpenAI'
+    }
+    return 'OpenAI'
+  }
+
+  const buildChannelMissingTargets = (): ModelPriceTarget[] => {
     const existingIds = new Set(models.map(m => m.id))
-    const candidates: string[] = []
+    const targets = new Map<string, ModelPriceTarget>()
     channels.forEach(ch => {
-      ch.models.filter(Boolean).forEach(m => {
-        if (!existingIds.has(m) && !candidates.includes(m)) {
-          candidates.push(m)
+      getChannelModels(ch).forEach(m => {
+        if (!existingIds.has(m) && !targets.has(m)) {
+          targets.set(m, { modelId: m, name: m, provider: ch.provider || 'OpenAI' })
         }
       })
     })
+    return Array.from(targets.values())
+  }
+
+  const buildCurrentModelTargets = (): ModelPriceTarget[] => models.map(m => ({
+    modelId: m.id,
+    name: m.name,
+    provider: m.provider,
+  }))
+
+  const buildPriceLibraryTargets = (mode = priceLibrarySourceMode): ModelPriceTarget[] | undefined => {
+    if (mode === 'all') return undefined
+    return mode === 'current' ? buildCurrentModelTargets() : buildChannelMissingTargets()
+  }
+
+  const openImportDialog = async () => {
+    const candidates = buildChannelMissingTargets().map(t => t.modelId)
     setImportCandidates(candidates)
     setImportSelected(new Set(candidates))
+    setImportPreview([])
     setShowImportDialog(true)
+    if (isDemoMode() || candidates.length === 0) return
+    setImportLoading(true)
+    try {
+      const preview = await adminApi.previewModelPriceLibrary({
+        models: buildChannelMissingTargets(),
+        exchangeRate: Number(priceLibraryExchangeRate) || 7.30,
+        multiplier: Number(priceLibraryMultiplier) || 1,
+        createMissing: true,
+        overwrite: false,
+      })
+      setImportPreview(preview.items || [])
+    } catch (e) {
+      console.warn('官方价格库预览失败:', e)
+      alert('官方价格库预览失败，将不会自动写入 0 价格。请稍后重试或手动添加价格。')
+    } finally {
+      setImportLoading(false)
+    }
   }
 
   const handleImport = async () => {
     const toImport = Array.from(importSelected)
+    if (toImport.length === 0) return
+    if (!isDemoMode()) {
+      setImportLoading(true)
+      try {
+        const targets = buildChannelMissingTargets().filter(t => toImport.includes(t.modelId))
+        const result = await adminApi.applyModelPriceLibrary({
+          models: targets,
+          selectedModelIds: toImport,
+          exchangeRate: Number(priceLibraryExchangeRate) || 7.30,
+          multiplier: Number(priceLibraryMultiplier) || 1,
+          createMissing: true,
+          overwrite: false,
+        })
+        await refreshModelsFromApi()
+        setShowImportDialog(false)
+        setImportPreview([])
+        alert(`渠道导入完成：创建 ${result.created} 个，跳过 ${result.skipped} 个，未匹配 ${result.unmatched} 个。\n未匹配模型不会写入 0，请在官方价格库更新后导入或手动定价。`)
+      } catch (e: any) {
+        alert(e.message || '导入失败')
+      } finally {
+        setImportLoading(false)
+      }
+      return
+    }
     for (const modelId of toImport) {
       // 尝试从渠道找到 provider
-      let provider = 'OpenAI'
-      for (const ch of channels) {
-        if (ch.models.includes(modelId)) { provider = ch.provider; break }
-      }
+      const provider = findProviderForModel(modelId)
       const newModel = {
         id: modelId, name: modelId, provider,
         description: '', contextLength: 128000,
@@ -2009,6 +2138,98 @@ function ModelsTab() {
     }
     setShowImportDialog(false)
   }
+
+  const openPriceLibraryDialog = async () => {
+    setShowPriceLibraryDialog(true)
+    setPriceLibraryLoading(true)
+    try {
+      const library = await adminApi.getModelPriceLibrary()
+      setPriceLibrary(library)
+      setPriceLibraryExchangeRate(String(library.defaultExchangeRate || 7.30))
+      setPriceLibraryMultiplier(String(library.defaultMultiplier || 1))
+      await runPriceLibraryPreview('channelMissing', library.defaultExchangeRate || 7.30, library.defaultMultiplier || 1)
+    } catch (e: any) {
+      alert(e.message || '加载官方价格库失败')
+    } finally {
+      setPriceLibraryLoading(false)
+    }
+  }
+
+  const runPriceLibraryPreview = async (
+    mode = priceLibrarySourceMode,
+    exchangeRate = Number(priceLibraryExchangeRate) || 7.30,
+    multiplier = Number(priceLibraryMultiplier) || 1,
+  ) => {
+    if (isDemoMode()) {
+      alert('演示模式不连接后端价格库')
+      return
+    }
+    const targets = buildPriceLibraryTargets(mode)
+    if (mode !== 'all' && (!targets || targets.length === 0)) {
+      setPriceLibraryPreview([])
+      setPriceLibrarySelected(new Set())
+      return
+    }
+    setPriceLibraryLoading(true)
+    try {
+      const preview = await adminApi.previewModelPriceLibrary({
+        models: targets,
+        exchangeRate,
+        multiplier,
+        createMissing: priceLibraryCreateMissing,
+        overwrite: priceLibraryOverwrite,
+      })
+      const items = preview.items || []
+      setPriceLibraryPreview(items)
+      setPriceLibrarySelected(new Set(items
+        .filter(item => item.action === 'create' || item.action === 'update')
+        .map(item => item.targetModelId)))
+    } catch (e: any) {
+      alert(e.message || '预览失败')
+    } finally {
+      setPriceLibraryLoading(false)
+    }
+  }
+
+  const handlePriceLibraryApply = async () => {
+    const selected = Array.from(priceLibrarySelected)
+    if (selected.length === 0) {
+      alert('请先选择要导入/覆盖的模型')
+      return
+    }
+    const targets = buildPriceLibraryTargets()
+    setPriceLibraryApplying(true)
+    try {
+      const result = await adminApi.applyModelPriceLibrary({
+        models: targets,
+        selectedModelIds: selected,
+        exchangeRate: Number(priceLibraryExchangeRate) || 7.30,
+        multiplier: Number(priceLibraryMultiplier) || 1,
+        createMissing: priceLibraryCreateMissing,
+        overwrite: priceLibraryOverwrite,
+      })
+      await refreshModelsFromApi()
+      setShowPriceLibraryDialog(false)
+      setPriceLibraryPreview([])
+      setPriceLibrarySelected(new Set())
+      alert(`官方价格库导入完成：创建 ${result.created} 个，更新 ${result.updated} 个，跳过 ${result.skipped} 个，未匹配 ${result.unmatched} 个。`)
+    } catch (e: any) {
+      alert(e.message || '应用失败')
+    } finally {
+      setPriceLibraryApplying(false)
+    }
+  }
+
+  const formatPrice = (value?: number | null) => value == null ? '—' : `¥${Number(value).toFixed(4)}`
+  const formatOfficialPrice = (item: ModelPricePreviewItem, value?: number | null) =>
+    value == null ? '—' : `${Number(value).toFixed(4)} ${item.currency || ''}`.trim()
+  const actionLabel = (action?: string) => action === 'create'
+    ? '创建'
+    : action === 'update'
+      ? '覆盖价格'
+      : action === 'unmatched'
+        ? '未匹配'
+        : '跳过'
 
   // 批量编辑
   const handleBatchEditSave = async () => {
@@ -2129,6 +2350,40 @@ function ModelsTab() {
     return { groups, uncategorized }
   }, [filtered, channels])
 
+  const importPreviewMap = useMemo(() => {
+    const map = new Map<string, ModelPricePreviewItem>()
+    importPreview.forEach(item => map.set(item.targetModelId, item))
+    return map
+  }, [importPreview])
+
+  const filteredPriceLibraryPreview = useMemo(() => {
+    const keyword = priceLibrarySearch.trim().toLowerCase()
+    return priceLibraryPreview.filter(item => {
+      if (priceLibraryProvider !== '__all__') {
+        const provider = item.provider || item.targetProvider || ''
+        if (provider !== priceLibraryProvider) return false
+      }
+      if (!keyword) return true
+      return [
+        item.targetModelId,
+        item.targetName,
+        item.libraryModelId,
+        item.libraryName,
+        item.provider,
+        item.targetProvider,
+        item.reason,
+        item.notes,
+      ].filter(Boolean).some(v => String(v).toLowerCase().includes(keyword))
+    })
+  }, [priceLibraryPreview, priceLibraryProvider, priceLibrarySearch])
+
+  const priceLibraryDisplayedIds = filteredPriceLibraryPreview.map(item => item.targetModelId)
+  const priceLibraryDisplayedActionableIds = filteredPriceLibraryPreview
+    .filter(item => item.action === 'create' || item.action === 'update')
+    .map(item => item.targetModelId)
+  const priceLibrarySelectedDisplayedCount = priceLibraryDisplayedIds.filter(id => priceLibrarySelected.has(id)).length
+  const priceLibraryActionableCount = priceLibraryPreview.filter(item => item.action === 'create' || item.action === 'update').length
+
   // 内联编辑：切换编辑状态
   const startInlineEdit = (m: Model) => {
     setInlineEditId(m.id)
@@ -2136,7 +2391,7 @@ function ModelsTab() {
       name: m.name, provider: m.provider, description: m.description,
       contextLength: m.contextLength,
       inputPrice: m.inputPrice, cachedInputPrice: m.cachedInputPrice ?? 0, outputPrice: m.outputPrice,
-      capabilities: [...m.capabilities], enabled: m.enabled,
+      capabilities: [...m.capabilities], aliases: (m as any).aliases || '', enabled: m.enabled,
     })
     setInlineCustomTagKey('')
     setInlineCustomTagLabel('')
@@ -2206,7 +2461,7 @@ function ModelsTab() {
   const openAdd = () => { setEditModel(null); setForm(emptyForm); setCustomTagKey(''); setCustomTagLabel(''); setShowDialog(true) }
   const openEdit = (m: Model) => {
     setEditModel(m)
-    setForm({ name: m.name, provider: m.provider, description: m.description, contextLength: m.contextLength, inputPrice: m.inputPrice, cachedInputPrice: m.cachedInputPrice ?? 0, outputPrice: m.outputPrice, capabilities: [...m.capabilities], enabled: m.enabled })
+    setForm({ name: m.name, provider: m.provider, description: m.description, contextLength: m.contextLength, inputPrice: m.inputPrice, cachedInputPrice: m.cachedInputPrice ?? 0, outputPrice: m.outputPrice, capabilities: [...m.capabilities], enabled: m.enabled, aliases: (m as any).aliases || '' })
     setCustomTagKey(''); setCustomTagLabel('')
     setShowDialog(true)
   }
@@ -2279,6 +2534,9 @@ function ModelsTab() {
             )}
             <Button size="sm" variant="outline" className="gap-1.5" onClick={openImportDialog}>
               <Download className="w-4 h-4" />从渠道导入
+            </Button>
+            <Button size="sm" variant="outline" className="gap-1.5" onClick={openPriceLibraryDialog}>
+              <Globe className="w-4 h-4" />官方价格库导入
             </Button>
             <Button size="sm" className="gap-1.5" onClick={openAdd}><Plus className="w-4 h-4" />添加模型</Button>
           </div>
@@ -2365,13 +2623,13 @@ function ModelsTab() {
                         <div className="flex items-center gap-1.5 shrink-0">
                           <div className="flex max-w-[180px] flex-wrap items-center justify-end gap-1">
                             <span className="text-[10px] px-1.5 py-0.5 rounded-md bg-primary/10 text-primary border border-primary/20" title="输入价格">
-                              入 ${m.inputPrice}
+                              入 ¥{m.inputPrice}
                             </span>
                             <span className="text-[10px] px-1.5 py-0.5 rounded-md bg-emerald-500/10 text-emerald-700 dark:text-emerald-300 border border-emerald-500/20" title="缓存输入价格">
-                              缓 ${m.cachedInputPrice ?? 0}
+                              缓 ¥{m.cachedInputPrice ?? 0}
                             </span>
                             <span className="text-[10px] px-1.5 py-0.5 rounded-md bg-muted/50 text-muted-foreground border border-border/50" title="输出价格">
-                              出 ${m.outputPrice}
+                              出 ¥{m.outputPrice}
                             </span>
                           </div>
                           <Switch
@@ -2430,15 +2688,15 @@ function ModelsTab() {
                               <Input type="number" value={inlineForm.contextLength} onChange={e => setInlineForm({ ...inlineForm, contextLength: Number(e.target.value) })} className="h-8 text-xs" />
                             </div>
                             <div className="space-y-1.5">
-                              <Label className="text-xs">输入价格 ($/1M)</Label>
+                              <Label className="text-xs">输入价格 (¥/1M)</Label>
                               <Input type="number" step="0.01" value={inlineForm.inputPrice} onChange={e => setInlineForm({ ...inlineForm, inputPrice: Number(e.target.value) })} className="h-8 text-xs" />
                             </div>
                             <div className="space-y-1.5">
-                              <Label className="text-xs">缓存输入价 ($/1M)</Label>
+                              <Label className="text-xs">缓存输入价 (¥/1M)</Label>
                               <Input type="number" step="0.01" value={inlineForm.cachedInputPrice} onChange={e => setInlineForm({ ...inlineForm, cachedInputPrice: Number(e.target.value) })} className="h-8 text-xs" />
                             </div>
                             <div className="space-y-1.5">
-                              <Label className="text-xs">输出价格 ($/1M)</Label>
+                              <Label className="text-xs">输出价格 (¥/1M)</Label>
                               <Input type="number" step="0.01" value={inlineForm.outputPrice} onChange={e => setInlineForm({ ...inlineForm, outputPrice: Number(e.target.value) })} className="h-8 text-xs" />
                             </div>
                           </div>
@@ -2582,13 +2840,13 @@ function ModelsTab() {
                     <div className="flex items-center gap-1.5 shrink-0">
                       <div className="flex max-w-[180px] flex-wrap items-center justify-end gap-1">
                         <span className="text-[10px] px-1.5 py-0.5 rounded-md bg-primary/10 text-primary border border-primary/20" title="输入价格">
-                          入 ${m.inputPrice}
+                          入 ¥{m.inputPrice}
                         </span>
                         <span className="text-[10px] px-1.5 py-0.5 rounded-md bg-emerald-500/10 text-emerald-700 dark:text-emerald-300 border border-emerald-500/20" title="缓存输入价格">
-                          缓 ${m.cachedInputPrice ?? 0}
+                          缓 ¥{m.cachedInputPrice ?? 0}
                         </span>
                         <span className="text-[10px] px-1.5 py-0.5 rounded-md bg-muted/50 text-muted-foreground border border-border/50" title="输出价格">
-                          出 ${m.outputPrice}
+                          出 ¥{m.outputPrice}
                         </span>
                       </div>
                       <Switch
@@ -2631,15 +2889,15 @@ function ModelsTab() {
                           <Input type="number" value={inlineForm.contextLength} onChange={e => setInlineForm({ ...inlineForm, contextLength: Number(e.target.value) })} className="h-8 text-xs" />
                         </div>
                         <div className="space-y-1.5">
-                          <Label className="text-xs">输入价格 ($/1M)</Label>
+                          <Label className="text-xs">输入价格 (¥/1M)</Label>
                           <Input type="number" step="0.01" value={inlineForm.inputPrice} onChange={e => setInlineForm({ ...inlineForm, inputPrice: Number(e.target.value) })} className="h-8 text-xs" />
                         </div>
                         <div className="space-y-1.5">
-                          <Label className="text-xs">缓存输入价 ($/1M)</Label>
+                          <Label className="text-xs">缓存输入价 (¥/1M)</Label>
                           <Input type="number" step="0.01" value={inlineForm.cachedInputPrice} onChange={e => setInlineForm({ ...inlineForm, cachedInputPrice: Number(e.target.value) })} className="h-8 text-xs" />
                         </div>
                         <div className="space-y-1.5">
-                          <Label>输出价格 ($/1M)</Label>
+                          <Label>输出价格 (¥/1M)</Label>
                           <Input type="number" step="0.01" value={inlineForm.outputPrice} onChange={e => setInlineForm({ ...inlineForm, outputPrice: Number(e.target.value) })} className="h-8 text-xs" />
                         </div>
                       </div>
@@ -2746,11 +3004,17 @@ function ModelsTab() {
               <div className="space-y-1.5"><Label>供应商</Label><Input value={form.provider} onChange={e => setForm({ ...form, provider: e.target.value })} placeholder="OpenAI" /></div>
             </div>
             <div className="space-y-1.5"><Label>描述</Label><Input value={form.description} onChange={e => setForm({ ...form, description: e.target.value })} placeholder="模型描述" /></div>
+            <div className="space-y-1.5">
+              <Label>模型别名
+                <span className="ml-1.5 text-[10px] font-normal text-muted-foreground">（逗号分隔，供外部 API 模型名映射，如 claude-3-5-sonnet-20241022,claude-sonnet-4）</span>
+              </Label>
+              <Input value={(form as any).aliases || ''} onChange={e => setForm({ ...form, aliases: e.target.value } as any)} placeholder="claude-3-5-sonnet-20241022,claude-sonnet-4-20250514" />
+            </div>
             <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
               <div className="space-y-1.5"><Label>上下文长度</Label><Input type="number" value={form.contextLength} onChange={e => setForm({ ...form, contextLength: Number(e.target.value) })} /></div>
-              <div className="space-y-1.5"><Label>输入价格 ($/1M)</Label><Input type="number" step="0.01" value={form.inputPrice} onChange={e => setForm({ ...form, inputPrice: Number(e.target.value) })} /></div>
-              <div className="space-y-1.5"><Label>缓存输入价 ($/1M)</Label><Input type="number" step="0.01" value={form.cachedInputPrice} onChange={e => setForm({ ...form, cachedInputPrice: Number(e.target.value) })} /></div>
-              <div className="space-y-1.5"><Label>输出价格 ($/1M)</Label><Input type="number" step="0.01" value={form.outputPrice} onChange={e => setForm({ ...form, outputPrice: Number(e.target.value) })} /></div>
+              <div className="space-y-1.5"><Label>输入价格 (¥/1M)</Label><Input type="number" step="0.01" value={form.inputPrice} onChange={e => setForm({ ...form, inputPrice: Number(e.target.value) })} /></div>
+              <div className="space-y-1.5"><Label>缓存输入价 (¥/1M)</Label><Input type="number" step="0.01" value={form.cachedInputPrice} onChange={e => setForm({ ...form, cachedInputPrice: Number(e.target.value) })} /></div>
+              <div className="space-y-1.5"><Label>输出价格 (¥/1M)</Label><Input type="number" step="0.01" value={form.outputPrice} onChange={e => setForm({ ...form, outputPrice: Number(e.target.value) })} /></div>
             </div>
             <div className="space-y-2"><Label>能力标签</Label>
               {/* 预设标签 */}
@@ -2839,9 +3103,9 @@ function ModelsTab() {
 
       {/* 批量从渠道导入模型弹窗 */}
       <Dialog open={showImportDialog} onOpenChange={setShowImportDialog}>
-        <DialogContent className="max-w-lg max-h-[80vh] overflow-y-auto">
+        <DialogContent className="max-w-3xl max-h-[80vh] overflow-y-auto">
           <DialogHeader><DialogTitle>从渠道批量导入模型</DialogTitle></DialogHeader>
-          <p className="text-xs text-muted-foreground mb-3">以下模型在渠道中存在，但尚未添加到定价表中。勾选要导入的模型：</p>
+          <p className="text-xs text-muted-foreground mb-3">以下模型在渠道中存在，但尚未添加到定价表中。导入前会先匹配官方价格库；未匹配的模型不会写入 0 价格。</p>
           {importCandidates.length === 0 ? (
             <p className="text-sm text-muted-foreground py-4">所有渠道模型已导入，暂无新模型可导入。</p>
           ) : (
@@ -2849,20 +3113,233 @@ function ModelsTab() {
               <div className="flex items-center gap-2 mb-2">
                 <input type="checkbox" checked={importSelected.size === importCandidates.length} onChange={e => setImportSelected(e.target.checked ? new Set(importCandidates) : new Set())} className="rounded" />
                 <span className="text-xs text-muted-foreground">全选 ({importSelected.size}/{importCandidates.length})</span>
+                {importLoading && <span className="text-xs text-muted-foreground flex items-center gap-1"><Loader2 className="w-3 h-3 animate-spin" />匹配官方价格...</span>}
               </div>
               <div className="max-h-60 overflow-y-auto space-y-1 border rounded-lg p-2">
-                {importCandidates.map(m => (
+                {importCandidates.map(m => {
+                  const preview = importPreviewMap.get(m)
+                  return (
                   <label key={m} className="flex items-center gap-2 px-2 py-1.5 rounded hover:bg-muted cursor-pointer text-sm">
                     <input type="checkbox" checked={importSelected.has(m)} onChange={e => { const next = new Set(importSelected); e.target.checked ? next.add(m) : next.delete(m); setImportSelected(next) }} className="rounded" />
-                    <span className="font-mono text-xs">{m}</span>
+                    <span className="font-mono text-xs flex-1">{m}</span>
+                    <span className="text-xs text-muted-foreground">{findProviderForModel(m)}</span>
+                    {preview ? (
+                      preview.matched ? (
+                        <span className="text-xs text-emerald-600">
+                          {formatPrice(preview.importedInputPrice)} / {formatPrice(preview.importedCachedInputPrice)} / {formatPrice(preview.importedOutputPrice)}
+                        </span>
+                      ) : (
+                        <span className="text-xs text-amber-600">未匹配，需手动定价</span>
+                      )
+                    ) : (
+                      <span className="text-xs text-muted-foreground">等待匹配</span>
+                    )}
                   </label>
-                ))}
+                )})}
               </div>
+              <p className="text-[11px] text-muted-foreground mt-2">价格顺序：输入 / 缓存输入 / 输出，单位均为人民币 ¥/1M tokens。</p>
             </>
           )}
           <DialogFooter className="mt-4">
             <Button variant="outline" onClick={() => setShowImportDialog(false)}>取消</Button>
-            <Button onClick={handleImport} disabled={importCandidates.length === 0 || importSelected.size === 0}>导入选中 ({importSelected.size})</Button>
+            <Button onClick={handleImport} disabled={importLoading || importCandidates.length === 0 || importSelected.size === 0}>
+              {importLoading && <Loader2 className="w-4 h-4 mr-1 animate-spin" />}导入选中 ({importSelected.size})
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* 官方价格库导入弹窗 */}
+      <Dialog open={showPriceLibraryDialog} onOpenChange={setShowPriceLibraryDialog}>
+        <DialogContent className="w-[96vw] max-w-[1800px] max-h-[92vh] overflow-hidden p-0">
+          <DialogHeader className="px-6 pt-6 pb-4 border-b">
+            <DialogTitle className="flex items-center gap-2">
+              <Globe className="w-5 h-5" />官方价格库导入
+            </DialogTitle>
+          </DialogHeader>
+
+          <div className="flex max-h-[calc(92vh-8rem)] flex-col gap-4 overflow-hidden px-6 py-4">
+            <div className="rounded-lg border bg-muted/30 p-3 text-xs text-muted-foreground">
+              内置官方价格快照（{priceLibrary?.updatedAt || '加载中'}），导入后保存为人民币 ¥/1M tokens。USD 价格按「官方价 × 汇率 × 倍率」换算；人民币价格只应用倍率。
+            </div>
+
+            <div className="grid grid-cols-1 md:grid-cols-4 gap-3">
+              <div className="space-y-1.5">
+                <Label>导入范围</Label>
+                <Select value={priceLibrarySourceMode} onValueChange={v => setPriceLibrarySourceMode(v as any)}>
+                  <SelectTrigger><SelectValue /></SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="channelMissing">渠道缺失模型</SelectItem>
+                    <SelectItem value="current">当前价目表模型</SelectItem>
+                    <SelectItem value="all">官方库全部模型</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+              <div className="space-y-1.5">
+                <Label>供应商筛选</Label>
+                <Select value={priceLibraryProvider} onValueChange={setPriceLibraryProvider}>
+                  <SelectTrigger><SelectValue /></SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="__all__">全部供应商</SelectItem>
+                    {(priceLibrary?.providers || []).map(provider => (
+                      <SelectItem key={provider} value={provider}>{provider}</SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+              <div className="space-y-1.5">
+                <Label>美元汇率</Label>
+                <Input type="number" step="0.01" value={priceLibraryExchangeRate} onChange={e => setPriceLibraryExchangeRate(e.target.value)} />
+              </div>
+              <div className="space-y-1.5">
+                <Label>倍率</Label>
+                <Input type="number" step="0.01" value={priceLibraryMultiplier} onChange={e => setPriceLibraryMultiplier(e.target.value)} />
+              </div>
+            </div>
+
+            <div className="flex flex-col md:flex-row gap-3 md:items-center">
+              <div className="relative flex-1">
+                <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
+                <Input value={priceLibrarySearch} onChange={e => setPriceLibrarySearch(e.target.value)} placeholder="搜索模型、别名、来源备注..." className="pl-9" />
+              </div>
+              <label className="flex items-center gap-2 text-sm">
+                <Switch checked={priceLibraryCreateMissing} onCheckedChange={setPriceLibraryCreateMissing} />
+                创建缺失模型
+              </label>
+              <label className="flex items-center gap-2 text-sm">
+                <Switch checked={priceLibraryOverwrite} onCheckedChange={setPriceLibraryOverwrite} />
+                覆盖已有价格
+              </label>
+              <Button variant="outline" onClick={() => runPriceLibraryPreview()} disabled={priceLibraryLoading}>
+                {priceLibraryLoading && <Loader2 className="w-4 h-4 mr-1 animate-spin" />}预览
+              </Button>
+            </div>
+
+            <div className="flex flex-wrap gap-2 text-xs">
+              <Badge variant="outline">快照模型 {priceLibrary?.items?.length || 0}</Badge>
+              <Badge variant="outline">预览 {priceLibraryPreview.length}</Badge>
+              <Badge variant="success">可操作 {priceLibraryActionableCount}</Badge>
+              <Badge variant="outline">已选 {priceLibrarySelected.size}</Badge>
+              {priceLibraryPreview.some(item => item.action === 'unmatched') && (
+                <Badge variant="secondary">未匹配 {priceLibraryPreview.filter(item => item.action === 'unmatched').length}</Badge>
+              )}
+            </div>
+
+            {priceLibrary?.sources?.length ? (
+              <div className="flex flex-wrap gap-2 text-[11px] text-muted-foreground">
+                {priceLibrary.sources.map(source => (
+                  <span key={source.provider} className="inline-flex items-center gap-1 rounded-full border px-2 py-1">
+                    {source.provider}
+                    {source.sourceUrl ? <a className="text-primary hover:underline" href={source.sourceUrl} target="_blank" rel="noreferrer">来源</a> : <span>预留</span>}
+                  </span>
+                ))}
+              </div>
+            ) : null}
+
+            <div className="min-h-0 flex-1 border rounded-lg overflow-hidden">
+              <div className="h-full max-h-[52vh] overflow-auto">
+                <table className="min-w-[1480px] w-full table-fixed text-sm">
+                  <thead className="sticky top-0 z-10 bg-muted/90 text-xs text-muted-foreground backdrop-blur">
+                    <tr>
+                      <th className="w-[48px] px-3 py-2 text-left">
+                        <input
+                          type="checkbox"
+                          checked={priceLibraryDisplayedActionableIds.length > 0 && priceLibraryDisplayedActionableIds.every(id => priceLibrarySelected.has(id))}
+                          onChange={e => {
+                            const next = new Set(priceLibrarySelected)
+                            priceLibraryDisplayedActionableIds.forEach(id => e.target.checked ? next.add(id) : next.delete(id))
+                            setPriceLibrarySelected(next)
+                          }}
+                        />
+                      </th>
+                      <th className="w-[310px] px-3 py-2 text-left">模型</th>
+                      <th className="w-[150px] px-3 py-2 text-left">动作</th>
+                      <th className="w-[220px] px-3 py-2 text-left">当前价</th>
+                      <th className="w-[270px] px-3 py-2 text-left">官方价</th>
+                      <th className="w-[260px] px-3 py-2 text-left">导入后人民币价</th>
+                      <th className="w-[320px] px-3 py-2 text-left">来源/备注</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {filteredPriceLibraryPreview.length === 0 ? (
+                      <tr><td colSpan={7} className="px-3 py-8 text-center text-sm text-muted-foreground">{priceLibraryLoading ? '正在加载预览...' : '暂无预览结果，请点击预览'}</td></tr>
+                    ) : filteredPriceLibraryPreview.map(item => (
+                      <tr key={item.targetModelId} className="border-t align-top">
+                        <td className="px-3 py-2">
+                          <input
+                            type="checkbox"
+                            disabled={item.action !== 'create' && item.action !== 'update'}
+                            checked={priceLibrarySelected.has(item.targetModelId)}
+                            onChange={e => {
+                              const next = new Set(priceLibrarySelected)
+                              e.target.checked ? next.add(item.targetModelId) : next.delete(item.targetModelId)
+                              setPriceLibrarySelected(next)
+                            }}
+                          />
+                        </td>
+                        <td className="px-3 py-2">
+                          <div className="font-mono text-xs break-all">{item.targetModelId}</div>
+                          <div className="text-xs text-muted-foreground">{item.libraryName || item.targetName || item.libraryModelId || '未匹配'} · {item.provider || item.targetProvider || '-'}</div>
+                          {item.libraryModelId && item.libraryModelId !== item.targetModelId && (
+                            <div className="text-[11px] text-muted-foreground">匹配官方：{item.libraryModelId}</div>
+                          )}
+                        </td>
+                        <td className="px-3 py-2">
+                          <Badge variant={item.action === 'create' ? 'success' : item.action === 'update' ? 'default' : item.action === 'unmatched' ? 'destructive' : 'secondary'} className="whitespace-nowrap text-xs">
+                            {actionLabel(item.action)}
+                          </Badge>
+                          {item.reason && <div className="mt-1 text-[11px] leading-relaxed text-muted-foreground break-words">{item.reason}</div>}
+                        </td>
+                        <td className="px-3 py-2 text-xs">
+                          <div className="space-y-1 font-mono text-[11px] leading-relaxed">
+                            <div><span className="mr-1 text-muted-foreground">输入</span>{formatPrice(item.currentInputPrice)}</div>
+                            <div><span className="mr-1 text-muted-foreground">缓存</span>{formatPrice(item.currentCachedInputPrice)}</div>
+                            <div><span className="mr-1 text-muted-foreground">输出</span>{formatPrice(item.currentOutputPrice)}</div>
+                          </div>
+                        </td>
+                        <td className="px-3 py-2 text-xs">
+                          {item.matched ? (
+                            <div className="space-y-1 font-mono text-[11px] leading-relaxed">
+                              <div><span className="mr-1 text-muted-foreground">输入</span>{formatOfficialPrice(item, item.officialInputPrice)}</div>
+                              <div><span className="mr-1 text-muted-foreground">缓存</span>{formatOfficialPrice(item, item.officialCachedInputPrice)}</div>
+                              <div><span className="mr-1 text-muted-foreground">输出</span>{formatOfficialPrice(item, item.officialOutputPrice)}</div>
+                              {item.cachePriceDefaulted && <div className="text-[11px] text-amber-600">缓存价缺失，按输入价</div>}
+                            </div>
+                          ) : '—'}
+                        </td>
+                        <td className="px-3 py-2 text-xs font-medium">
+                          {item.matched ? (
+                            <div className="space-y-1 font-mono text-[11px] leading-relaxed">
+                              <div><span className="mr-1 text-muted-foreground">输入</span>{formatPrice(item.importedInputPrice)}</div>
+                              <div><span className="mr-1 text-muted-foreground">缓存</span>{formatPrice(item.importedCachedInputPrice)}</div>
+                              <div><span className="mr-1 text-muted-foreground">输出</span>{formatPrice(item.importedOutputPrice)}</div>
+                            </div>
+                          ) : '—'}
+                        </td>
+                        <td className="px-3 py-2 text-xs leading-relaxed text-muted-foreground break-words">
+                          {item.sourceUrl ? <a className="text-primary hover:underline" href={item.sourceUrl} target="_blank" rel="noreferrer">官方来源</a> : '—'}
+                          {item.sourceAccessedAt && <span className="ml-1">({item.sourceAccessedAt})</span>}
+                          {item.notes && <div className="mt-1">{item.notes}</div>}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+
+            {priceLibraryDisplayedIds.length > 0 && (
+              <p className="text-[11px] text-muted-foreground">
+                当前筛选显示 {filteredPriceLibraryPreview.length} 条，已选 {priceLibrarySelectedDisplayedCount} 条。覆盖更新只改价格字段，不覆盖人工维护的名称、描述和能力标签。
+              </p>
+            )}
+          </div>
+
+          <DialogFooter className="border-t bg-background px-6 py-4">
+            <Button variant="outline" onClick={() => setShowPriceLibraryDialog(false)}>取消</Button>
+            <Button onClick={handlePriceLibraryApply} disabled={priceLibraryApplying || priceLibrarySelected.size === 0}>
+              {priceLibraryApplying && <Loader2 className="w-4 h-4 mr-1 animate-spin" />}应用选中 ({priceLibrarySelected.size})
+            </Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>
@@ -2873,15 +3350,15 @@ function ModelsTab() {
           <DialogHeader><DialogTitle>批量编辑 ({batchSelected.size} 个模型)</DialogTitle></DialogHeader>
           <div className="space-y-3 mt-2">
             <div className="space-y-1.5">
-              <Label>输入价格 ($/1M，留空不修改)</Label>
+              <Label>输入价格 (¥/1M，留空不修改)</Label>
               <Input type="number" step="0.01" value={batchForm.inputPrice} onChange={e => setBatchForm({ ...batchForm, inputPrice: e.target.value })} placeholder="留空表示不修改" />
             </div>
             <div className="space-y-1.5">
-              <Label>缓存输入价 ($/1M，留空不修改)</Label>
+              <Label>缓存输入价 (¥/1M，留空不修改)</Label>
               <Input type="number" step="0.01" value={batchForm.cachedInputPrice} onChange={e => setBatchForm({ ...batchForm, cachedInputPrice: e.target.value })} placeholder="留空表示不修改" />
             </div>
             <div className="space-y-1.5">
-              <Label>输出价格 ($/1M，留空不修改)</Label>
+              <Label>输出价格 (¥/1M，留空不修改)</Label>
               <Input type="number" step="0.01" value={batchForm.outputPrice} onChange={e => setBatchForm({ ...batchForm, outputPrice: e.target.value })} placeholder="留空表示不修改" />
             </div>
             <div className="space-y-1.5">
@@ -3535,7 +4012,7 @@ function LogsTab() {
       <div className="grid grid-cols-2 sm:grid-cols-4 gap-4 mb-6">
         {[
           { label: '总 Token 用量', value: formatNumber(totalTokens), icon: Zap, color: 'text-blue-500' },
-          { label: '累计费用', value: `¥${(totalCost * 7.3).toFixed(2)}`, icon: DollarSign, color: 'text-green-500' },
+          { label: '累计费用', value: `¥${(totalCost).toFixed(2)}`, icon: DollarSign, color: 'text-green-500' },
           { label: '平均延迟', value: `${avgLatency.toFixed(0)}ms`, icon: Activity, color: 'text-orange-500' },
           { label: '错误率', value: `${errorRate}%`, icon: AlertTriangle, color: Number(errorRate) > 5 ? 'text-red-500' : 'text-muted-foreground' },
         ].map(({ label, value, icon: Icon, color }) => (
@@ -3613,7 +4090,7 @@ function LogsTab() {
                 <td className="px-4 py-2.5 text-xs text-muted-foreground font-mono">{log.requestIp || '-'}</td>
                 <td className="px-4 py-2.5 text-xs font-mono">{log.inputTokens.toLocaleString()}</td>
                 <td className="px-4 py-2.5 text-xs font-mono">{log.outputTokens.toLocaleString()}</td>
-                <td className="px-4 py-2.5 text-xs font-mono">¥{(log.cost * 7.3).toFixed(4)}</td>
+                <td className="px-4 py-2.5 text-xs font-mono">¥{(log.cost).toFixed(4)}</td>
                 <td className="px-4 py-2.5 text-xs">{log.latency}ms</td>
                 <td className="px-4 py-2.5"><Badge variant={log.status === 'success' ? 'success' : 'destructive'} className="text-xs">{log.status === 'success' ? '成功' : '失败'}</Badge></td>
                 <td className="px-4 py-2.5 text-xs text-muted-foreground">{formatDate(log.timestamp)}</td>
@@ -3648,7 +4125,7 @@ function LogsTab() {
                   { label: '输入 Token', value: detailLog.inputTokens.toLocaleString() },
                   { label: '缓存 Token', value: (detailLog.cachedInputTokens || 0).toLocaleString() },
                   { label: '输出 Token', value: detailLog.outputTokens.toLocaleString() },
-                  { label: '费用', value: `¥${(detailLog.cost * 7.3).toFixed(4)}` },
+                  { label: '费用', value: `¥${(detailLog.cost).toFixed(4)}` },
                   { label: '延迟', value: `${detailLog.latency}ms` },
                   { label: '请求 IP', value: detailLog.requestIp || '-' },
                   { label: '供应商', value: detailLog.provider || '-' },

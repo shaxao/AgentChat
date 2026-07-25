@@ -2,8 +2,11 @@ import { cn } from '@/lib/utils'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import {
   MessageSquare, BookOpen, Code2, Wallet, Settings, User, GitBranch, LayoutGrid, Workflow, Layers, Activity,
+  Download,
 } from 'lucide-react'
 import NotificationBell from './NotificationBell'
+
+const AUTOCODE_IDE_DOWNLOAD_URL = 'https://muhuo.site/autocode-api/api/local-runner/connector/windows/latest'
 
 export type MainView = 'chat' | 'skill-store' | 'autocode' | 'wallet' | 'routing' | 'scenarios' | 'workflow' | 'templates' | 'harness'
 
@@ -68,6 +71,19 @@ export default function IconNavBar({ activeView, onChange, onOpenSettings, onOpe
       {/* Bottom actions */}
       <div className="flex flex-col items-center gap-2 mt-auto">
         {/* 通知铃铛 */}
+        <Tooltip delayDuration={200}>
+          <TooltipTrigger asChild>
+            <a
+              href={AUTOCODE_IDE_DOWNLOAD_URL}
+              className="w-10 h-10 rounded-xl flex items-center justify-center transition-all text-sidebar-foreground hover:bg-sidebar-accent hover:text-foreground"
+              title="下载 AutoCode IDE"
+            >
+              <Download className="w-5 h-5" />
+            </a>
+          </TooltipTrigger>
+          <TooltipContent side="right">下载 AutoCode IDE</TooltipContent>
+        </Tooltip>
+
         <NotificationBell compact />
 
         {isAdmin && (

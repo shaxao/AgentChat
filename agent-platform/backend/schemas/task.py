@@ -10,6 +10,7 @@ class TaskStatus(str, Enum):
     pending = "pending"
     running = "running"
     waiting_confirm = "waiting_confirm"
+    waiting_user_input = "waiting_user_input"
     waiting_plan_confirm = "waiting_plan_confirm"
     waiting_prototype_confirm = "waiting_prototype_confirm"
     reviewing = "reviewing"
@@ -31,6 +32,12 @@ class ToolPolicy(str, Enum):
     ask = "ask"
     auto_safe = "auto_safe"
     full_access = "full_access"
+
+
+class AutonomyMode(str, Enum):
+    strong = "strong"
+    balanced = "balanced"
+    conservative = "conservative"
 
 
 class SubTask(BaseModel):
@@ -65,19 +72,23 @@ class AgentLogEntry(BaseModel):
 
 
 class TaskCreate(BaseModel):
+    autonomy_mode: AutonomyMode = Field(default=AutonomyMode.strong, description="Agent autonomy mode")
     title: str = Field(..., max_length=200, description="任务标题")
     description: str = Field(..., description="用户自然语言需求")
-    project_type: str = Field(default="nextjs", description="项目类型")
-    agent_types: list[str] = Field(default=["frontend"], description="启用的 Agent 类型")
+    project_type: str = Field(default="unknown", description="项目类型")
+    agent_types: list[str] = Field(default=["general"], description="启用的 Agent 类型")
     enable_smart_planning: bool = Field(default=False, description="是否启用智能规划")
     model: Optional[str] = Field(default=None, description="指定使用的模型")
     spec: Optional[str] = Field(default=None, description="开发规范，写入工作区 SPEC.md")
     user_id: Optional[str] = Field(default=None, description="用户 ID")
     tool_policy: ToolPolicy = Field(default=ToolPolicy.full_access, description="工具权限策略")
     pending_confirmation: Optional[dict] = Field(default=None, description="当前待确认操作")
+    pending_user_input: Optional[dict] = Field(default=None, description="当前等待用户回答的问题")
 
 
 class TaskResponse(BaseModel):
+    autonomy_mode: AutonomyMode = Field(default=AutonomyMode.strong, description="Agent autonomy mode")
+    completion_report: Optional[dict] = Field(default=None, description="Structured completion self-check report")
     id: str
     title: str
     description: str
@@ -91,10 +102,12 @@ class TaskResponse(BaseModel):
     preview_url: Optional[str]
     model: Optional[str] = Field(default=None, description="任务使用的模型")
     tool_policy: ToolPolicy = Field(default=ToolPolicy.full_access, description="工具权限策略")
+    pending_confirmation: Optional[dict] = Field(default=None, description="当前待确认操作")
+    pending_user_input: Optional[dict] = Field(default=None, description="当前等待用户回答的问题")
     plan: Optional[TaskPlan] = Field(default=None, description="智能任务计划")
     current_subtask_id: Optional[str] = Field(default=None, description="当前子任务 ID")
-    review: Optional[dict] = Field(default=None, description="代码审查结果")
-    phase_reviews: list[dict] = Field(default_factory=list, description="阶段代码审查结果")
+    review: Optional[dict] = Field(default=None, description="产物审查结果")
+    phase_reviews: list[dict] = Field(default_factory=list, description="阶段产物审查结果")
     prototype: Optional[dict] = Field(default=None, description="原型数据")
     plan_confirmed: Optional[bool] = Field(default=None, description="是否已确认开发计划")
     prototype_confirmed: Optional[bool] = Field(default=None, description="是否已确认原型")
@@ -114,6 +127,8 @@ class TaskResponse(BaseModel):
     pipeline_status: Optional[str] = Field(default=None, description="最近流水线状态")
     preview_status: Optional[str] = Field(default=None, description="预览状态")
     preview_error: Optional[str] = Field(default=None, description="预览错误")
+    active_execution_plan: Optional[dict] = Field(default=None, description="AI-selected universal execution plan")
+    task_capability_profile: Optional[dict] = Field(default=None, description="Resolved tools, workspace evidence, and stage policy")
 
 
     local_execution_enabled: bool = Field(default=False, description="本地执行是否开启")
@@ -126,6 +141,8 @@ class TaskResponse(BaseModel):
 
 
 class TaskStatusResponse(BaseModel):
+    autonomy_mode: AutonomyMode = AutonomyMode.strong
+    completion_report: Optional[dict] = None
     status: TaskStatus
     progress: int = Field(ge=0, le=100, default=0)
     current_step: str = ""
@@ -134,6 +151,7 @@ class TaskStatusResponse(BaseModel):
     model: Optional[str] = None
     tool_policy: ToolPolicy = ToolPolicy.full_access
     pending_confirmation: Optional[dict] = None
+    pending_user_input: Optional[dict] = None
     plan: Optional[TaskPlan] = None
     review: Optional[dict] = None
     phase_reviews: list[dict] = Field(default_factory=list)
@@ -154,10 +172,12 @@ class TaskStatusResponse(BaseModel):
     pipeline_status: Optional[str] = None
     preview_status: Optional[str] = None
     preview_error: Optional[str] = None
+    active_execution_plan: Optional[dict] = None
+    task_capability_profile: Optional[dict] = None
 
 
 class WorkspaceCreate(BaseModel):
-    project_type: str = "default"
+    project_type: str = "unknown"
     name: Optional[str] = None
 
 

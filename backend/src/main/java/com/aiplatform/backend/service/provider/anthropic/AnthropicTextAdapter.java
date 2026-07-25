@@ -45,32 +45,122 @@ public class AnthropicTextAdapter implements ProviderAdapter {
     public ObjectNode transformRequest(ObjectNode openAiBody, String provider) {
         ObjectNode anthropicBody = openAiBody.deepCopy();
 
-        // 1. 提取 system 消息到顶层
+        // 1. 提取 system 消息到顶层，并把 OpenAI 消息（含 tool_calls / tool role）转换为 Anthropic content block 格式
         JsonNode messages = anthropicBody.path("messages");
         if (messages.isArray()) {
             StringBuilder systemText = new StringBuilder();
-            ArrayNode filteredMessages = anthropicBody.putArray("_filtered_messages");
+            ArrayNode converted = MAPPER.createArrayNode();
             for (JsonNode msg : messages) {
-                if ("system".equals(msg.path("role").asText(""))) {
+                String role = msg.path("role").asText("");
+                if ("system".equals(role)) {
                     String content = msg.path("content").asText("");
                     if (!content.isEmpty()) {
                         if (systemText.length() > 0) systemText.append("\n\n");
                         systemText.append(content);
                     }
-                } else {
-                    filteredMessages.add(msg);
+                    continue;
                 }
+                if ("tool".equals(role)) {
+                    // OpenAI tool 结果 → Anthropic user 消息，content 含 tool_result 块
+                    // 相邻的多个 tool 结果合并到同一个 user 消息中（Anthropic 要求 tool_result 紧跟 assistant 的 tool_use）
+                    ObjectNode target;
+                    JsonNode last = converted.size() > 0 ? converted.get(converted.size() - 1) : null;
+                    if (last != null && "user".equals(last.path("role").asText("")) && last.path("_toolResultCarrier").asBoolean(false)) {
+                        target = (ObjectNode) last;
+                    } else {
+                        target = converted.addObject();
+                        target.put("role", "user");
+                        target.put("_toolResultCarrier", true);
+                        target.putArray("content");
+                    }
+                    ArrayNode contentArr = (ArrayNode) target.path("content");
+                    ObjectNode toolResult = contentArr.addObject();
+                    toolResult.put("type", "tool_result");
+                    toolResult.put("tool_use_id", msg.path("tool_call_id").asText(""));
+                    JsonNode toolContent = msg.get("content");
+                    toolResult.put("content", toolContent != null && !toolContent.isNull()
+                            ? (toolContent.isTextual() ? toolContent.asText("") : toolContent.toString())
+                            : "");
+                    continue;
+                }
+
+                JsonNode toolCalls = msg.path("tool_calls");
+                if ("assistant".equals(role) && toolCalls.isArray() && !toolCalls.isEmpty()) {
+                    // OpenAI assistant.tool_calls → Anthropic assistant content 含 text + tool_use 块
+                    ObjectNode out = converted.addObject();
+                    out.put("role", "assistant");
+                    ArrayNode contentArr = out.putArray("content");
+                    JsonNode textContent = msg.get("content");
+                    if (textContent != null && textContent.isTextual() && !textContent.asText("").isEmpty()) {
+                        contentArr.addObject().put("type", "text").put("text", textContent.asText(""));
+                    }
+                    for (JsonNode tc : toolCalls) {
+                        JsonNode fn = tc.path("function");
+                        ObjectNode toolUse = contentArr.addObject();
+                        toolUse.put("type", "tool_use");
+                        toolUse.put("id", tc.path("id").asText(""));
+                        toolUse.put("name", fn.path("name").asText(""));
+                        String argsStr = fn.path("arguments").asText("");
+                        JsonNode input;
+                        try {
+                            input = (argsStr == null || argsStr.isBlank()) ? MAPPER.createObjectNode() : MAPPER.readTree(argsStr);
+                        } catch (Exception e) {
+                            input = MAPPER.createObjectNode();
+                        }
+                        toolUse.set("input", input);
+                    }
+                    continue;
+                }
+
+                // 普通 user / assistant 消息（content 可能是字符串或多模态数组，Anthropic 均兼容）
+                converted.add(msg);
             }
             if (systemText.length() > 0) {
                 anthropicBody.put("system", systemText.toString());
             }
-            anthropicBody.set("messages", filteredMessages);
-            // 清理临时字段
-            anthropicBody.remove("_filtered_messages");
+            // 清理临时标记字段
+            for (JsonNode m : converted) {
+                if (m instanceof ObjectNode on) on.remove("_toolResultCarrier");
+            }
+            anthropicBody.set("messages", converted);
         }
 
-        // 2. 移除 OpenAI 特有字段
+        // 2. 转换 tools 定义：OpenAI {type:function, function:{name,description,parameters}} → Anthropic {name,description,input_schema}
+        JsonNode tools = anthropicBody.path("tools");
+        if (tools.isArray() && !tools.isEmpty()) {
+            ArrayNode anthTools = MAPPER.createArrayNode();
+            for (JsonNode t : tools) {
+                JsonNode fn = t.has("function") ? t.path("function") : t;
+                ObjectNode at = anthTools.addObject();
+                at.put("name", fn.path("name").asText(""));
+                String desc = fn.path("description").asText("");
+                if (!desc.isEmpty()) at.put("description", desc);
+                JsonNode params = fn.path("parameters");
+                at.set("input_schema", params.isObject() ? params : MAPPER.createObjectNode().put("type", "object"));
+            }
+            anthropicBody.set("tools", anthTools);
+        }
+        // tool_choice: OpenAI "auto"/"none"/{...} → Anthropic {type:auto/any/tool}
+        JsonNode toolChoice = anthropicBody.path("tool_choice");
+        if (!toolChoice.isMissingNode() && !toolChoice.isNull()) {
+            ObjectNode tc = MAPPER.createObjectNode();
+            if (toolChoice.isTextual()) {
+                String v = toolChoice.asText("");
+                if ("required".equals(v)) tc.put("type", "any");
+                else if ("none".equals(v)) tc.put("type", "auto"); // Anthropic 无 none，退化为 auto（tools 仍可不调用）
+                else tc.put("type", "auto");
+                anthropicBody.set("tool_choice", tc);
+            } else if (toolChoice.isObject() && toolChoice.path("function").has("name")) {
+                tc.put("type", "tool");
+                tc.put("name", toolChoice.path("function").path("name").asText(""));
+                anthropicBody.set("tool_choice", tc);
+            }
+        }
+
+        // 3. 移除 OpenAI 特有字段
         anthropicBody.remove("stream_options");
+        anthropicBody.remove("prompt_cache_key");
+        anthropicBody.remove("_autocode_prompt_cache_key");
         // Anthropic 不支持 frequency_penalty / presence_penalty 在某些模型上，保留但不强制
 
         // 3. 深度思考参数 → Anthropic thinking block
@@ -210,14 +300,34 @@ public class AnthropicTextAdapter implements ProviderAdapter {
                         ctx.hasUsage = true;
                     }
                     break;
-                case "content_block_delta":
-                    // 提取增量文本或思考内容
+                case "content_block_start": {
+                    // tool_use 块开始：记录 id + name，按 Anthropic 的 index 建立 StreamToolCall
+                    JsonNode block = json.path("content_block");
+                    if ("tool_use".equals(block.path("type").asText(""))) {
+                        int idx = json.path("index").asInt(0);
+                        StreamToolCall stc = findOrCreateToolCall(ctx, idx);
+                        stc.id = block.path("id").asText("");
+                        stc.type = "function";
+                        stc.functionName = block.path("name").asText("");
+                        // Anthropic tool_use.input 可能在 start 事件里已带部分对象（通常为空 {}）
+                    }
+                    break;
+                }
+                case "content_block_delta": {
+                    // 提取增量文本、思考内容或工具参数增量
                     JsonNode delta = json.path("delta");
                     String deltaType = delta.path("type").asText("");
                     if ("thinking_delta".equals(deltaType)) {
                         String thinking = delta.path("thinking").asText(null);
                         if (thinking != null && !thinking.isEmpty()) {
                             ctx.thinkingBuilder.append(thinking);
+                        }
+                    } else if ("input_json_delta".equals(deltaType)) {
+                        // 工具参数 JSON 增量拼接到对应 index 的 StreamToolCall
+                        int idx = json.path("index").asInt(0);
+                        String partial = delta.path("partial_json").asText(null);
+                        if (partial != null && !partial.isEmpty()) {
+                            findOrCreateToolCall(ctx, idx).arguments.append(partial);
                         }
                     } else if ("text_delta".equals(deltaType)) {
                         String text = delta.path("text").asText(null);
@@ -227,14 +337,22 @@ public class AnthropicTextAdapter implements ProviderAdapter {
                         String text = delta.path("text").asText(null);
                         return text != null && !text.isEmpty() ? text : null;
                     }
-                case "message_delta":
-                    // 提取 output_tokens
+                    break;
+                }
+                case "message_delta": {
+                    // 提取 output_tokens 与 stop_reason
                     int outputTokens = json.path("usage").path("output_tokens").asInt(0);
                     if (outputTokens > 0) {
                         ctx.outputTokens = outputTokens;
                         ctx.hasUsage = true;
                     }
+                    String stopReason = json.path("delta").path("stop_reason").asText(null);
+                    if (stopReason != null && !stopReason.isEmpty()) {
+                        ctx.finishReason = "tool_use".equals(stopReason) ? "tool_calls"
+                                : ("max_tokens".equals(stopReason) ? "length" : "stop");
+                    }
                     break;
+                }
                 case "message_stop":
                     ctx.done = true;
                     break;
@@ -245,6 +363,17 @@ public class AnthropicTextAdapter implements ProviderAdapter {
             // JSON 解析失败，跳过
         }
         return null;
+    }
+
+    /** 按 Anthropic content block 的 index 查找或新建 StreamToolCall（工具参数增量拼接用） */
+    private static StreamToolCall findOrCreateToolCall(StreamContext ctx, int index) {
+        for (StreamToolCall existing : ctx.toolCallsBuilder) {
+            if (existing.index == index) return existing;
+        }
+        StreamToolCall stc = new StreamToolCall();
+        stc.index = index;
+        ctx.toolCallsBuilder.add(stc);
+        return stc;
     }
 
     @Override

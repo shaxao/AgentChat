@@ -22,6 +22,9 @@ public class ModelChannel {
     /** 翻译支持语言配置 JSON 数组，如 [{"code":"英文","label":"🇺🇸 英文"},...] */
     private String translateLangs; // 仅 channelType=translate 时有效
     private String status;        // active / error / disabled
+    private String statusMessage; // latest connection test result or error detail
+    /** 出站接口格式：chat_completions（默认）/ responses / messages。决定平台调用上游时用哪种 API 协议。 */
+    private String apiFormat;
     private Integer priority;
     private Integer rateLimit;
     @TableField(fill = FieldFill.INSERT)

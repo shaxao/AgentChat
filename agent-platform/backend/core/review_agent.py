@@ -1,42 +1,49 @@
 # -*- coding: utf-8 -*-
-"""
-AutoCode review agent.
-
-The reviewer is a hard quality gate. It must not approve an empty workspace or
-an execution phase with no meaningful artifacts.
-"""
+"""Artifact-aware quality review for AutoCode tasks."""
 
 from __future__ import annotations
 
 import asyncio
 import json
 import logging
+import os
 import re
 import subprocess
+import zipfile
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterable
+
+from core.execution_protocol import is_auxiliary_artifact, normalize_artifact_contracts
 
 logger = logging.getLogger(__name__)
 
-
-SOURCE_EXTENSIONS = {
-    ".js", ".jsx", ".ts", ".tsx", ".py", ".go", ".java", ".vue",
-    ".html", ".css", ".scss", ".sass", ".md", ".json", ".yaml", ".yml",
-}
 CODE_EXTENSIONS = {
-    ".js", ".jsx", ".ts", ".tsx", ".py", ".go", ".java", ".vue",
-    ".html", ".css", ".scss", ".sass",
+    ".c", ".cc", ".cpp", ".cxx", ".cs", ".dart", ".ex", ".exs", ".fs", ".fsx",
+    ".go", ".groovy", ".h", ".hpp", ".html", ".java", ".js", ".jsx", ".kt",
+    ".kts", ".lua", ".m", ".mm", ".php", ".pl", ".pm", ".py", ".r", ".rb",
+    ".rs", ".scala", ".sh", ".sol", ".swift", ".ts", ".tsx", ".vue", ".zig",
 }
-SKIP_DIRS = {"node_modules", ".git", "dist", "build", ".next", "__pycache__", ".autocode", "venv", ".venv"}
+TEXT_EXTENSIONS = CODE_EXTENSIONS | {
+    ".css", ".csv", ".ini", ".json", ".md", ".rst", ".scss", ".sql", ".toml",
+    ".txt", ".xml", ".yaml", ".yml",
+}
+SKIP_DIRS = {
+    ".autocode", ".git", ".next", ".venv", "__pycache__", "build", "dist",
+    "node_modules", "target", "venv",
+}
+EXTENSIONLESS_ARTIFACT_FILES = {
+    "dockerfile", "gemfile", "license", "makefile", "procfile", "rakefile",
+    "readme",
+}
 
 
 class ReviewResult:
-    """Aggregated code review result."""
+    """Aggregated artifact review result."""
 
     def __init__(self):
         self.passed: bool = True
         self.score: int = 100
-        self.issues: list[dict] = []
+        self.issues: list[dict[str, Any]] = []
         self.summary: str = ""
         self.dimensions: dict[str, Any] = {}
 
@@ -48,7 +55,7 @@ class ReviewResult:
         elif level == "warn":
             self.score = max(0, self.score - 6)
 
-    def to_dict(self) -> dict:
+    def to_dict(self) -> dict[str, Any]:
         return {
             "passed": self.passed,
             "score": self.score,
@@ -59,7 +66,7 @@ class ReviewResult:
 
 
 class ReviewAgent:
-    """Code review agent called by AgentOrchestrator after phases/final build."""
+    """Review code and non-code artifacts against an open execution contract."""
 
     SENSITIVE_PATTERNS = [
         (r'(?i)(api[_\-]?key|secret|password|token|credential)\s*[=:]\s*["\'][\w\-/+]{8,}', "疑似硬编码敏感信息"),
@@ -67,19 +74,10 @@ class ReviewAgent:
         (r'(?i)AKIA[0-9A-Z]{16}', "疑似 AWS Access Key 泄露"),
         (r'(?i)-----BEGIN (RSA |EC )?PRIVATE KEY', "疑似私钥泄露"),
     ]
-
     SECURITY_PATTERNS = [
-        (r'eval\s*\(', "warn", "使用 eval()，存在代码注入风险"),
-        (r'innerHTML\s*=\s*[^"\'`]', "warn", "动态写入 innerHTML，需确认已做转义"),
-        (r'dangerouslySetInnerHTML', "info", "使用 dangerouslySetInnerHTML，请确认输入可信或已净化"),
-        (r'subprocess\.call|os\.system', "warn", "直接执行系统命令，需确认输入不可被注入"),
-        (r'pickle\.loads', "error", "pickle.loads 存在反序列化安全风险"),
-    ]
-
-    PERFORMANCE_PATTERNS = [
-        (r'console\.log\(', "info", "生产代码中包含 console.log"),
-        (r'TODO|FIXME|HACK', "info", "包含待办标记，需确认不影响交付"),
-        (r'\.forEach\(.*\.forEach\(', "warn", "嵌套遍历可能造成性能问题"),
+        (r"eval\s*\(", "warn", "使用 eval()，需确认输入不可被注入"),
+        (r"pickle\.loads", "error", "pickle.loads 存在不安全反序列化风险"),
+        (r"subprocess\.(call|run|Popen)|os\.system", "info", "执行系统命令，需确认输入边界"),
     ]
 
     def __init__(self, llm_client=None):
@@ -90,387 +88,408 @@ class ReviewAgent:
         ws_path: Path,
         task_id: str,
         task_title: str,
-        project_type: str,
-        log: Callable,
+        project_type: str = "unknown",
+        log: Callable | None = None,
+        *,
+        execution_plan: dict[str, Any] | None = None,
+        capability_profile: dict[str, Any] | None = None,
+        changed_files: Iterable[str] | None = None,
+        artifact_sources: dict[str, Any] | None = None,
     ) -> ReviewResult:
+        log = log or (lambda *_args, **_kwargs: None)
         result = ReviewResult()
-        log("info", "代码审查 Agent 启动", "reviewer")
+        plan = execution_plan or {}
+        profile = capability_profile or {}
+        contracts = normalize_artifact_contracts(
+            plan.get("artifact_contracts") or [], intent=str(plan.get("intent") or "")
+        )
+        changed = [str(path) for path in (changed_files or []) if str(path).strip()]
 
-        await self._artifact_gate(ws_path, project_type, result, log)
-        await self._static_scan(ws_path, result, log)
-        await self._file_quality_check(ws_path, result, log)
-        await self._toolchain_check(ws_path, project_type, result, log)
-        await self._ai_review(ws_path, task_title, project_type, result, log)
+        log("info", "产物审查已启动", "reviewer")
+        await self._artifact_gate(
+            ws_path,
+            contracts,
+            changed,
+            profile,
+            artifact_sources or {},
+            result,
+            log,
+            execution_intent=str(plan.get("intent") or ""),
+        )
+
+        code_files = self._resolve_code_files(ws_path, contracts, changed)
+        if code_files:
+            await self._static_scan(ws_path, code_files, result, log)
+            await self._ai_review(ws_path, task_title, plan, code_files, result, log)
+        else:
+            result.dimensions["static_scan"] = {"status": "not_applicable", "files_scanned": 0}
+            result.dimensions["ai_review"] = {"status": "not_applicable", "reason": "no code artifact declared"}
 
         self._generate_summary(result)
         await self._write_review_file(ws_path, task_id, task_title, result)
-
-        if result.passed:
-            log("success", f"代码审查通过，综合评分：{result.score}/100", "reviewer")
-        else:
-            errors = [i for i in result.issues if i["level"] == "error"]
-            log("warn", f"代码审查未通过：{len(errors)} 个错误，评分 {result.score}/100", "reviewer")
-
+        log(
+            "success" if result.passed else "warn",
+            f"产物审查{'通过' if result.passed else '未通过'}，评分 {result.score}/100",
+            "reviewer",
+        )
         return result
 
-    async def _artifact_gate(self, ws_path: Path, project_type: str, result: ReviewResult, log: Callable):
-        files = self._iter_review_files(ws_path, SOURCE_EXTENSIONS)
-        code_files = [f for f in files if f.suffix in CODE_EXTENSIONS]
-        result.dimensions["artifacts"] = {
-            "source_files": len(files),
-            "code_files": len(code_files),
-            "sample_files": [str(f.relative_to(ws_path)) for f in files[:30]],
-        }
-        if not files:
-            result.add_issue(
-                "error",
-                "review/no-artifacts",
-                ".",
-                "工作区没有可审查文件，不能通过代码审查。",
-            )
-            result.score = min(result.score, 10)
-        elif not code_files and self._expects_code(project_type):
-            result.add_issue(
-                "error",
-                "review/no-code-files",
-                ".",
-                "当前任务类型需要代码产物，但工作区没有发现源码文件。",
-            )
-            result.score = min(result.score, 25)
-        log("info", f"产物检查: {len(files)} 个可审查文件，{len(code_files)} 个源码文件", "reviewer")
-
-    async def _static_scan(self, ws_path: Path, result: ReviewResult, log: Callable):
-        scanned = 0
-        security_issues = 0
-        performance_issues = 0
-
-        for file in self._iter_review_files(ws_path, CODE_EXTENSIONS):
-            try:
-                content = file.read_text(encoding="utf-8", errors="ignore")
-            except Exception:
-                continue
-
-            scanned += 1
-            rel = str(file.relative_to(ws_path))
-
-            for pattern, label in self.SENSITIVE_PATTERNS:
-                if re.search(pattern, content):
-                    result.add_issue("error", "security/sensitive-data", rel, label)
-                    security_issues += 1
-
-            for pattern, level, message in self.SECURITY_PATTERNS:
-                if re.search(pattern, content):
-                    result.add_issue(level, "security/pattern", rel, message)
-                    if level in ("error", "warn"):
-                        security_issues += 1
-
-            for pattern, level, message in self.PERFORMANCE_PATTERNS:
-                if re.search(pattern, content):
-                    result.add_issue(level, "quality/pattern", rel, message)
-                    if level == "warn":
-                        performance_issues += 1
-
-        result.dimensions["static_scan"] = {
-            "files_scanned": scanned,
-            "security_issues": security_issues,
-            "performance_issues": performance_issues,
-        }
-        log("info", f"静态扫描: {scanned} 文件，安全:{security_issues}，性能:{performance_issues}", "reviewer")
-
-    async def _file_quality_check(self, ws_path: Path, result: ReviewResult, log: Callable):
-        large_files = []
-        very_large_files = []
-
-        for file in self._iter_review_files(ws_path, SOURCE_EXTENSIONS):
-            try:
-                size_kb = file.stat().st_size / 1024
-            except OSError:
-                continue
-            if size_kb <= 500:
-                continue
-            rel = str(file.relative_to(ws_path))
-            large_files.append(rel)
-            if size_kb > 2048:
-                very_large_files.append(rel)
-                result.add_issue("error", "quality/very-large-file", rel, f"文件过大 ({size_kb:.0f}KB)，需要拆分或移出源码产物")
-            else:
-                result.add_issue("warn", "quality/large-file", rel, f"文件较大 ({size_kb:.0f}KB)，可能影响维护和加载")
-
-        result.dimensions["file_quality"] = {
-            "large_files": large_files,
-            "very_large_files": very_large_files,
-        }
-        log("info", f"文件检查: {len(large_files)} 个大文件", "reviewer")
-
-    async def _toolchain_check(self, ws_path: Path, project_type: str, result: ReviewResult, log: Callable):
-        tool_results: dict[str, Any] = {}
-
-        if project_type in ("nextjs", "react", "vue") and (ws_path / "package.json").exists():
-            package_text = (ws_path / "package.json").read_text(encoding="utf-8", errors="ignore")
-            has_tsconfig = (ws_path / "tsconfig.json").exists()
-            if has_tsconfig:
-                tool_results["typescript"] = await self._run_command(
-                    ["npx", "tsc", "--noEmit", "--skipLibCheck"],
-                    ws_path,
-                    result,
-                    "typescript/type-check",
-                    "TypeScript 类型检查未通过",
-                    log,
-                    timeout=60,
-                )
-            if '"build"' not in package_text:
-                result.add_issue("info", "toolchain/no-build-script", "package.json", "package.json 未定义 build 脚本，已跳过构建脚本审查")
-
-        if project_type == "python":
-            py_files = [str(f) for f in self._iter_review_files(ws_path, {".py"})[:40]]
-            if py_files:
-                tool_results["python"] = await self._run_command(
-                    ["python", "-m", "py_compile", *py_files],
-                    ws_path,
-                    result,
-                    "python/syntax",
-                    "Python 语法检查未通过",
-                    log,
-                    timeout=30,
-                )
-
-        result.dimensions["toolchain"] = tool_results
-
-    async def _run_command(
-        self,
-        command: list[str],
-        cwd: Path,
-        result: ReviewResult,
-        rule: str,
-        fail_message: str,
-        log: Callable,
-        timeout: int,
-    ) -> dict[str, Any]:
-        try:
-            proc = await asyncio.to_thread(
-                subprocess.run,
-                command,
-                cwd=str(cwd),
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-            )
-        except Exception as exc:
-            log("info", f"工具链检查跳过: {command[0]} ({exc})", "reviewer")
-            return {"status": "skip", "reason": str(exc)}
-
-        output = ((proc.stdout or "") + "\n" + (proc.stderr or "")).strip()
-        if proc.returncode != 0:
-            result.add_issue("warn", rule, ".", f"{fail_message}: {output[:500]}")
-            log("warn", f"工具链检查失败: {' '.join(command[:3])}", "reviewer")
-            return {"status": "fail", "exit_code": proc.returncode, "output": output[:1200]}
-
-        log("info", f"工具链检查通过: {' '.join(command[:3])}", "reviewer")
-        return {"status": "pass"}
-
-    async def _ai_review(
+    async def _artifact_gate(
         self,
         ws_path: Path,
-        task_title: str,
-        project_type: str,
+        contracts: list[dict[str, Any]],
+        changed_files: list[str],
+        capability_profile: dict[str, Any],
+        artifact_sources: dict[str, Any],
         result: ReviewResult,
         log: Callable,
-    ):
+        execution_intent: str = "",
+    ) -> None:
+        local_unsynced = (
+            str(capability_profile.get("artifact_source") or "") == "local_connector"
+            or str(capability_profile.get("workspace_sync_status") or "").lower() not in {"", "synced", "workspace"}
+        )
+        checks: list[dict[str, Any]] = []
+        verified_count = 0
+
+        for contract in contracts:
+            raw_path = str(contract.get("path") or "").strip()
+            if not raw_path or is_auxiliary_artifact(raw_path):
+                if contract.get("required", True):
+                    result.add_issue("error", "artifact/invalid-contract", raw_path or ".", "目标产物路径为空或仅指向 AutoCode 辅助文件")
+                continue
+            path = self._resolve_artifact_path(ws_path, raw_path, artifact_sources)
+            if path is None or not path.exists() or not path.is_file():
+                if local_unsynced and self._matches_changed_evidence(raw_path, changed_files):
+                    checks.append({"path": raw_path, "status": "verified_by_local_change_evidence", "source": "local_connector"})
+                    verified_count += 1
+                    continue
+                semantic_label = self._looks_like_semantic_artifact_label(raw_path)
+                if local_unsynced and semantic_label:
+                    meaningful = self._meaningful_changed_files(changed_files)
+                    if meaningful:
+                        checks.append({
+                            "path": raw_path,
+                            "status": "verified_by_local_change_evidence",
+                            "source": "local_connector",
+                            "evidence": meaningful[:10],
+                        })
+                        verified_count += 1
+                        continue
+                    checks.append({
+                        "path": raw_path,
+                        "status": "deferred_semantic_contract",
+                        "source": "local_connector",
+                        "reason": "execution plan contract is a semantic label, not a cloud workspace path",
+                    })
+                    result.add_issue(
+                        "info",
+                        "artifact/local-semantic-contract",
+                        raw_path,
+                        "Execution plan artifact contract is a semantic label; cloud path verification deferred to local connector evidence.",
+                    )
+                    continue
+                if semantic_label:
+                    checks.append({
+                        "path": raw_path,
+                        "status": "semantic_contract_no_path",
+                        "reason": "execution plan contract is a semantic label, not a file path",
+                    })
+                    result.add_issue(
+                        "warn" if contract.get("required", True) else "info",
+                        "artifact/non-path-contract",
+                        raw_path,
+                        "Execution plan artifact contract is not a file path; use changed files or explicit artifact paths for strict review.",
+                    )
+                    continue
+                level = "error" if contract.get("required", True) else "warn"
+                result.add_issue(level, "artifact/missing", raw_path, "未找到执行计划声明的目标产物")
+                checks.append({"path": raw_path, "status": "missing"})
+                continue
+
+            check = self._validate_file(path, contract)
+            check["path"] = raw_path
+            checks.append(check)
+            if check["status"] == "pass":
+                verified_count += 1
+            else:
+                result.add_issue("error", check.get("rule", "artifact/invalid"), raw_path, check.get("message", "产物验证失败"))
+
+        if not contracts:
+            meaningful = [path for path in changed_files if not is_auxiliary_artifact(path)]
+            if meaningful:
+                verified_count = len(meaningful)
+                checks.extend({"path": path, "status": "changed_file_evidence"} for path in meaningful[:100])
+            elif str(execution_intent or "").lower() == "code_development":
+                checks.append({
+                    "status": "missing_change_evidence",
+                    "reason": "code_development requires at least one non-AutoCode changed file",
+                })
+                result.add_issue(
+                    "error",
+                    "artifact/no-code-changes",
+                    ".",
+                    "Code-development review has no artifact contracts and no meaningful changed files.",
+                )
+            else:
+                workspace_files = self._iter_workspace_files(ws_path)
+                if workspace_files:
+                    verified_count = len(workspace_files)
+                    checks.append({"status": "workspace_evidence", "file_count": len(workspace_files)})
+                elif local_unsynced:
+                    checks.append({"status": "deferred_to_local_connector", "reason": "local project is not mirrored into workspace"})
+                    result.add_issue("info", "artifact/local-source", ".", "本地产物未同步到云工作区，未执行云端文件存在性否决")
+                else:
+                    result.add_issue("error", "artifact/no-artifacts", ".", "未发现执行计划产物、有效变更或可审查文件")
+
+        result.dimensions["artifacts"] = {
+            "status": "pass" if not any(i["level"] == "error" and i["rule"].startswith("artifact/") for i in result.issues) else "fail",
+            "declared_count": len(contracts),
+            "verified_count": verified_count,
+            "source": "local_connector" if local_unsynced else "workspace",
+            "checks": checks,
+        }
+        log("info", f"产物合同验证完成：{verified_count}/{len(contracts) or verified_count}", "reviewer")
+
+    def _resolve_artifact_path(self, ws_path: Path, raw_path: str, sources: dict[str, Any]) -> Path | None:
+        mapped = sources.get(raw_path)
+        if isinstance(mapped, str) and mapped.strip():
+            return Path(mapped)
+        candidate = Path(raw_path)
+        if candidate.is_absolute():
+            return candidate
+        normalized = raw_path.replace("\\", "/").lstrip("/")
+        if normalized.startswith("workspace/"):
+            normalized = normalized[len("workspace/"):]
+        return ws_path / normalized
+
+    def _validate_file(self, path: Path, contract: dict[str, Any]) -> dict[str, Any]:
+        try:
+            size = path.stat().st_size
+        except OSError as exc:
+            return {"status": "fail", "rule": "artifact/unreadable", "message": str(exc)}
+        minimum = int(contract.get("minimum_size") or 1)
+        if size < minimum:
+            return {"status": "fail", "rule": "artifact/empty", "message": f"文件大小 {size} 字节，低于要求 {minimum} 字节"}
+
+        suffix = path.suffix.lower()
+        kind = str(contract.get("kind") or "unknown").lower()
+        try:
+            if suffix in {".pptx", ".xlsx", ".docx"}:
+                return self._validate_office_package(path, suffix, size)
+            if suffix == ".pdf" or kind == "pdf":
+                return self._validate_signature(path, b"%PDF-", size, "artifact/pdf-signature")
+            if suffix in {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"} or kind == "image":
+                return self._validate_image(path, size)
+            if suffix == ".json":
+                json.loads(path.read_text(encoding="utf-8-sig"))
+                return {"status": "pass", "kind": "json", "size": size}
+            if suffix in TEXT_EXTENSIONS or kind in {"code", "text", "document"}:
+                path.read_text(encoding=str(contract.get("encoding") or "utf-8-sig"))
+                return {"status": "pass", "kind": kind or "text", "size": size}
+            with path.open("rb") as stream:
+                signature = stream.read(32)
+            return {"status": "pass", "kind": kind or "unknown", "size": size, "signature_hex": signature.hex()}
+        except (OSError, UnicodeError, ValueError, json.JSONDecodeError, zipfile.BadZipFile) as exc:
+            return {"status": "fail", "rule": "artifact/unreadable", "message": f"文件无法按声明格式读取：{exc}"}
+
+    def _validate_office_package(self, path: Path, suffix: str, size: int) -> dict[str, Any]:
+        expected = {
+            ".pptx": "ppt/presentation.xml",
+            ".xlsx": "xl/workbook.xml",
+            ".docx": "word/document.xml",
+        }[suffix]
+        with zipfile.ZipFile(path) as archive:
+            names = set(archive.namelist())
+            if "[Content_Types].xml" not in names or expected not in names:
+                return {"status": "fail", "rule": "artifact/office-structure", "message": f"Office 包缺少 {expected} 或内容类型清单"}
+        return {"status": "pass", "kind": suffix.lstrip("."), "size": size, "package_entry": expected}
+
+    def _validate_signature(self, path: Path, expected: bytes, size: int, rule: str) -> dict[str, Any]:
+        with path.open("rb") as stream:
+            actual = stream.read(len(expected))
+        if actual != expected:
+            return {"status": "fail", "rule": rule, "message": "文件签名与声明格式不匹配"}
+        return {"status": "pass", "size": size}
+
+    def _validate_image(self, path: Path, size: int) -> dict[str, Any]:
+        with path.open("rb") as stream:
+            head = stream.read(16)
+        valid = (
+            head.startswith(b"\x89PNG\r\n\x1a\n")
+            or head.startswith(b"\xff\xd8\xff")
+            or head.startswith((b"GIF87a", b"GIF89a"))
+            or head.startswith(b"BM")
+            or (head.startswith(b"RIFF") and head[8:12] == b"WEBP")
+        )
+        if not valid:
+            return {"status": "fail", "rule": "artifact/image-signature", "message": "无法识别图片文件签名"}
+        return {"status": "pass", "kind": "image", "size": size}
+
+    async def _static_scan(self, ws_path: Path, files: list[Path], result: ReviewResult, log: Callable) -> None:
+        scanned = 0
+        issue_count = 0
+        for path in files[:500]:
+            try:
+                text = path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            scanned += 1
+            rel = self._relative_label(ws_path, path)
+            for pattern, message in self.SENSITIVE_PATTERNS:
+                if re.search(pattern, text):
+                    result.add_issue("error", "security/secret", rel, message)
+                    issue_count += 1
+            for pattern, level, message in self.SECURITY_PATTERNS:
+                if re.search(pattern, text):
+                    result.add_issue(level, "security/pattern", rel, message)
+                    issue_count += 1
+        result.dimensions["static_scan"] = {"status": "done", "files_scanned": scanned, "issues": issue_count}
+        log("info", f"代码静态扫描完成：{scanned} 个文件", "reviewer")
+
+    async def _ai_review(self, ws_path: Path, task_title: str, plan: dict[str, Any], files: list[Path], result: ReviewResult, log: Callable) -> None:
         if not self._llm:
             result.dimensions["ai_review"] = {"status": "skip", "reason": "no LLM client"}
-            log("info", "AI 综合评审: 跳过（无 LLM 客户端）", "reviewer")
             return
-
-        core_files = []
-        for file in self._iter_review_files(ws_path, CODE_EXTENSIONS):
+        snippets: list[str] = []
+        for path in files[:4]:
             try:
-                lines = file.read_text(encoding="utf-8", errors="ignore").splitlines()
-            except Exception:
+                lines = path.read_text(encoding="utf-8", errors="replace").splitlines()[:220]
+            except OSError:
                 continue
-            if 5 <= len(lines) <= 600:
-                core_files.append((file, lines[:220]))
-            if len(core_files) >= 4:
-                break
-
-        if not core_files:
-            result.dimensions["ai_review"] = {"status": "skip", "reason": "no suitable code files"}
+            snippets.append(f"FILE: {self._relative_label(ws_path, path)}\n" + "\n".join(lines))
+        if not snippets:
+            result.dimensions["ai_review"] = {"status": "skip", "reason": "no readable code"}
             return
-
-        snippets = []
-        for file, lines in core_files:
-            rel = file.relative_to(ws_path).as_posix()
-            snippets.append(f"### {rel}\n```\n" + "\n".join(lines) + "\n```")
-
-        prompt = f"""你是一名严格的代码审查工程师。请审查以下 AutoCode 产物。
-
-任务: {task_title}
-项目类型: {project_type}
-
-{chr(10).join(snippets)}
-
-只返回 JSON:
-{{
-  "score": 0到100的整数,
-  "verdict": "pass|warn|fail",
-  "strengths": ["优点"],
-  "concerns": ["问题"],
-  "suggestions": ["建议"]
-}}"""
-
+        prompt = (
+            "你是严格的代码审查工程师。根据任务和源码片段返回 JSON，字段为 "
+            "score(0-100), verdict(pass|warn|fail), concerns, suggestions。\n"
+            f"任务：{task_title}\n任务类型：{plan.get('task_family') or 'unknown'}\n\n"
+            + "\n\n".join(snippets)
+        )
         try:
             response_text = ""
             if hasattr(self._llm, "stream"):
-                async for chunk in self._llm.stream(
-                    messages=[{"role": "user", "content": prompt}],
-                    max_tokens=700,
-                    temperature=0.2,
-                ):
+                async for chunk in self._llm.stream(messages=[{"role": "user", "content": prompt}], max_tokens=700, temperature=0.2):
                     response_text += chunk
             else:
-                response = await self._llm.chat(
-                    messages=[{"role": "user", "content": prompt}],
-                    max_tokens=700,
-                    temperature=0.2,
-                )
+                response = await self._llm.chat(messages=[{"role": "user", "content": prompt}], max_tokens=700, temperature=0.2)
                 response_text = str(getattr(response, "content", response) or "")
-
-            json_match = re.search(r"\{.*\}", response_text, re.DOTALL)
-            if not json_match:
-                result.dimensions["ai_review"] = {"status": "parse_error", "raw": response_text[:300]}
-                log("warn", "AI 综合评审: 响应解析失败", "reviewer")
+            match = re.search(r"\{.*\}", response_text, re.DOTALL)
+            if not match:
+                result.dimensions["ai_review"] = {"status": "parse_error"}
                 return
-
-            ai_data = json.loads(json_match.group())
-            ai_score = int(ai_data.get("score", 80))
-            verdict = str(ai_data.get("verdict", "pass")).lower()
-            result.dimensions["ai_review"] = {
-                "status": "done",
-                "score": ai_score,
-                "verdict": verdict,
-                "strengths": ai_data.get("strengths", []),
-                "concerns": ai_data.get("concerns", []),
-                "suggestions": ai_data.get("suggestions", []),
-            }
-            result.score = int(result.score * 0.75 + ai_score * 0.25)
+            data = json.loads(match.group())
+            score = max(0, min(100, int(data.get("score", 80))))
+            verdict = str(data.get("verdict") or "pass").lower()
+            result.dimensions["ai_review"] = {"status": "done", **data, "score": score, "verdict": verdict}
+            result.score = int(result.score * 0.75 + score * 0.25)
             if verdict == "fail":
-                for concern in ai_data.get("concerns", [])[:5]:
-                    result.add_issue("warn", "ai-review/concern", "core", str(concern))
-            log("info", f"AI 综合评审: {ai_score}/100, {verdict}", "reviewer")
+                for concern in (data.get("concerns") or [])[:5]:
+                    result.add_issue("warn", "ai-review/concern", "code", str(concern))
+            log("info", f"AI 代码审查完成：{score}/100", "reviewer")
         except Exception as exc:
             result.dimensions["ai_review"] = {"status": "error", "reason": str(exc)}
-            log("warn", f"AI 综合评审异常: {exc}", "reviewer")
+            log("warn", f"AI 代码审查失败：{exc}", "reviewer")
 
-    def _generate_summary(self, result: ReviewResult):
-        errors = [i for i in result.issues if i["level"] == "error"]
-        warns = [i for i in result.issues if i["level"] == "warn"]
-        infos = [i for i in result.issues if i["level"] == "info"]
+    def _resolve_code_files(self, ws_path: Path, contracts: list[dict[str, Any]], changed_files: list[str]) -> list[Path]:
+        candidates: list[Path] = []
+        declared_code = any(str(item.get("kind") or "").lower() == "code" for item in contracts)
+        paths = [str(item.get("path") or "") for item in contracts if str(item.get("kind") or "").lower() == "code"]
+        paths.extend(changed_files)
+        for raw in paths:
+            path = Path(raw)
+            if not path.is_absolute():
+                path = ws_path / raw.replace("\\", "/").lstrip("/")
+            if path.is_file() and (path.suffix.lower() in CODE_EXTENSIONS or declared_code):
+                candidates.append(path)
+        if declared_code and not candidates:
+            candidates.extend(path for path in self._iter_workspace_files(ws_path) if path.suffix.lower() in CODE_EXTENSIONS)
+        return list(dict.fromkeys(candidates))
 
-        parts = [f"综合评分 {result.score}/100"]
-        if errors:
-            parts.append(f"{len(errors)} 个错误")
-        if warns:
-            parts.append(f"{len(warns)} 个警告")
-        if infos:
-            parts.append(f"{len(infos)} 个提示")
-        if not errors and not warns:
-            parts.append("未发现阻断问题")
-        result.summary = " | ".join(parts)
-
-    async def _write_review_file(self, ws_path: Path, task_id: str, task_title: str, result: ReviewResult):
-        autocode_dir = ws_path / ".autocode"
-        autocode_dir.mkdir(parents=True, exist_ok=True)
-
-        lines = [
-            "# 代码审查报告",
-            "",
-            f"**任务**: {task_title}",
-            f"**任务 ID**: {task_id}",
-            f"**综合评分**: {result.score}/100",
-            f"**审查结论**: {'通过' if result.passed else '未通过'}",
-            "",
-            "## 问题汇总",
-            "",
-        ]
-
-        grouped = {
-            "错误": [i for i in result.issues if i["level"] == "error"],
-            "警告": [i for i in result.issues if i["level"] == "warn"],
-            "提示": [i for i in result.issues if i["level"] == "info"],
-        }
-        for title, issues in grouped.items():
-            if not issues:
-                continue
-            lines.append(f"### {title}")
-            for issue in issues:
-                lines.append(f"- `{issue['file']}` [{issue['rule']}] {issue['message']}")
-            lines.append("")
-
-        if not result.issues:
-            lines.extend(["未发现问题。", ""])
-
-        ai = result.dimensions.get("ai_review", {})
-        if ai.get("status") == "done":
-            lines.extend([
-                "## AI 综合评审",
-                "",
-                f"**评分**: {ai.get('score')}/100",
-                f"**结论**: {ai.get('verdict')}",
-                "",
-            ])
-            if ai.get("strengths"):
-                lines.append("**优点**:")
-                lines.extend(f"- {item}" for item in ai["strengths"])
-                lines.append("")
-            if ai.get("suggestions"):
-                lines.append("**改进建议**:")
-                lines.extend(f"- {item}" for item in ai["suggestions"])
-                lines.append("")
-
-        artifacts = result.dimensions.get("artifacts", {})
-        static = result.dimensions.get("static_scan", {})
-        phase_artifacts = result.dimensions.get("phase_artifacts", {})
-        lines.extend([
-            "## 扫描统计",
-            "",
-            f"- 可审查文件: {artifacts.get('source_files', 0)}",
-            f"- 源码文件: {artifacts.get('code_files', 0)}",
-            f"- 静态扫描文件: {static.get('files_scanned', 0)}",
-            f"- 安全问题: {static.get('security_issues', 0)}",
-            f"- 性能问题: {static.get('performance_issues', 0)}",
-        ])
-        if phase_artifacts:
-            lines.append(f"- 本阶段变更文件: {phase_artifacts.get('changed_count', 0)}")
-
-        ci = result.dimensions.get("ci", {})
-        if ci:
-            lines.extend([
-                "",
-                "## CI / Validation",
-                "",
-                f"- Status: {ci.get('status')}",
-                f"- Command: `{ci.get('command') or '(none)'}`",
-                f"- Exit code: {ci.get('exit_code')}",
-                f"- Report: `.autocode/CI_REPORT.md`",
-            ])
-
-        (autocode_dir / "REVIEW.md").write_text("\n".join(lines), encoding="utf-8")
-
-    def _iter_review_files(self, ws_path: Path, extensions: set[str]) -> list[Path]:
+    def _iter_workspace_files(self, ws_path: Path) -> list[Path]:
         if not ws_path.exists():
             return []
-        files = []
-        for file in ws_path.rglob("*"):
-            if not file.is_file():
-                continue
-            try:
-                rel = file.relative_to(ws_path)
-            except ValueError:
-                continue
-            if any(part in SKIP_DIRS for part in rel.parts):
-                continue
-            if file.suffix.lower() in extensions:
-                files.append(file)
-        return sorted(files, key=lambda p: p.as_posix())
+        files: list[Path] = []
+        try:
+            for path in ws_path.rglob("*"):
+                if not path.is_file():
+                    continue
+                rel = path.relative_to(ws_path)
+                if any(part in SKIP_DIRS for part in rel.parts) or is_auxiliary_artifact(rel.as_posix()):
+                    continue
+                files.append(path)
+                if len(files) >= 2000:
+                    break
+        except OSError:
+            pass
+        return files
 
-    def _expects_code(self, project_type: str) -> bool:
-        return project_type not in {"markdown", "docs", "document", "research"}
+    def _matches_changed_evidence(self, raw_path: str, changed_files: list[str]) -> bool:
+        expected = raw_path.replace("\\", "/").lower().lstrip("/")
+        expected_name = expected.rsplit("/", 1)[-1]
+        return any(
+            item.replace("\\", "/").lower().lstrip("/") == expected
+            or item.replace("\\", "/").lower().rsplit("/", 1)[-1] == expected_name
+            for item in changed_files
+        )
+
+    def _meaningful_changed_files(self, changed_files: list[str]) -> list[str]:
+        return [
+            path for path in changed_files
+            if str(path).strip() and not is_auxiliary_artifact(str(path))
+        ]
+
+    def _looks_like_semantic_artifact_label(self, raw_path: str) -> bool:
+        normalized = str(raw_path or "").strip().replace("\\", "/").strip("/")
+        if not normalized or "/" in normalized:
+            return False
+        if Path(normalized).suffix:
+            return False
+        if normalized.lower() in EXTENSIONLESS_ARTIFACT_FILES:
+            return False
+        # Slug-like extensionless names may be real files. Natural language or
+        # CJK labels from plan subtasks are not usable cloud workspace paths.
+        return not bool(re.fullmatch(r"[A-Za-z0-9_.-]+", normalized))
+
+    def _relative_label(self, ws_path: Path, path: Path) -> str:
+        try:
+            return path.relative_to(ws_path).as_posix()
+        except ValueError:
+            return str(path)
+
+    def _generate_summary(self, result: ReviewResult) -> None:
+        errors = sum(1 for issue in result.issues if issue["level"] == "error")
+        warns = sum(1 for issue in result.issues if issue["level"] == "warn")
+        result.summary = f"综合评分 {result.score}/100 | {errors} 个错误 | {warns} 个警告"
+        if errors == 0:
+            result.summary += " | 未发现阻断问题"
+
+    async def _write_review_file(self, ws_path: Path, task_id: str, task_title: str, result: ReviewResult) -> None:
+        autocode_dir = ws_path / ".autocode"
+        autocode_dir.mkdir(parents=True, exist_ok=True)
+        lines = [
+            "# 产物审查报告", "", f"任务：{task_title}", f"任务 ID：{task_id}",
+            f"综合评分：{result.score}/100", f"审查结论：{'通过' if result.passed else '未通过'}", "", "## 问题", "",
+        ]
+        if result.issues:
+            lines.extend(f"- [{item['level']}] {item['file']} ({item['rule']}) {item['message']}" for item in result.issues)
+        else:
+            lines.append("未发现问题。")
+        lines.extend(["", "## 验证详情", "", json.dumps(result.dimensions, ensure_ascii=False, indent=2)])
+        (autocode_dir / "REVIEW.md").write_text("\n".join(lines), encoding="utf-8")
+
+    async def _run_command(self, command: list[str], ws_path: Path, result: ReviewResult, log: Callable, rule: str, fail_message: str) -> dict[str, Any]:
+        env = {**os.environ, "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"}
+        try:
+            proc = await asyncio.to_thread(
+                subprocess.run, command, cwd=str(ws_path), capture_output=True, text=True,
+                encoding="utf-8", errors="replace", timeout=120, env=env,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+            return {"status": "skip", "reason": str(exc)}
+        output = ((proc.stdout or "") + "\n" + (proc.stderr or "")).strip()
+        if proc.returncode != 0:
+            result.add_issue("warn", rule, ".", f"{fail_message}: {output[:500]}")
+            return {"status": "fail", "exit_code": proc.returncode, "output": output[:1200]}
+        return {"status": "pass", "exit_code": 0}

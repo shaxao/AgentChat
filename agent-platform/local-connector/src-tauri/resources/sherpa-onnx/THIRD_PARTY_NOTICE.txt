@@ -1,0 +1,16 @@
+sherpa-onnx bundled runtime
+
+Project: sherpa-onnx
+Repository: https://github.com/k2-fsa/sherpa-onnx
+Bundled release: v1.13.4
+Bundled Windows package:
+  sherpa-onnx-v1.13.4-win-x64-shared-MD-MinSizeRel-no-tts.tar.bz2
+License: Apache License 2.0
+
+Optional Chinese ASR model downloadable from the voice module:
+  sherpa-onnx-paraformer-zh-int8-2025-10-07.tar.bz2
+Model source release:
+  https://github.com/k2-fsa/sherpa-onnx/releases/tag/asr-models
+
+The sherpa-onnx runtime is included so AutoCode IDE can run local STT after the
+user installs a model from the voice module. Models are not bundled by default.

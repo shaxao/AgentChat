@@ -95,11 +95,18 @@ def is_ignored(rel: str, patterns: list[str]) -> bool:
 
 
 def safe_path(root: Path, raw_path: str, patterns: list[str], must_exist: bool = False) -> Path:
-    raw = (raw_path or "").replace("\\", "/").strip()
-    if raw.startswith("/workspace/"):
-        raw = raw[len("/workspace/"):]
-    raw = raw.lstrip("/")
-    target = (root / raw).resolve(strict=must_exist)
+    raw_original = (raw_path or "").strip()
+    raw_norm = raw_original.replace("\\", "/")
+    if raw_norm.startswith("/workspace/"):
+        raw = raw_norm[len("/workspace/"):].lstrip("/")
+        target = (root / raw).resolve(strict=must_exist)
+    else:
+        candidate = Path(raw_original)
+        if candidate.is_absolute():
+            target = candidate.resolve(strict=must_exist)
+        else:
+            raw = raw_norm.lstrip("/")
+            target = (root / raw).resolve(strict=must_exist)
     try:
         rel = target.relative_to(root)
     except ValueError as exc:
@@ -110,12 +117,12 @@ def safe_path(root: Path, raw_path: str, patterns: list[str], must_exist: bool =
     return target
 
 
-def atomic_write_text(path: Path, content: str) -> None:
+def atomic_write_text(path: Path, content: str, *, encoding: str = "utf-8") -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
     tmp_path = Path(tmp_name)
     try:
-        with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
+        with os.fdopen(fd, "w", encoding=encoding, newline="") as handle:
             handle.write(content)
             handle.flush()
             os.fsync(handle.fileno())
@@ -136,6 +143,36 @@ def read_file(root: Path, patterns: list[str], args: dict[str, Any]) -> dict[str
     return {"ok": True, "result": path.read_text(encoding="utf-8", errors="replace")[:max(1, limit)]}
 
 
+def read_lines(root: Path, patterns: list[str], args: dict[str, Any]) -> dict[str, Any]:
+    path = safe_path(root, str(args.get("path") or ""), patterns, must_exist=True)
+    if not path.is_file():
+        raise ValueError("target is not a file")
+    start = max(1, int(args.get("start") or 1))
+    end = max(start, int(args.get("end") or start))
+    max_lines = 240
+    if end - start + 1 > max_lines:
+        end = start + max_lines - 1
+    lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    total = len(lines)
+    selected = lines[start - 1:min(end, total)]
+    width = max(len(str(min(end, total))), len(str(start)), 3)
+    body = "\n".join(f"{idx:>{width}} | {line}" for idx, line in enumerate(selected, start=start))
+    if not body:
+        body = "(no lines in requested range)"
+    display_end = min(end, total) if total else 0
+    if start > total:
+        display_end = total
+    rel = path.relative_to(root).as_posix()
+    return {
+        "ok": True,
+        "result": f"[OK] {rel} lines {start}-{display_end} of {total}\n{body}",
+        "path": rel,
+        "start": start,
+        "end": display_end,
+        "total_lines": total,
+    }
+
+
 def write_file(root: Path, patterns: list[str], args: dict[str, Any]) -> dict[str, Any]:
     path = safe_path(root, str(args.get("path") or ""), patterns, must_exist=False)
     content = str(args.get("content") or "")
@@ -146,6 +183,50 @@ def write_file(root: Path, patterns: list[str], args: dict[str, Any]) -> dict[st
         "result": f"[OK] 文件已写入：{rel}",
         "path": rel,
         "content": path.read_text(encoding="utf-8", errors="replace"),
+    }
+
+
+def _normalize_text_encoding(value: str) -> str:
+    encoding = (value or "utf-8").strip().lower().replace("_", "-")
+    allowed = {"utf-8", "utf-8-sig"}
+    if encoding not in allowed:
+        raise ValueError("local text file tools only support utf-8 or utf-8-sig")
+    return encoding
+
+
+def local_write_text_file(root: Path, patterns: list[str], args: dict[str, Any]) -> dict[str, Any]:
+    path = safe_path(root, str(args.get("path") or ""), patterns, must_exist=False)
+    content = str(args.get("content") or "")
+    encoding = _normalize_text_encoding(str(args.get("encoding") or "utf-8"))
+    atomic_write_text(path, content, encoding=encoding)
+    data = path.read_text(encoding=encoding, errors="replace")
+    rel = path.relative_to(root).as_posix()
+    return {
+        "ok": True,
+        "result": f"[OK] text file written: {rel}",
+        "path": rel,
+        "absolute_path": str(path),
+        "content": data,
+        "encoding": encoding,
+        "size": path.stat().st_size,
+    }
+
+
+def local_read_text_file(root: Path, patterns: list[str], args: dict[str, Any]) -> dict[str, Any]:
+    path = safe_path(root, str(args.get("path") or ""), patterns, must_exist=True)
+    if not path.is_file():
+        raise ValueError("target is not a file")
+    encoding = _normalize_text_encoding(str(args.get("encoding") or "utf-8"))
+    content = path.read_text(encoding=encoding, errors="replace")
+    rel = path.relative_to(root).as_posix()
+    return {
+        "ok": True,
+        "result": content,
+        "path": rel,
+        "absolute_path": str(path),
+        "content": content,
+        "encoding": encoding,
+        "size": path.stat().st_size,
     }
 
 
@@ -166,6 +247,139 @@ def apply_patch_tool(root: Path, patterns: list[str], args: dict[str, Any]) -> d
         "path": rel,
         "content": path.read_text(encoding="utf-8", errors="replace"),
     }
+
+
+_CODE_EDITOR_UNDO: dict[str, list[str | None]] = {}
+_CODE_EDITOR_UNDO_LIMIT = 20
+_CODE_EDITOR_DIFF_LIMIT = 4000
+
+
+def _code_editor_push_undo(key: str, old_text: str | None) -> None:
+    stack = _CODE_EDITOR_UNDO.setdefault(key, [])
+    stack.append(old_text)
+    if len(stack) > _CODE_EDITOR_UNDO_LIMIT:
+        del stack[0]
+
+
+def _unified_diff_text(old: str, new: str, rel_path: str) -> str:
+    import difflib
+
+    diff_lines = list(difflib.unified_diff(
+        old.splitlines(), new.splitlines(),
+        fromfile=f"a/{rel_path}", tofile=f"b/{rel_path}", lineterm="", n=3,
+    ))
+    if not diff_lines:
+        return "(无内容差异)"
+    out = "\n".join(diff_lines)
+    if len(out) > _CODE_EDITOR_DIFF_LIMIT:
+        out = out[:_CODE_EDITOR_DIFF_LIMIT] + "\n... (diff 已截断)"
+    return out
+
+
+def code_editor(root: Path, patterns: list[str], args: dict[str, Any]) -> dict[str, Any]:
+    command = str(args.get("command") or "").strip()
+    raw_path = str(args.get("path") or "")
+    undo_key = f"{root}::{raw_path.strip().lstrip('/')}"
+
+    if command == "view":
+        path = safe_path(root, raw_path, patterns, must_exist=True)
+        if not path.is_file():
+            raise ValueError("目标不是文件")
+        all_lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        start, end = 1, len(all_lines)
+        view_range = args.get("view_range")
+        if isinstance(view_range, (list, tuple)) and len(view_range) == 2:
+            start = max(1, int(view_range[0]))
+            end = min(len(all_lines), int(view_range[1]))
+        numbered = "\n".join(f"{i:>6}\t{all_lines[i - 1]}" for i in range(start, end + 1))
+        rel = path.relative_to(root).as_posix()
+        return {"ok": True, "result": f"[OK] {rel} 第 {start}-{end} 行（共 {len(all_lines)} 行）:\n{numbered}", "path": rel}
+
+    if command == "create":
+        path = safe_path(root, raw_path, patterns, must_exist=False)
+        if path.exists() and path.is_dir():
+            raise ValueError("不能覆盖目录")
+        old_text = path.read_text(encoding="utf-8", errors="replace") if path.is_file() else None
+        new_text = str(args.get("file_text") or "")
+        atomic_write_text(path, new_text)
+        _code_editor_push_undo(undo_key, old_text)
+        rel = path.relative_to(root).as_posix()
+        diff = _unified_diff_text(old_text or "", new_text, rel)
+        return {"ok": True, "result": f"[OK] 文件已写入：{rel}\n{diff}", "path": rel, "diff": diff, "content": new_text}
+
+    if command == "str_replace":
+        path = safe_path(root, raw_path, patterns, must_exist=True)
+        if not path.is_file():
+            raise ValueError("目标不是文件")
+        # newline="" 关闭通用换行翻译，保留文件真实的 \r\n，供下方检测换行风格与撤销还原。
+        with open(path, "r", encoding="utf-8", errors="replace", newline="") as _fh:
+            original = _fh.read()
+        old_str = str(args.get("old_str") or "")
+        new_str = str(args.get("new_str") or "")
+        if not old_str:
+            raise ValueError("str_replace 需要 old_str 参数")
+        # 换行符容错：文件可能是 CRLF，而 old_str 经传输被规范化为 LF（反之亦然）。
+        # 统一到 LF 空间做匹配与替换，写回时保留文件原本的换行风格。
+        uses_crlf = "\r\n" in original
+        work = original.replace("\r\n", "\n")
+        old_norm = old_str.replace("\r\n", "\n")
+        new_norm = new_str.replace("\r\n", "\n")
+        occurrences = work.count(old_norm)
+        if occurrences == 0:
+            raise ValueError(f"old_str 未在文件中找到匹配。文件前 500 字符:\n{original[:500]}")
+        if occurrences > 1:
+            raise ValueError(f"old_str 匹配到 {occurrences} 处，必须唯一匹配，请扩大上下文范围")
+        replaced = work.replace(old_norm, new_norm, 1)
+        updated = replaced.replace("\n", "\r\n") if uses_crlf else replaced
+        atomic_write_text(path, updated)
+        _code_editor_push_undo(undo_key, original)
+        rel = path.relative_to(root).as_posix()
+        diff = _unified_diff_text(original, updated, rel)
+        return {"ok": True, "result": f"[OK] 已替换：{rel}\n{diff}", "path": rel, "diff": diff, "content": updated}
+
+    if command == "insert":
+        path = safe_path(root, raw_path, patterns, must_exist=True)
+        if not path.is_file():
+            raise ValueError("目标不是文件")
+        # newline="" 关闭通用换行翻译，保留文件真实的 \r\n。
+        with open(path, "r", encoding="utf-8", errors="replace", newline="") as _fh:
+            original = _fh.read()
+        new_str = str(args.get("new_str") or "")
+        if not new_str:
+            raise ValueError("insert 需要 new_str 参数")
+        insert_line = int(args.get("insert_line", -1))
+        # 保留文件原本的换行风格：CRLF 文件插入后仍写回 CRLF。
+        newline = "\r\n" if "\r\n" in original else "\n"
+        work = original.replace("\r\n", "\n")
+        new_norm = new_str.replace("\r\n", "\n").replace("\r", "\n")
+        lines = work.split("\n")
+        trailing_newline = work.endswith("\n")
+        if trailing_newline:
+            lines.pop()
+        if insert_line < 0 or insert_line > len(lines):
+            raise ValueError(f"insert_line 超出范围（0-{len(lines)}，0 表示插入到文件开头）")
+        lines.insert(insert_line, new_norm)
+        updated = newline.join(lines) + (newline if trailing_newline else "")
+        atomic_write_text(path, updated)
+        _code_editor_push_undo(undo_key, original)
+        rel = path.relative_to(root).as_posix()
+        diff = _unified_diff_text(original, updated, rel)
+        return {"ok": True, "result": f"[OK] 已在第 {insert_line} 行后插入：{rel}\n{diff}", "path": rel, "diff": diff, "content": updated}
+
+    if command == "undo_edit":
+        stack = _CODE_EDITOR_UNDO.get(undo_key)
+        if not stack:
+            raise ValueError(f"没有可撤销的编辑: {raw_path}")
+        previous = stack.pop()
+        path = safe_path(root, raw_path, patterns, must_exist=False)
+        rel = path.relative_to(root).as_posix()
+        if previous is None:
+            path.unlink(missing_ok=True)
+            return {"ok": True, "result": f"[OK] 已撤销创建，文件已删除：{rel}", "path": rel, "deleted": True}
+        atomic_write_text(path, previous)
+        return {"ok": True, "result": f"[OK] 已恢复上次编辑前的内容：{rel}", "path": rel, "content": previous}
+
+    raise ValueError(f"未知 code_editor 命令: {command}")
 
 
 def glob_tool(root: Path, patterns: list[str], args: dict[str, Any]) -> dict[str, Any]:
@@ -326,8 +540,12 @@ def git_diff(root: Path, patterns: list[str], args: dict[str, Any]) -> dict[str,
 
 TOOLS = {
     "read_file": read_file,
+    "read_lines": read_lines,
     "write_file": write_file,
+    "local_write_text_file": local_write_text_file,
+    "local_read_text_file": local_read_text_file,
     "apply_patch": apply_patch_tool,
+    "code_editor": code_editor,
     "glob": glob_tool,
     "search_code": search_code,
     "snapshot_files": snapshot_files,

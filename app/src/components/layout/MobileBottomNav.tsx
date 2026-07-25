@@ -3,9 +3,11 @@ import { cn } from '@/lib/utils'
 import type { MainView } from '@/components/layout/IconNavBar'
 import {
   MessageSquare, BookOpen, Code2, Wallet, GitBranch, LayoutGrid, Workflow, Layers,
-  MoreHorizontal, Settings, Shield, X, Bell, Activity
+  MoreHorizontal, Settings, Shield, X, Bell, Activity, Download
 } from 'lucide-react'
 import NotificationBell from './NotificationBell'
+
+const AUTOCODE_IDE_DOWNLOAD_URL = 'https://muhuo.site/autocode-api/api/local-runner/connector/windows/latest'
 
 interface MobileBottomNavProps {
   activeView: MainView
@@ -127,6 +129,14 @@ export default function MobileBottomNav({ activeView, onChange, onOpenSettings, 
               <NotificationBell onOpen={() => setMoreOpen(false)} />
               <span className="text-xs font-medium">通知</span>
             </div>
+            <a
+              href={AUTOCODE_IDE_DOWNLOAD_URL}
+              onClick={() => setMoreOpen(false)}
+              className="flex flex-col items-center gap-2 p-3 rounded-xl hover:bg-muted text-muted-foreground hover:text-foreground transition-colors"
+            >
+              <Download className="w-6 h-6" />
+              <span className="text-xs font-medium">下载 IDE</span>
+            </a>
             {isAdmin && (
               <button
                 onClick={() => {

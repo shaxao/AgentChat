@@ -1,4 +1,4 @@
-﻿/**
+/**
  *
  * 自动识别 VITE_DEMO_MODE。
  *
@@ -309,6 +309,114 @@ export const chatApi = {
 }
 
 // ==================== 管理 API ====================
+export interface ModelPriceLibraryItem {
+  provider: string
+  modelId: string
+  name: string
+  aliases?: string[]
+  contextLength?: number
+  capabilities?: string[]
+  currency: 'USD' | 'CNY' | string
+  inputPricePer1M: number
+  cachedInputPricePer1M?: number
+  outputPricePer1M: number
+  sourceUrl?: string
+  sourceAccessedAt?: string
+  notes?: string
+}
+
+export interface ModelPriceLibrarySource {
+  provider: string
+  sourceUrl?: string
+  sourceAccessedAt?: string
+  notes?: string
+  reserved?: boolean
+}
+
+export interface ModelPriceLibraryResponse {
+  schemaVersion: string
+  updatedAt: string
+  defaultExchangeRate: number
+  defaultMultiplier: number
+  providers: string[]
+  sources: ModelPriceLibrarySource[]
+  items: ModelPriceLibraryItem[]
+}
+
+export interface ModelPriceTarget {
+  modelId: string
+  name?: string
+  provider?: string
+}
+
+export interface ModelPricePreviewRequest {
+  models?: ModelPriceTarget[]
+  exchangeRate?: number
+  multiplier?: number
+  overwrite?: boolean
+  createMissing?: boolean
+}
+
+export interface ModelPriceApplyRequest extends ModelPricePreviewRequest {
+  selectedModelIds?: string[]
+}
+
+export interface ModelPricePreviewItem {
+  targetModelId: string
+  targetProvider?: string
+  targetName?: string
+  existing: boolean
+  matched: boolean
+  action: 'create' | 'update' | 'skip' | 'unmatched' | string
+  reason?: string
+  libraryModelId?: string
+  libraryName?: string
+  provider?: string
+  currency?: string
+  contextLength?: number
+  capabilities?: string[]
+  aliases?: string[]
+  currentInputPrice?: number
+  currentCachedInputPrice?: number
+  currentOutputPrice?: number
+  officialInputPrice?: number
+  officialCachedInputPrice?: number
+  officialOutputPrice?: number
+  importedInputPrice?: number
+  importedCachedInputPrice?: number
+  importedOutputPrice?: number
+  inputDelta?: number
+  cachedInputDelta?: number
+  outputDelta?: number
+  cachePriceDefaulted?: boolean
+  sourceUrl?: string
+  sourceAccessedAt?: string
+  notes?: string
+}
+
+export interface ModelPricePreviewResponse {
+  updatedAt: string
+  exchangeRate: number
+  multiplier: number
+  overwrite: boolean
+  createMissing: boolean
+  total: number
+  matched: number
+  actionable: number
+  unmatched: number
+  items: ModelPricePreviewItem[]
+}
+
+export interface ModelPriceApplyResponse {
+  created: number
+  updated: number
+  skipped: number
+  unmatched: number
+  models: unknown[]
+  items: ModelPricePreviewItem[]
+  summary?: Record<string, number>
+}
+
 export const adminApi = {
   getStats: () => request<Record<string, number>>('GET', '/admin/stats'),
   listUsers: (params: { page?: number; size?: number; keyword?: string; role?: string; status?: string }) => {
@@ -332,6 +440,12 @@ export const adminApi = {
     request<unknown>('PUT', `/admin/models?modelId=${encodeURIComponent(modelId)}`, data),
   deleteModel: (modelId: string) =>
     request<string>('DELETE', `/admin/models?modelId=${encodeURIComponent(modelId)}`),
+  getModelPriceLibrary: () =>
+    request<ModelPriceLibraryResponse>('GET', '/admin/model-price-library'),
+  previewModelPriceLibrary: (data: ModelPricePreviewRequest) =>
+    request<ModelPricePreviewResponse>('POST', '/admin/model-price-library/preview', data),
+  applyModelPriceLibrary: (data: ModelPriceApplyRequest) =>
+    request<ModelPriceApplyResponse>('POST', '/admin/model-price-library/apply', data),
   listSubscriptions: (page = 1, size = 20) =>
     request<{ list: unknown[]; total: number }>('GET', `/admin/subscriptions?page=${page}&size=${size}`),
   createSubscription: (data: { userId: number; plan: string; planName?: string; price?: number; costLimit?: number; tokensLimit?: number; modelLimit?: string; startDate?: string; endDate?: string }) =>
@@ -415,6 +529,51 @@ export interface HarnessVersionVO {
   description?: string
   createdAt?: string
   updatedAt?: string
+}
+
+export interface HarnessVersionMetricVO {
+  version: string
+  status: string
+  percentage?: number
+  total: number
+  successRate?: number
+  failureRate?: number
+  toolSuccessRate?: number
+  emptyResponseRate?: number
+  avgLatencyMs?: number
+  inputTokens?: number
+  outputTokens?: number
+}
+
+export interface HarnessVersionMetricsVO {
+  surface: string
+  windowDays: number
+  active?: HarnessVersionMetricVO | null
+  canaries: HarnessVersionMetricVO[]
+  others: HarnessVersionMetricVO[]
+  comparison?: {
+    activeVersion?: string
+    canaryVersion?: string
+    successRateDelta?: number
+    failureRateDelta?: number
+    toolSuccessRateDelta?: number
+    emptyResponseRateDelta?: number
+    avgLatencyDelta?: number
+  }
+}
+
+export interface HarnessTraceEventVO {
+  id: number
+  traceId?: number
+  seq?: number
+  eventType?: string
+  eventName?: string
+  status?: string
+  toolName?: string
+  model?: string
+  durationMs?: number
+  payloadJson?: string
+  createdAt?: string
 }
 
 export interface HarnessRegressionRunVO {
@@ -527,6 +686,8 @@ export const harnessApi = {
     return request<PageResult<HarnessTraceVO>>('GET', `/harness/traces/page?${q}`)
   },
   trace: (id: number) => request<HarnessTraceVO>('GET', `/harness/traces/${id}`),
+  traceEvents: (id: number) =>
+    request<HarnessTraceEventVO[]>('GET', `/harness/traces/${id}/events`),
   failures: (surface?: string, limit = 100) => {
     const q = new URLSearchParams({ limit: String(limit) })
     if (surface && surface !== 'all') q.set('surface', surface)
@@ -575,6 +736,8 @@ export const harnessApi = {
     request<HarnessRegressionRunVO>('PUT', `/harness/regression-runs/${id}/start`),
   runRegressionPreflight: (id: number) =>
     request<HarnessRegressionRunVO>('POST', `/harness/regression-runs/${id}/preflight`),
+  executeRegressionRun: (id: number) =>
+    request<HarnessRegressionRunVO>('POST', `/harness/regression-runs/${id}/execute`),
   completeRegressionRun: (id: number, data: {
     status: 'passed' | 'failed' | 'blocked' | 'cancelled'
     totalCases?: number
@@ -608,10 +771,19 @@ export const harnessApi = {
     if (surface && surface !== 'all') q.set('surface', surface)
     return request<HarnessVersionVO[]>('GET', `/harness/versions?${q}`)
   },
+  versionMetrics: (surface?: string, windowDays = 7) => {
+    const q = new URLSearchParams({ windowDays: String(windowDays) })
+    if (surface && surface !== 'all') q.set('surface', surface)
+    return request<HarnessVersionMetricsVO>('GET', `/harness/versions/metrics?${q}`)
+  },
   createVersionFromPatch: (patchId: number) =>
     request<HarnessVersionVO>('POST', `/harness/versions/from-patch/${patchId}`),
+  canaryVersion: (id: number, data: { percentage?: number }) =>
+    request<HarnessVersionVO>('PUT', `/harness/versions/${id}/canary`, data),
   activateVersion: (id: number) =>
     request<HarnessVersionVO>('PUT', `/harness/versions/${id}/activate`),
+  rollbackVersion: (id: number) =>
+    request<HarnessVersionVO>('PUT', `/harness/versions/${id}/rollback`),
 }
 
 export interface SubscriptionPlanVO {
@@ -1410,6 +1582,37 @@ export async function loadConversations() {
   }
 }
 
+export async function* resumeMessage(
+  uuid: string,
+  assistantMessageId: string,
+  _startingContent = '',
+  onUpdate?: (msgId: string, updates: Record<string, unknown>) => void,
+  abortSignal?: AbortSignal,
+) {
+  const chatStore = useChatStore.getState()
+  const conversation = chatStore.conversations.find(c => c.id === uuid)
+  const model = conversation?.model || chatStore.selectedModel || 'auto'
+  for await (const event of sendMessage(
+    uuid,
+    '继续',
+    model,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    abortSignal,
+    undefined,
+    onUpdate,
+    undefined,
+    undefined,
+    assistantMessageId,
+    true,
+  )) {
+    yield event
+  }
+}
+
 export async function loadConversationMessages(uuid: string, limit = 50, signal?: AbortSignal) {
   if (DEMO_MODE) return
   if (!uuid) return
@@ -1665,10 +1868,11 @@ async function acRequest<T>(
 /** Register an imported project as a persistent AutoCode task. */
 export async function registerImportedProjectTask(
   projectId: string,
-  options?: { enable_smart_planning?: boolean },
+  options?: { enable_smart_planning?: boolean; model?: string },
 ): Promise<AutoCodeTaskResponse> {
   return acRequest<AutoCodeTaskResponse>('POST', `/api/projects/${projectId}/register-task`, {
     enable_smart_planning: Boolean(options?.enable_smart_planning),
+    model: options?.model,
   })
 }
 
@@ -1773,12 +1977,16 @@ interface AutoCodeTaskResponse {
   description?: string
   project_type: string
   workspace_id: string
+  execution_target?: 'cloud_workspace' | 'local_ide' | string
   status: string
   agents: string[]
   preview_url?: string
   model?: string
   tool_policy?: AutoCodeToolPolicy
+  autonomy_mode?: 'strong' | 'balanced' | 'conservative' | string
   pending_confirmation?: Record<string, unknown> | null
+  pending_user_input?: Record<string, unknown> | null
+  completion_report?: Record<string, unknown> | null
   local_execution_enabled?: boolean
   local_runner_session_id?: string
   local_import_mode?: boolean
@@ -1826,6 +2034,8 @@ interface AutoCodeTaskResponse {
   recommended_flow?: string
   prototype_required?: boolean
   events?: AutoCodeRuntimeEvent[]
+  active_execution_plan?: Record<string, unknown>
+  task_capability_profile?: Record<string, unknown>
 }
 
 export interface AutoCodeRuntimeEvent {
@@ -1875,8 +2085,8 @@ export async function createAutoCodeTask(params: {
   return acRequest<AutoCodeTaskResponse>('POST', '/api/tasks', {
     title: params.title,
     description: params.description,
-    project_type: params.project_type || 'nextjs',
-    agent_types: params.agent_types || ['frontend'],
+    project_type: params.project_type || 'unknown',
+    agent_types: params.agent_types || ['general'],
     ...(params.model ? { model: params.model } : {}),
     ...(params.spec ? { spec: params.spec } : {}),
     ...(params.tool_policy ? { tool_policy: params.tool_policy } : {}),
@@ -1891,9 +2101,13 @@ export async function getAutoCodeTaskStatus(taskId: string): Promise<{
   current_step: string
   preview_url?: string
   workspace_id?: string
+  execution_target?: 'cloud_workspace' | 'local_ide' | string
   model?: string
   tool_policy?: AutoCodeToolPolicy
+  autonomy_mode?: 'strong' | 'balanced' | 'conservative' | string
   pending_confirmation?: Record<string, unknown> | null
+  pending_user_input?: Record<string, unknown> | null
+  completion_report?: Record<string, unknown> | null
   local_execution_enabled?: boolean
   local_runner?: AutoCodeLocalRunnerStatus
   plan?: AutoCodeTaskResponse['plan']
@@ -1916,13 +2130,19 @@ export async function getAutoCodeTaskStatus(taskId: string): Promise<{
   complexity?: string
   recommended_flow?: string
   prototype_required?: boolean
+  active_execution_plan?: Record<string, unknown>
+  task_capability_profile?: Record<string, unknown>
 }> {
   return acRequest<{
     status: string; progress: number; current_step: string
     preview_url?: string; workspace_id?: string
+    execution_target?: 'cloud_workspace' | 'local_ide' | string
     model?: string
     tool_policy?: AutoCodeToolPolicy
+    autonomy_mode?: 'strong' | 'balanced' | 'conservative' | string
     pending_confirmation?: Record<string, unknown> | null
+    pending_user_input?: Record<string, unknown> | null
+    completion_report?: Record<string, unknown> | null
     local_execution_enabled?: boolean
     local_runner?: AutoCodeLocalRunnerStatus
     plan?: AutoCodeTaskResponse['plan']
@@ -1941,6 +2161,12 @@ export async function getAutoCodeTaskStatus(taskId: string): Promise<{
     pipeline_status?: string
     preview_status?: string
     preview_error?: string
+    project_recon?: Record<string, unknown>
+    complexity?: string
+    recommended_flow?: string
+    prototype_required?: boolean
+    active_execution_plan?: Record<string, unknown>
+    task_capability_profile?: Record<string, unknown>
   }>('GET', `/api/tasks/${taskId}/status`)
 }
 
@@ -2002,13 +2228,40 @@ export async function getAutoCodeLocalRunnerSessionStatus(sessionId: string): Pr
 
 export async function registerLocalRunnerTask(
   sessionId: string,
-  params: { title?: string; project_path?: string; enable_smart_planning?: boolean; sync_to_cloud?: boolean },
+  params: { title?: string; project_path?: string; enable_smart_planning?: boolean; sync_to_cloud?: boolean; model?: string },
 ): Promise<AutoCodeTaskResponse> {
   return acRequest<AutoCodeTaskResponse>('POST', `/api/local-runner/session/${sessionId}/register-task`, {
     title: params.title,
     project_path: params.project_path,
     enable_smart_planning: Boolean(params.enable_smart_planning),
     sync_to_cloud: Boolean(params.sync_to_cloud),
+    model: params.model,
+  })
+}
+
+export async function autoImportLocalConnectorProject(params: {
+  grant_id?: string
+  project_path: string
+  project_name?: string
+  device_id?: string
+  device_name?: string
+  device_os?: string
+  public_api_base?: string
+  enable_smart_planning?: boolean
+  sync_to_cloud?: boolean
+  model?: string
+}): Promise<AutoCodeTaskResponse> {
+  return acRequest<AutoCodeTaskResponse>('POST', '/api/local-runner/connector/auto-import', {
+    grant_id: params.grant_id || '',
+    project_path: params.project_path,
+    project_name: params.project_name || '',
+    device_id: params.device_id || '',
+    device_name: params.device_name || '',
+    device_os: params.device_os || '',
+    public_api_base: params.public_api_base || '',
+    enable_smart_planning: Boolean(params.enable_smart_planning),
+    sync_to_cloud: Boolean(params.sync_to_cloud),
+    model: params.model,
   })
 }
 
@@ -2039,6 +2292,18 @@ export async function resolveAutoCodeApproval(
 
 export async function listAutoCodeTasks(): Promise<AutoCodeTaskResponse[]> {
   return acRequest<AutoCodeTaskResponse[]>('GET', '/api/tasks')
+}
+
+/** 撤销 code_editor 对指定文件的最后一次编辑（FileEditCard 撤销按钮调用） */
+export async function undoAutoCodeCodeEditor(
+  taskId: string,
+  path: string,
+): Promise<{ ok: boolean; result: string; deleted?: boolean }> {
+  return acRequest<{ ok: boolean; result: string; deleted?: boolean }>(
+    'POST',
+    `/api/tasks/${taskId}/code-editor-undo`,
+    { path },
+  )
 }
 
 export interface AutoCodeQueueStatus {
@@ -2123,6 +2388,15 @@ export async function confirmPrototype(
   return acRequest<{ success: boolean }>('POST', `/api/tasks/${taskId}/confirm-prototype`, {
     confirmed,
     ...(modifiedPrototype ? { modified_prototype: modifiedPrototype } : {}),
+  })
+}
+
+export async function confirmReview(
+  taskId: string,
+  confirmed: boolean,
+): Promise<{ ok: boolean; message?: string }> {
+  return acRequest<{ ok: boolean; message?: string }>('POST', `/api/tasks/${taskId}/confirm-review`, {
+    confirmed,
   })
 }
 
@@ -3644,6 +3918,89 @@ export const userPreferenceApi = {
 
 
 /** 角色 VO */
+
+export interface UserUsageSummary {
+  days: number
+  requestCount: number
+  successCount: number
+  errorCount: number
+  inputTokens: number
+  cachedInputTokens: number
+  billableInputTokens: number
+  outputTokens: number
+  totalTokens: number
+  cacheHitRate: number
+  totalCost: number
+  avgCost: number
+}
+
+export interface UserUsageLogItem {
+  id: number
+  model: string
+  sceneType: string
+  status: string
+  errorMsg?: string | null
+  requestIp?: string | null
+  provider?: string | null
+  channelId?: string | null
+  channelName?: string | null
+  inputTokens: number
+  cachedInputTokens: number
+  billableInputTokens: number
+  outputTokens: number
+  totalTokens: number
+  cacheHitRate: number
+  inputPrice: number
+  cachedInputPrice: number
+  outputPrice: number
+  inputCost: number
+  cachedInputCost: number
+  outputCost: number
+  totalCost: number
+  costEstimated: boolean
+  latencyMs?: number | null
+  createdAt: string
+}
+
+export interface ModelPriceItem {
+  id: string
+  name: string
+  provider: string
+  description?: string
+  contextLength: number
+  inputPrice: number
+  cachedInputPrice: number
+  outputPrice: number
+  capabilities: string[]
+}
+
+export interface UserUsageLogsParams {
+  page?: number
+  size?: number
+  model?: string
+  sceneType?: string
+  status?: string
+  from?: string
+  to?: string
+}
+
+export const usageApi = {
+  summary: (days: number = 30) =>
+    request<UserUsageSummary>('GET', `/user/usage-summary?days=${Math.min(Math.max(days, 1), 90)}`),
+  logs: (params: UserUsageLogsParams = {}) => {
+    const qs = new URLSearchParams()
+    qs.set('page', String(params.page ?? 1))
+    qs.set('size', String(params.size ?? 20))
+    if (params.model && params.model !== 'all') qs.set('model', params.model)
+    if (params.sceneType && params.sceneType !== 'all') qs.set('sceneType', params.sceneType)
+    if (params.status && params.status !== 'all') qs.set('status', params.status)
+    if (params.from) qs.set('from', params.from)
+    if (params.to) qs.set('to', params.to)
+    return request<{ list: UserUsageLogItem[]; total: number; page: number; size: number }>('GET', `/user/usage-logs?${qs}`)
+  },
+  modelPrices: () => request<ModelPriceItem[]>('GET', '/user/model-prices'),
+}
+
 export interface SysRoleVO {
   id: number
   uuid: string

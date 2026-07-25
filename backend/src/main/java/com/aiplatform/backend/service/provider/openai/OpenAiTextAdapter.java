@@ -127,11 +127,17 @@ public class OpenAiTextAdapter implements ProviderAdapter {
                         stc.index = idx;
                         ctx.toolCallsBuilder.add(stc);
                     }
-                    // 累积字段（首个 chunk 包含 id/type/name，后续 chunks 只有 arguments 增量）
-                    if (tcDelta.has("id")) stc.id = tcDelta.path("id").asText();
-                    if (tcDelta.has("type")) stc.type = tcDelta.path("type").asText();
+                    // 累积字段（首个 chunk 包含 id/type/name，后续 chunks 通常只有 arguments 增量）。
+                    // 兼容 new-api / 部分 OpenAI-compatible 代理：后续 chunk 可能继续带 id/name 字段但值为空。
+                    // 不能让空字符串覆盖首包里的有效 tool_call_id / function.name，否则下游 IDE 会认为
+                    // “没有有效 tool call”，触发 agent stream completed without text or tool call。
+                    String id = tcDelta.path("id").asText(null);
+                    if (id != null && !id.isBlank()) stc.id = id;
+                    String type = tcDelta.path("type").asText(null);
+                    if (type != null && !type.isBlank()) stc.type = type;
                     JsonNode func = tcDelta.path("function");
-                    if (func.has("name")) stc.functionName = func.path("name").asText();
+                    String name = func.path("name").asText(null);
+                    if (name != null && !name.isBlank()) stc.functionName = name;
                     String argsDelta = func.path("arguments").asText(null);
                     if (argsDelta != null) stc.arguments.append(argsDelta);
                 }

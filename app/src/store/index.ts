@@ -61,6 +61,23 @@ export interface MessageSearchInfo {
   errorMessage?: string
 }
 
+export interface MessageAgentStatus {
+  runId?: string
+  status: string
+  turnIndex?: number
+  message?: string
+  model?: string
+  agentId?: string
+  harnessVersion?: string
+}
+
+export interface MessageAgentWarning {
+  runId?: string
+  code: string
+  message: string
+  detail?: unknown
+}
+
 export interface Message {
   id: string
   role: 'user' | 'assistant' | 'system'
@@ -85,6 +102,8 @@ export interface Message {
   audioUrl?: string
   /** Agent 工具调用记录 */
   toolCalls?: ToolCallInfo[]
+  agentStatus?: MessageAgentStatus
+  agentWarnings?: MessageAgentWarning[]
   search?: MessageSearchInfo
   /** 嵌入式 AutoCode Agent 卡片 */
   autocode?: {
@@ -160,6 +179,7 @@ export interface Model {
   cachedInputPrice?: number
   outputPrice: number
   capabilities: ('text' | 'vision' | 'audio' | 'code' | 'reasoning' | 'tool' | 'think')[]
+  aliases?: string  // 模型别名，逗号分隔（供外部 API 模型名映射）
   enabled: boolean
 }
 
@@ -174,7 +194,9 @@ export interface ModelChannel {
   tags?: string[]   // 渠道能力标签，如 ["tool","vision"]
   ttsVoices?: string  // TTS 音色配置 JSON 字符串
   translateLangs?: string  // 翻译语言配置 JSON 字符串
+  apiFormat?: 'chat_completions' | 'responses' | 'messages'  // 出站接口格式，默认 chat_completions
   status: 'active' | 'error' | 'disabled'
+  statusMessage?: string
   priority: number
   rateLimit: number
   createdAt: string

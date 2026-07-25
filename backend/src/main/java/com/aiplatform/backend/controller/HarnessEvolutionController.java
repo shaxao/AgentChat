@@ -5,6 +5,7 @@ import com.aiplatform.backend.entity.HarnessFailureCase;
 import com.aiplatform.backend.entity.HarnessPatch;
 import com.aiplatform.backend.entity.HarnessRegressionRun;
 import com.aiplatform.backend.entity.HarnessTrace;
+import com.aiplatform.backend.entity.HarnessTraceEvent;
 import com.aiplatform.backend.entity.HarnessVersion;
 import com.aiplatform.backend.service.HarnessEvolutionService;
 import lombok.RequiredArgsConstructor;
@@ -37,6 +38,14 @@ public class HarnessEvolutionController {
         return Result.ok(harnessEvolutionService.overview(surface, limit));
     }
 
+    @GetMapping("/version-metrics")
+    @PreAuthorize("hasAuthority('PERM_harness:view')")
+    public Result<Map<String, Object>> versionMetrics(
+            @RequestParam(required = false) String surface,
+            @RequestParam(defaultValue = "7") int days) {
+        return Result.ok(harnessEvolutionService.versionMetrics(surface, days));
+    }
+
     @GetMapping("/traces")
     @PreAuthorize("hasAuthority('PERM_harness:view')")
     public Result<List<HarnessTrace>> traces(
@@ -58,6 +67,12 @@ public class HarnessEvolutionController {
     @PreAuthorize("hasAuthority('PERM_harness:view')")
     public Result<HarnessTrace> trace(@PathVariable Long id) {
         return Result.ok(harnessEvolutionService.getTrace(id));
+    }
+
+    @GetMapping("/traces/{id}/events")
+    @PreAuthorize("hasAuthority('PERM_harness:view')")
+    public Result<List<HarnessTraceEvent>> traceEvents(@PathVariable Long id) {
+        return Result.ok(harnessEvolutionService.traceEvents(id));
     }
 
     @GetMapping("/failures")
@@ -174,6 +189,12 @@ public class HarnessEvolutionController {
         return Result.ok(harnessEvolutionService.runRegressionPreflight(id));
     }
 
+    @PostMapping("/regression-runs/{id}/execute")
+    @PreAuthorize("hasAuthority('PERM_harness:regression')")
+    public Result<HarnessRegressionRun> executeRegressionRun(@PathVariable Long id) {
+        return Result.ok(harnessEvolutionService.executeRegressionRun(id));
+    }
+
     @PutMapping("/regression-runs/{id}/complete")
     @PreAuthorize("hasAuthority('PERM_harness:regression')")
     public Result<HarnessRegressionRun> completeRegressionRun(
@@ -248,9 +269,40 @@ public class HarnessEvolutionController {
         return Result.ok(harnessEvolutionService.createVersionFromPatch(patchId, userId));
     }
 
+    @PostMapping("/patches/{id}/version")
+    @PreAuthorize("hasAuthority('PERM_harness:patch')")
+    public Result<HarnessVersion> createVersionFromApprovedPatch(
+            @RequestAttribute(required = false) Long userId,
+            @PathVariable Long id) {
+        return Result.ok(harnessEvolutionService.createVersionFromPatch(id, userId));
+    }
+
+    @PostMapping("/versions/{id}/canary")
+    @PreAuthorize("hasAuthority('PERM_harness:patch')")
+    public Result<HarnessVersion> canaryVersion(
+            @RequestAttribute(required = false) Long userId,
+            @PathVariable Long id,
+            @RequestBody(required = false) Map<String, Object> body) {
+        return Result.ok(harnessEvolutionService.canaryVersion(id, userId, body));
+    }
+
     @PutMapping("/versions/{id}/activate")
     @PreAuthorize("hasAuthority('PERM_harness:patch')")
     public Result<HarnessVersion> activateVersion(@PathVariable Long id) {
         return Result.ok(harnessEvolutionService.activateVersion(id));
+    }
+
+    @PostMapping("/versions/{id}/activate")
+    @PreAuthorize("hasAuthority('PERM_harness:patch')")
+    public Result<HarnessVersion> activateVersionPost(@PathVariable Long id) {
+        return Result.ok(harnessEvolutionService.activateVersion(id));
+    }
+
+    @PostMapping("/versions/{id}/rollback")
+    @PreAuthorize("hasAuthority('PERM_harness:patch')")
+    public Result<HarnessVersion> rollbackVersion(
+            @RequestAttribute(required = false) Long userId,
+            @PathVariable Long id) {
+        return Result.ok(harnessEvolutionService.rollbackVersion(id, userId));
     }
 }

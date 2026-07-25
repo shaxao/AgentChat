@@ -408,7 +408,7 @@ export default function ModelPanel({ onClose }: ModelPanelProps) {
                       </div>
                     </div>
                     <div className="text-right text-[10px] text-muted-foreground shrink-0">
-                      <p>${'inputPrice' in model ? (model.inputPrice as number) : 0}/1M</p>
+                      <p>¥{'inputPrice' in model ? (model.inputPrice as number) : 0}/1M</p>
                       <p className="text-[9px]">输入</p>
                     </div>
                   </button>

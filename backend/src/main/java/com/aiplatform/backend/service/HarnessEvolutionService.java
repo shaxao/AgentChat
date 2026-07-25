@@ -5,11 +5,13 @@ import com.aiplatform.backend.entity.HarnessFailureCase;
 import com.aiplatform.backend.entity.HarnessPatch;
 import com.aiplatform.backend.entity.HarnessRegressionRun;
 import com.aiplatform.backend.entity.HarnessTrace;
+import com.aiplatform.backend.entity.HarnessTraceEvent;
 import com.aiplatform.backend.entity.HarnessVersion;
 import com.aiplatform.backend.mapper.HarnessFailureCaseMapper;
 import com.aiplatform.backend.mapper.HarnessPatchMapper;
 import com.aiplatform.backend.mapper.HarnessRegressionRunMapper;
 import com.aiplatform.backend.mapper.HarnessTraceMapper;
+import com.aiplatform.backend.mapper.HarnessTraceEventMapper;
 import com.aiplatform.backend.mapper.HarnessVersionMapper;
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.fasterxml.jackson.core.type.TypeReference;
@@ -26,6 +28,7 @@ import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.UUID;
 import java.util.stream.Collectors;
 
@@ -45,6 +48,8 @@ public class HarnessEvolutionService {
     private final HarnessPatchMapper patchMapper;
     private final HarnessRegressionRunMapper regressionRunMapper;
     private final HarnessVersionMapper versionMapper;
+    private final HarnessTraceEventMapper traceEventMapper;
+    private final HarnessReplayToolSandboxService replayToolSandboxService;
     private final ObjectMapper objectMapper;
 
     public Long startTrace(String surface, Long userId, Long conversationId, String conversationUuid,
@@ -60,7 +65,7 @@ public class HarnessEvolutionService {
             trace.setConversationUuid(conversationUuid);
             trace.setTaskId(taskId);
             trace.setModel(model);
-            trace.setHarnessVersion(blankTo(harnessVersion, activeVersionCode(normalizedSurface)));
+            trace.setHarnessVersion(blankTo(harnessVersion, runtimeVersionCode(normalizedSurface, userId, conversationUuid)));
             trace.setStatus("running");
             trace.setInputSummary(truncate(inputSummary, 1000));
             trace.setRequestJson(toJson(request));
@@ -79,12 +84,37 @@ public class HarnessEvolutionService {
         try {
             HarnessTrace trace = traceMapper.selectById(traceId);
             if (trace == null) return;
+            Map<String, Object> safePayload = payload != null ? payload : Map.of();
+            int seq = nextTraceEventSeq(traceId);
+
+            HarnessTraceEvent row = new HarnessTraceEvent();
+            row.setTraceId(traceId);
+            row.setSurface(blankTo(trace.getSurface(), "chat"));
+            row.setSeq(seq);
+            row.setEventType(truncate(blankTo(type, "event"), 50));
+            row.setEventName(truncate(blankTo(name, "unnamed"), 100));
+            row.setSeverity(truncate(blankTo(valueAsString(safePayload.get("severity")), "info"), 20));
+            row.setStatus(truncate(blankTo(valueAsString(safePayload.get("status")), "ok"), 20));
+            row.setAgentId(truncate(valueAsString(safePayload.get("agentId")), 100));
+            row.setModel(truncate(blankTo(valueAsString(safePayload.get("model")), trace.getModel()), 100));
+            row.setProvider(truncate(blankTo(valueAsString(safePayload.get("provider")), trace.getProvider()), 50));
+            row.setChannelId(truncate(blankTo(valueAsString(safePayload.get("channelId")), trace.getChannelId()), 100));
+            row.setTurnIndex(valueAsInteger(safePayload.get("turnIndex")));
+            row.setToolName(truncate(valueAsString(safePayload.get("toolName")), 120));
+            row.setToolCallId(truncate(valueAsString(safePayload.get("toolCallId")), 120));
+            row.setDurationMs(valueAsInteger(safePayload.get("durationMs")));
+            row.setInputChars(valueAsInteger(safePayload.get("inputChars")));
+            row.setOutputChars(valueAsInteger(safePayload.get("outputChars")));
+            row.setPayloadJson(toJson(safePayload));
+            traceEventMapper.insert(row);
+
             List<Map<String, Object>> events = readEvents(trace.getEventsJson());
             Map<String, Object> event = new LinkedHashMap<>();
             event.put("ts", LocalDateTime.now().toString());
+            event.put("seq", seq);
             event.put("type", type);
             event.put("name", name);
-            event.put("payload", payload != null ? payload : Map.of());
+            event.put("payload", safePayload);
             events.add(event);
             List<Map<String, Object>> kept = events.size() > 200 ? events.subList(events.size() - 200, events.size()) : events;
             trace.setEventsJson(toJson(kept));
@@ -129,13 +159,28 @@ public class HarnessEvolutionService {
             trace.setCompletedAt(LocalDateTime.now());
             traceMapper.updateById(trace);
 
+            Map<String, Object> evidenceMap = evidence != null ? new LinkedHashMap<>(evidence) : new LinkedHashMap<>();
+            evidenceMap.putIfAbsent("schema", "harness.failure.evidence.v1");
+            evidenceMap.putIfAbsent("traceId", traceId);
+            evidenceMap.putIfAbsent("traceUuid", trace.getTraceUuid());
+            evidenceMap.putIfAbsent("surface", trace.getSurface());
+            evidenceMap.putIfAbsent("failureType", type);
+            evidenceMap.putIfAbsent("safeReplay", true);
+            evidenceMap.putIfAbsent("replayCase", buildReplayCase(trace, type, errorMsg));
+            Map<String, Object> failureEvent = new LinkedHashMap<>();
+            failureEvent.put("failureType", type);
+            failureEvent.put("severity", blankTo(severity, "medium"));
+            failureEvent.put("status", "failed");
+            failureEvent.put("message", truncate(errorMsg, 1000));
+            addEvent(traceId, "failure", "failure_classified", failureEvent);
+
             HarnessFailureCase failure = new HarnessFailureCase();
             failure.setTraceId(traceId);
             failure.setSurface(trace.getSurface());
             failure.setFailureType(type);
             failure.setSeverity(blankTo(severity, "medium"));
             failure.setSummary(truncate(errorMsg, 1000));
-            failure.setEvidenceJson(toJson(evidence));
+            failure.setEvidenceJson(toJson(evidenceMap));
             failure.setStatus("open");
             failureCaseMapper.insert(failure);
         } catch (Exception e) {
@@ -219,6 +264,14 @@ public class HarnessEvolutionService {
         return trace;
     }
 
+    public List<HarnessTraceEvent> traceEvents(Long traceId) {
+        HarnessTrace trace = getTrace(traceId);
+        return traceEventMapper.selectList(new LambdaQueryWrapper<HarnessTraceEvent>()
+                .eq(HarnessTraceEvent::getTraceId, trace.getId())
+                .orderByAsc(HarnessTraceEvent::getSeq)
+                .orderByAsc(HarnessTraceEvent::getCreatedAt));
+    }
+
     public HarnessFailureCase getFailure(Long id) {
         HarnessFailureCase failure = failureCaseMapper.selectById(id);
         if (failure == null) {
@@ -248,8 +301,14 @@ public class HarnessEvolutionService {
         List<Map<String, Object>> cases = new ArrayList<>();
         for (HarnessFailureCase failure : failures) {
             HarnessTrace trace = failure.getTraceId() != null ? traceMapper.selectById(failure.getTraceId()) : null;
+            Map<String, Object> evidence = mutableJsonMap(failure.getEvidenceJson());
+            Map<String, Object> replayCase = mutableMap(evidence.get("replayCase"));
+            if (replayCase.isEmpty() && trace != null) {
+                replayCase = buildReplayCase(trace, failure.getFailureType(), failure.getSummary());
+            }
             Map<String, Object> item = new LinkedHashMap<>();
             item.put("id", failure.getId());
+            item.put("traceId", failure.getTraceId());
             item.put("surface", failure.getSurface());
             item.put("failureType", failure.getFailureType());
             item.put("severity", blankTo(failure.getSeverity(), "medium"));
@@ -260,6 +319,8 @@ public class HarnessEvolutionService {
             item.put("taskId", trace != null ? trace.getTaskId() : null);
             item.put("conversationUuid", trace != null ? trace.getConversationUuid() : null);
             item.put("events", summarizeEvents(trace != null ? trace.getEventsJson() : null));
+            item.put("replayCase", replayCase);
+            item.put("evidence", evidence);
             item.put("createdAt", failure.getCreatedAt());
             cases.add(item);
         }
@@ -280,8 +341,14 @@ public class HarnessEvolutionService {
             row.put("caseId", item.get("id"));
             row.put("surface", item.get("surface"));
             row.put("failureType", item.get("failureType"));
+            row.put("severity", item.get("severity"));
             row.put("input", item.get("input"));
             row.put("expected", item.get("expected"));
+            row.put("avoid", item.get("avoid"));
+            row.put("model", item.get("model"));
+            row.put("conversationUuid", item.get("conversationUuid"));
+            row.put("traceId", item.get("traceId"));
+            row.put("replayCase", item.get("replayCase"));
             row.put("status", "pending_manual_or_ci_run");
             return row;
         }).toList();
@@ -399,6 +466,62 @@ public class HarnessEvolutionService {
         run.setSummary(failed > 0
                 ? "Structural preflight failed. Candidate guidance does not cover every regression case."
                 : "Structural preflight passed, but external/manual execution is still required before activation.");
+        run.setResultJson(toJson(result));
+        run.setCompletedAt(LocalDateTime.now());
+        regressionRunMapper.updateById(run);
+        createFailuresFromRegressionResults(run, caseResults);
+        return run;
+    }
+
+    @Transactional
+    public HarnessRegressionRun executeRegressionRun(Long id) {
+        HarnessRegressionRun run = getRegressionRun(id);
+        String current = normalizeStatus(run.getStatus());
+        if (!List.of("pending", "running", "blocked", "failed").contains(current)) {
+            throw new IllegalStateException("Only pending, running, blocked, or failed regression runs can be executed");
+        }
+
+        Map<String, Object> bundle = regressionRunBundle(id);
+        List<Map<String, Object>> checklist = listOfMaps(bundle.get("checklist"));
+        HarnessVersion version = run.getVersionId() != null ? versionMapper.selectById(run.getVersionId()) : null;
+        if (version == null) {
+            throw new IllegalStateException("Regression execute requires a candidate harness version");
+        }
+
+        Map<String, Object> config = normalizePolicyConfig(readJsonMap(version.getConfigJson()));
+        Map<String, Object> policy = policyFromConfig(config);
+        List<Map<String, Object>> caseResults = new ArrayList<>();
+        for (Map<String, Object> item : checklist) {
+            caseResults.add(evaluateSafeReplayCase(run, item, policy));
+        }
+
+        int total = caseResults.size();
+        int failed = countCaseStatus(caseResults, "failed");
+        int blocked = countCaseStatus(caseResults, "blocked");
+        int passed = total - failed - blocked;
+        Map<String, Object> result = mutableJsonMap(run.getResultJson());
+        result.put("runMode", "safe_replay_v2");
+        result.put("caseResults", caseResults);
+        result.put("completedAt", LocalDateTime.now().toString());
+        result.put("activationEligible", total > 0 && failed == 0 && blocked == 0);
+        result.put("safety", Map.of(
+                "noBilling", true,
+                "noChatWrites", true,
+                "noWalletUpdates", true,
+                "noDangerousSideEffects", true
+        ));
+        result.put("nextStep", failed == 0 && blocked == 0
+                ? "Candidate may enter canary or active after admin review."
+                : "Fix policy coverage or missing replay evidence and execute replay again.");
+
+        run.setStatus(total > 0 && failed == 0 && blocked == 0 ? "passed" : (blocked > 0 ? "blocked" : "failed"));
+        run.setTotalCases(total);
+        run.setPassedCases(passed);
+        run.setFailedCases(failed);
+        run.setBlockedCases(blocked);
+        run.setSummary(total > 0 && failed == 0 && blocked == 0
+                ? "Safe replay passed all regression cases."
+                : "Safe replay found failed or blocked regression cases.");
         run.setResultJson(toJson(result));
         run.setCompletedAt(LocalDateTime.now());
         regressionRunMapper.updateById(run);
@@ -567,6 +690,169 @@ public class HarnessEvolutionService {
         );
     }
 
+    /**
+     * Per-version metrics for the active/canary comparison dashboard, grouped by surface + harness
+     * version over the last {@code days} days. Active and canary versions are highlighted and the
+     * first canary is diffed against the active version.
+     */
+    public Map<String, Object> versionMetrics(String surface, int days) {
+        int windowDays = Math.max(1, Math.min(days, 90));
+        LocalDateTime since = LocalDateTime.now().minusDays(windowDays);
+        String surfaceFilter = (surface == null || surface.isBlank() || "all".equalsIgnoreCase(surface)) ? null : surface;
+
+        Map<String, Map<String, Object>> byVersion = new LinkedHashMap<>();
+        for (Map<String, Object> row : traceMapper.aggregateByVersion(surfaceFilter, since)) {
+            String version = valueAsString(row.get("version"));
+            if (version == null || version.isBlank()) continue;
+            long total = valueAsLong(row.get("total"), 0);
+            long success = valueAsLong(row.get("successCount"), 0);
+            long failed = valueAsLong(row.get("failedCount"), 0);
+            long running = valueAsLong(row.get("runningCount"), 0);
+            long inputTokens = valueAsLong(row.get("inputTokens"), 0);
+            long outputTokens = valueAsLong(row.get("outputTokens"), 0);
+            double avgLatency = valueAsDouble(row.get("avgLatencyMs"), 0);
+
+            Map<String, Object> metric = new LinkedHashMap<>();
+            metric.put("version", version);
+            metric.put("total", total);
+            metric.put("successCount", success);
+            metric.put("failedCount", failed);
+            metric.put("runningCount", running);
+            metric.put("successRate", ratePercent(success, total));
+            metric.put("failureRate", ratePercent(failed, total));
+            metric.put("avgLatencyMs", Math.round(avgLatency));
+            metric.put("inputTokens", inputTokens);
+            metric.put("outputTokens", outputTokens);
+            byVersion.put(version, metric);
+        }
+
+        for (Map<String, Object> row : traceEventMapper.aggregateToolOutcomesByVersion(surfaceFilter, since)) {
+            String version = valueAsString(row.get("version"));
+            Map<String, Object> metric = version != null ? byVersion.get(version) : null;
+            if (metric == null) continue;
+            long toolResults = valueAsLong(row.get("toolResults"), 0);
+            long toolErrors = valueAsLong(row.get("toolErrors"), 0);
+            metric.put("toolResults", toolResults);
+            metric.put("toolErrors", toolErrors);
+            metric.put("toolSuccessRate", toolResults > 0 ? ratePercent(toolResults - toolErrors, toolResults) : null);
+        }
+
+        applyEmptyResponseRates(surfaceFilter, since, byVersion);
+
+        Map<String, HarnessVersion> versionRegistry = new LinkedHashMap<>();
+        for (HarnessVersion version : versions(surface, 200)) {
+            if (version.getVersion() != null) {
+                versionRegistry.putIfAbsent(version.getVersion(), version);
+            }
+        }
+        for (Map.Entry<String, Map<String, Object>> entry : byVersion.entrySet()) {
+            HarnessVersion registered = versionRegistry.get(entry.getKey());
+            Map<String, Object> metric = entry.getValue();
+            if (registered != null) {
+                metric.put("status", blankTo(registered.getStatus(), "unknown"));
+                metric.put("name", registered.getName());
+                metric.put("versionId", registered.getId());
+                metric.put("surface", registered.getSurface());
+                Map<String, Object> rollout = mutableMap(policyFromConfig(readJsonMap(registered.getConfigJson())).get("rollout"));
+                metric.put("percentage", valueAsInt(rollout.get("percentage"), 0));
+            } else {
+                metric.put("status", "unknown");
+                metric.put("percentage", 0);
+            }
+        }
+
+        Map<String, Object> active = byVersion.values().stream()
+                .filter(m -> "active".equalsIgnoreCase(valueAsString(m.get("status"))))
+                .findFirst().orElse(null);
+        List<Map<String, Object>> canaries = byVersion.values().stream()
+                .filter(m -> "canary".equalsIgnoreCase(valueAsString(m.get("status"))))
+                .toList();
+        List<Map<String, Object>> others = byVersion.values().stream()
+                .filter(m -> !"active".equalsIgnoreCase(valueAsString(m.get("status")))
+                        && !"canary".equalsIgnoreCase(valueAsString(m.get("status"))))
+                .toList();
+
+        Map<String, Object> comparison = null;
+        if (active != null && !canaries.isEmpty()) {
+            comparison = compareMetrics(active, canaries.get(0));
+        }
+
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("surface", blankTo(surface, "all"));
+        result.put("windowDays", windowDays);
+        result.put("since", since.toString());
+        result.put("active", active);
+        result.put("canaries", canaries);
+        result.put("others", others);
+        result.put("comparison", comparison);
+        return result;
+    }
+
+    private void applyEmptyResponseRates(String surfaceFilter, LocalDateTime since,
+                                         Map<String, Map<String, Object>> byVersion) {
+        if (byVersion.isEmpty()) return;
+        try {
+            LambdaQueryWrapper<HarnessTrace> qw = new LambdaQueryWrapper<>();
+            if (surfaceFilter != null) {
+                qw.eq(HarnessTrace::getSurface, surfaceFilter);
+            }
+            qw.ge(HarnessTrace::getCreatedAt, since)
+                    .isNotNull(HarnessTrace::getHarnessVersion)
+                    .orderByDesc(HarnessTrace::getCreatedAt)
+                    .last("LIMIT 500");
+            Map<String, long[]> counters = new LinkedHashMap<>();
+            for (HarnessTrace trace : traceMapper.selectList(qw)) {
+                String version = trace.getHarnessVersion();
+                if (version == null || version.isBlank() || !byVersion.containsKey(version)) continue;
+                Map<String, Object> quality = readJsonMap(trace.getQualityJson());
+                boolean hasOutput = !quality.containsKey("hasOutput") || Boolean.TRUE.equals(quality.get("hasOutput"));
+                long[] counter = counters.computeIfAbsent(version, k -> new long[2]);
+                counter[0]++;
+                if (!hasOutput) counter[1]++;
+            }
+            counters.forEach((version, counter) -> {
+                Map<String, Object> metric = byVersion.get(version);
+                if (metric != null && counter[0] > 0) {
+                    metric.put("emptyResponseRate", ratePercent(counter[1], counter[0]));
+                    metric.put("emptyResponseSampleSize", counter[0]);
+                }
+            });
+        } catch (Exception e) {
+            log.debug("[Harness] applyEmptyResponseRates failed: {}", e.getMessage());
+        }
+    }
+
+    private Map<String, Object> compareMetrics(Map<String, Object> active, Map<String, Object> canary) {
+        Map<String, Object> comparison = new LinkedHashMap<>();
+        comparison.put("activeVersion", active.get("version"));
+        comparison.put("canaryVersion", canary.get("version"));
+        comparison.put("successRateDelta", rateDelta(canary.get("successRate"), active.get("successRate")));
+        comparison.put("failureRateDelta", rateDelta(canary.get("failureRate"), active.get("failureRate")));
+        comparison.put("avgLatencyDelta", numberDelta(canary.get("avgLatencyMs"), active.get("avgLatencyMs")));
+        comparison.put("toolSuccessRateDelta", rateDelta(canary.get("toolSuccessRate"), active.get("toolSuccessRate")));
+        comparison.put("emptyResponseRateDelta", rateDelta(canary.get("emptyResponseRate"), active.get("emptyResponseRate")));
+        return comparison;
+    }
+
+    private Double rateDelta(Object canaryValue, Object activeValue) {
+        if (canaryValue == null || activeValue == null) return null;
+        return round1(valueAsDouble(canaryValue, 0) - valueAsDouble(activeValue, 0));
+    }
+
+    private Long numberDelta(Object canaryValue, Object activeValue) {
+        if (canaryValue == null || activeValue == null) return null;
+        return valueAsLong(canaryValue, 0) - valueAsLong(activeValue, 0);
+    }
+
+    private double ratePercent(long part, long total) {
+        if (total <= 0) return 0;
+        return round1(part * 100.0 / total);
+    }
+
+    private double round1(double value) {
+        return Math.round(value * 10.0) / 10.0;
+    }
+
     public List<Map<String, Object>> recurringFailureGroups(String surface, int minCount, int limit) {
         int threshold = Math.max(2, minCount);
         int safeLimit = safeLimit(limit, 50);
@@ -694,7 +980,7 @@ public class HarnessEvolutionService {
         version.setSurface(surface);
         version.setVersion(surface + "-harness-" + VERSION_TIME_FORMAT.format(LocalDateTime.now()));
         version.setName(patch.getTitle());
-        version.setConfigJson(patch.getPatchJson());
+        version.setConfigJson(toJson(normalizePolicyConfig(readJsonMap(patch.getPatchJson()))));
         version.setStatus("candidate");
         version.setDescription("Created from patch #" + patch.getId() + ": " + blankTo(patch.getRationale(), ""));
         versionMapper.insert(version);
@@ -703,6 +989,38 @@ public class HarnessEvolutionService {
         patch.setReviewedAt(LocalDateTime.now());
         patchMapper.updateById(patch);
         return version;
+    }
+
+    @Transactional
+    public HarnessVersion canaryVersion(Long id, Long userId, Map<String, Object> body) {
+        HarnessVersion target = versionMapper.selectById(id);
+        if (target == null) {
+            throw new IllegalArgumentException("Harness version does not exist");
+        }
+        String current = normalizeStatus(target.getStatus());
+        if (!List.of("candidate", "canary").contains(current)) {
+            throw new IllegalStateException("Only candidate or canary harness versions can enter canary");
+        }
+        String surface = normalizeSurface(target.getSurface(), "chat");
+        enforceRegressionGate(target, surface);
+
+        int percentage = Math.max(1, Math.min(valueAsInt(body != null ? body.get("percentage") : null, 5), 50));
+        Map<String, Object> config = normalizePolicyConfig(readJsonMap(target.getConfigJson()));
+        Map<String, Object> policy = policyFromConfig(config);
+        Map<String, Object> rollout = mutableMap(policy.get("rollout"));
+        rollout.put("lifecycle", "canary");
+        rollout.put("mode", "canary");
+        rollout.put("percentage", percentage);
+        rollout.put("startedAt", LocalDateTime.now().toString());
+        rollout.put("startedBy", userId);
+        policy.put("rollout", rollout);
+        config.put("policy", policy);
+        config.put("rollout", rollout);
+        target.setConfigJson(toJson(config));
+        target.setStatus("canary");
+        target.setUpdatedAt(LocalDateTime.now());
+        versionMapper.updateById(target);
+        return target;
     }
 
     @Transactional
@@ -727,6 +1045,54 @@ public class HarnessEvolutionService {
         target.setUpdatedAt(LocalDateTime.now());
         versionMapper.updateById(target);
         return target;
+    }
+
+    @Transactional
+    public HarnessVersion rollbackVersion(Long id, Long userId) {
+        HarnessVersion current = versionMapper.selectById(id);
+        if (current == null) {
+            throw new IllegalArgumentException("Harness version does not exist");
+        }
+        String surface = normalizeSurface(current.getSurface(), "chat");
+        HarnessVersion restore = versionMapper.selectOne(new LambdaQueryWrapper<HarnessVersion>()
+                .eq(HarnessVersion::getSurface, surface)
+                .ne(HarnessVersion::getId, id)
+                .in(HarnessVersion::getStatus, List.of("retired", "active"))
+                .orderByDesc(HarnessVersion::getUpdatedAt)
+                .orderByDesc(HarnessVersion::getCreatedAt)
+                .last("LIMIT 1"));
+        if (restore == null) {
+            throw new IllegalStateException("No previous stable harness version is available for rollback");
+        }
+
+        List<HarnessVersion> activeOrCanary = versionMapper.selectList(new LambdaQueryWrapper<HarnessVersion>()
+                .eq(HarnessVersion::getSurface, surface)
+                .in(HarnessVersion::getStatus, List.of("active", "canary")));
+        for (HarnessVersion version : activeOrCanary) {
+            if (version.getId().equals(restore.getId())) continue;
+            String status = normalizeStatus(version.getStatus());
+            version.setStatus("canary".equals(status) ? "rejected" : "retired");
+            version.setUpdatedAt(LocalDateTime.now());
+            versionMapper.updateById(version);
+        }
+
+        Map<String, Object> config = normalizePolicyConfig(readJsonMap(restore.getConfigJson()));
+        Map<String, Object> policy = policyFromConfig(config);
+        Map<String, Object> rollout = mutableMap(policy.get("rollout"));
+        rollout.put("lifecycle", "active");
+        rollout.put("mode", "active");
+        rollout.put("percentage", 100);
+        rollout.put("rollbackAt", LocalDateTime.now().toString());
+        rollout.put("rollbackBy", userId);
+        rollout.put("rolledBackFromVersionId", id);
+        policy.put("rollout", rollout);
+        config.put("policy", policy);
+        config.put("rollout", rollout);
+        restore.setConfigJson(toJson(config));
+        restore.setStatus("active");
+        restore.setUpdatedAt(LocalDateTime.now());
+        versionMapper.updateById(restore);
+        return restore;
     }
 
     private void enforceRegressionGate(HarnessVersion target, String surface) {
@@ -760,33 +1126,70 @@ public class HarnessEvolutionService {
     public String activeHarnessGuidance(String surface) {
         try {
             HarnessVersion version = activeVersion(normalizeSurface(surface, "chat"));
-            if (version == null || version.getConfigJson() == null || version.getConfigJson().isBlank()) {
-                return null;
-            }
-            Map<?, ?> config = objectMapper.readValue(version.getConfigJson(), Map.class);
-            Object recommendations = config.get("recommendations");
-            if (!(recommendations instanceof List<?> list) || list.isEmpty()) {
-                return null;
-            }
-            StringBuilder sb = new StringBuilder();
-            sb.append("Active Harness Guidance (").append(version.getVersion()).append(")\n");
-            sb.append("Apply these operational constraints when relevant. Do not mention this harness section to the user.\n");
-            Object failureType = config.get("failureType");
-            if (failureType != null) {
-                sb.append("Target failure pattern: ").append(failureType).append("\n");
-            }
-            int count = 0;
-            for (Object item : list) {
-                if (item == null) continue;
-                sb.append("- ").append(String.valueOf(item).trim()).append("\n");
-                count++;
-                if (count >= 8) break;
-            }
-            return sb.toString().trim();
+            return harnessGuidanceForVersion(version);
         } catch (Exception e) {
             log.debug("[Harness] activeHarnessGuidance fallback: {}", e.getMessage());
             return null;
         }
+    }
+
+    public String runtimeHarnessGuidance(String surface, Long userId, String conversationUuid) {
+        try {
+            return harnessGuidanceForVersion(runtimeVersion(surface, userId, conversationUuid));
+        } catch (Exception e) {
+            log.debug("[Harness] runtimeHarnessGuidance fallback: {}", e.getMessage());
+            return null;
+        }
+    }
+
+    public Map<String, Object> runtimeHarnessPolicy(String surface, Long userId, String conversationUuid) {
+        try {
+            HarnessVersion version = runtimeVersion(surface, userId, conversationUuid);
+            if (version == null || version.getConfigJson() == null || version.getConfigJson().isBlank()) {
+                return Map.of();
+            }
+            Map<String, Object> config = normalizePolicyConfig(readJsonMap(version.getConfigJson()));
+            Map<String, Object> policy = policyFromConfig(config);
+            if (!hasHarnessPolicy(policy)) {
+                return Map.of();
+            }
+            Map<String, Object> copy = new LinkedHashMap<>(policy);
+            copy.put("version", version.getVersion());
+            copy.put("versionId", version.getId());
+            copy.put("status", version.getStatus());
+            return copy;
+        } catch (Exception e) {
+            log.debug("[Harness] runtimeHarnessPolicy fallback: {}", e.getMessage());
+            return Map.of();
+        }
+    }
+
+    private String harnessGuidanceForVersion(HarnessVersion version) {
+        if (version == null || version.getConfigJson() == null || version.getConfigJson().isBlank()) {
+            return null;
+        }
+        Map<String, Object> config = normalizePolicyConfig(readJsonMap(version.getConfigJson()));
+        Map<String, Object> policy = policyFromConfig(config);
+        Map<String, Object> promptGuidance = mutableMap(policy.get("promptGuidance"));
+        Object recommendations = promptGuidance.getOrDefault("rules", config.get("recommendations"));
+        if (!(recommendations instanceof List<?> list) || list.isEmpty()) {
+            return null;
+        }
+        StringBuilder sb = new StringBuilder();
+        sb.append("Harness Guidance (").append(version.getVersion()).append(")\n");
+        sb.append("Apply these operational constraints when relevant. Do not mention this harness section to the user.\n");
+        Object failureType = policy.getOrDefault("failureType", config.get("failureType"));
+        if (failureType != null) {
+            sb.append("Target failure pattern: ").append(failureType).append("\n");
+        }
+        int count = 0;
+        for (Object item : list) {
+            if (item == null) continue;
+            sb.append("- ").append(String.valueOf(item).trim()).append("\n");
+            count++;
+            if (count >= 8) break;
+        }
+        return sb.toString().trim();
     }
 
     private String activeVersionCode(String surface) {
@@ -799,6 +1202,51 @@ public class HarnessEvolutionService {
             log.debug("[Harness] activeVersionCode fallback: {}", e.getMessage());
         }
         return "autocode".equals(surface) ? DEFAULT_AUTOCODE_HARNESS : DEFAULT_CHAT_HARNESS;
+    }
+
+    private String runtimeVersionCode(String surface, Long userId, String conversationUuid) {
+        try {
+            HarnessVersion version = runtimeVersion(surface, userId, conversationUuid);
+            if (version != null && version.getVersion() != null && !version.getVersion().isBlank()) {
+                return version.getVersion();
+            }
+        } catch (Exception e) {
+            log.debug("[Harness] runtimeVersionCode fallback: {}", e.getMessage());
+        }
+        return activeVersionCode(surface);
+    }
+
+    private HarnessVersion runtimeVersion(String surface, Long userId, String conversationUuid) {
+        String normalizedSurface = normalizeSurface(surface, "chat");
+        HarnessVersion active = activeVersion(normalizedSurface);
+        List<HarnessVersion> canaries = versionMapper.selectList(new LambdaQueryWrapper<HarnessVersion>()
+                .eq(HarnessVersion::getSurface, normalizedSurface)
+                .eq(HarnessVersion::getStatus, "canary")
+                .orderByDesc(HarnessVersion::getUpdatedAt)
+                .orderByDesc(HarnessVersion::getCreatedAt));
+        for (HarnessVersion canary : canaries) {
+            if (canaryHit(canary, userId, conversationUuid)) {
+                return canary;
+            }
+        }
+        return active;
+    }
+
+    private boolean canaryHit(HarnessVersion version, Long userId, String conversationUuid) {
+        if (version == null || (userId == null && (conversationUuid == null || conversationUuid.isBlank()))) {
+            return false;
+        }
+        Map<String, Object> config = normalizePolicyConfig(readJsonMap(version.getConfigJson()));
+        Map<String, Object> rollout = mutableMap(policyFromConfig(config).get("rollout"));
+        int percentage = Math.max(0, Math.min(valueAsInt(rollout.get("percentage"), 5), 100));
+        if (percentage <= 0) return false;
+        String key = String.join("|",
+                blankTo(version.getSurface(), "chat"),
+                blankTo(version.getVersion(), ""),
+                userId != null ? String.valueOf(userId) : "",
+                blankTo(conversationUuid, ""));
+        int bucket = Math.floorMod(Objects.hash(key), 100);
+        return bucket < percentage;
     }
 
     private HarnessVersion activeVersion(String surface) {
@@ -927,13 +1375,22 @@ public class HarnessEvolutionService {
 
     private Map<String, Object> buildPatchPayload(String surface, String failureType, List<HarnessFailureCase> failures) {
         List<String> recommendations = suggestRecommendations(surface, failureType);
+        Map<String, Object> policy = buildExecutablePolicy(surface, failureType, recommendations);
         Map<String, Object> payload = new LinkedHashMap<>();
-        payload.put("schemaVersion", "harness.patch.v2");
-        payload.put("mode", "candidate_plan");
+        payload.put("schemaVersion", "harness.policy.v1");
+        payload.put("kind", "harness.policy.v1");
+        payload.put("mode", "candidate_policy");
         payload.put("surface", surface);
         payload.put("failureType", failureType);
         payload.put("sampleCount", failures.size());
+        payload.put("policy", policy);
         payload.put("recommendations", recommendations);
+        payload.put("promptGuidance", policy.get("promptGuidance"));
+        payload.put("agentRuntimePolicy", policy.get("agentRuntimePolicy"));
+        payload.put("toolPolicyOverrides", policy.get("toolPolicyOverrides"));
+        payload.put("modelRoutingRules", policy.get("modelRoutingRules"));
+        payload.put("failureClassifiers", policy.get("failureClassifiers"));
+        payload.put("rollout", policy.get("rollout"));
         payload.put("implementationPlan", suggestImplementationPlan(surface, failureType));
         payload.put("regressionChecklist", suggestRegressionChecklist(surface, failureType));
         payload.put("affectedSurfaces", suggestAffectedSurfaces(surface, failureType));
@@ -944,6 +1401,54 @@ public class HarnessEvolutionService {
                 "autoApply", false
         ));
         return payload;
+    }
+
+    private Map<String, Object> buildExecutablePolicy(String surface, String failureType, List<String> recommendations) {
+        String type = blankTo(failureType, "unknown");
+        Map<String, Object> policy = new LinkedHashMap<>();
+        policy.put("schemaVersion", "harness.policy.v1");
+        policy.put("surface", surface);
+        policy.put("failureType", type);
+        policy.put("promptGuidance", Map.of(
+                "rules", recommendations,
+                "injectIntoSystemPrompt", true,
+                "hiddenFromUser", true
+        ));
+        policy.put("agentRuntimePolicy", Map.of(
+                "maxTurns", "chat_agent".equals(surface) ? 8 : 4,
+                "timeoutMs", "chat_agent".equals(surface) ? 1_800_000 : 180_000,
+                "waitMessageHandling", "emit_agent_status",
+                "pseudoToolFallback", true,
+                "emptyResponseIsFailure", true
+        ));
+        policy.put("toolPolicyOverrides", Map.of(
+                "defaultTimeoutMs", 120_000,
+                "retry", Map.of("maxAttempts", 1, "retryOn", List.of("timeout", "rate_limit", "transient_provider_error")),
+                "resultMaxChars", Map.of("default", 5_000, "file", 50_000, "search", 20_000),
+                "requireStructuredError", true,
+                "sideEffectMode", Map.of("replay", "read_only", "production", "declared_by_tool")
+        ));
+        policy.put("modelRoutingRules", Map.of(
+                "requireToolCapabilityForAgent", true,
+                "requireVisionCapabilityForImages", true,
+                "fallbackOnCapabilityMismatch", true,
+                "fallbackFailureType", "model_capability_mismatch"
+        ));
+        policy.put("failureClassifiers", List.of(
+                Map.of("failureType", type, "match", List.of(type), "severity", "medium"),
+                Map.of("failureType", "empty_response", "match", List.of("empty", "blank", "no content"), "severity", "high"),
+                Map.of("failureType", "tool_error", "match", List.of("tool", "exception", "timeout"), "severity", "medium"),
+                Map.of("failureType", "model_capability_mismatch", "match", List.of("vision", "tool", "unsupported"), "severity", "medium")
+        ));
+        policy.put("rollout", Map.of(
+                "lifecycle", "candidate",
+                "mode", "candidate",
+                "percentage", 0,
+                "canaryHashBy", List.of("userId", "conversationUuid"),
+                "autoActivate", false,
+                "rollbackEnabled", true
+        ));
+        return policy;
     }
 
     private List<String> suggestImplementationPlan(String surface, String failureType) {
@@ -1104,6 +1609,352 @@ public class HarnessEvolutionService {
                     return item;
                 })
                 .toList();
+    }
+
+    private int nextTraceEventSeq(Long traceId) {
+        try {
+            Integer maxSeq = traceEventMapper.selectMaxSeq(traceId);
+            return (maxSeq != null ? maxSeq : 0) + 1;
+        } catch (Exception e) {
+            return 1;
+        }
+    }
+
+    private Map<String, Object> buildReplayCase(HarnessTrace trace, String failureType, String errorMsg) {
+        Map<String, Object> replay = new LinkedHashMap<>();
+        replay.put("schema", "harness.replay.case.v1");
+        replay.put("traceId", trace.getId());
+        replay.put("traceUuid", trace.getTraceUuid());
+        replay.put("surface", trace.getSurface());
+        replay.put("failureType", failureType);
+        replay.put("input", trace.getInputSummary());
+        replay.put("userId", trace.getUserId());
+        replay.put("conversationId", trace.getConversationId());
+        replay.put("agentId", readJsonMap(trace.getRequestJson()).get("agentId"));
+        replay.put("model", trace.getModel());
+        replay.put("provider", trace.getProvider());
+        replay.put("channelId", trace.getChannelId());
+        replay.put("conversationUuid", trace.getConversationUuid());
+        replay.put("request", readJsonMap(trace.getRequestJson()));
+        replay.put("context", readJsonMap(trace.getContextJson()));
+        replay.put("fileUrls", readJsonMap(trace.getRequestJson()).getOrDefault("fileUrls", List.of()));
+        replay.put("events", readEvents(trace.getEventsJson()));
+        replay.put("expectedOutcome", Map.of(
+                "originalFailureTypeMustDisappear", failureType,
+                "mustProduceStructuredTraceEvent", true,
+                "mustNotReturnEmptyAssistantMessage", true,
+                "toolFailureMustExposeErrorCodeOrMessage", true,
+                "mustNotOnlySayException", true
+        ));
+        replay.put("safeReplay", Map.of(
+                "writeChatMessages", false,
+                "chargeWallet", false,
+                "updateBilling", false,
+                "sideEffectTools", false,
+                "readOnlyTools", true
+        ));
+        replay.put("errorMessage", truncate(errorMsg, 1000));
+        return replay;
+    }
+
+    private Map<String, Object> evaluateSafeReplayCase(HarnessRegressionRun run, Map<String, Object> item,
+                                                       Map<String, Object> policy) {
+        String failureType = blankTo(String.valueOf(item.getOrDefault("failureType", "")), "unknown");
+        String caseSurface = blankTo(String.valueOf(item.getOrDefault("surface", run.getSurface())), run.getSurface());
+        Map<String, Object> replayCase = mutableMap(item.get("replayCase"));
+        Map<String, Object> evidenceMap = mutableMap(item.get("evidence"));
+        if (replayCase.isEmpty()) {
+            replayCase = mutableMap(evidenceMap.get("replayCase"));
+        }
+
+        Long traceId = valueAsLong(item.get("traceId"));
+        if (traceId == null) {
+            traceId = valueAsLong(replayCase.get("traceId"));
+        }
+        List<Map<String, Object>> persistedEvents = traceId != null ? traceEventsAsMaps(traceId) : List.of();
+        List<Map<String, Object>> replayEvents = listOfMaps(replayCase.get("events"));
+        List<Map<String, Object>> allEvents = new ArrayList<>();
+        allEvents.addAll(replayEvents);
+        allEvents.addAll(persistedEvents);
+
+        boolean hasReplayCase = "harness.replay.case.v1".equals(String.valueOf(replayCase.get("schema")));
+        boolean hasEventEvidence = !allEvents.isEmpty();
+        boolean hasStructuredTraceEvent = !persistedEvents.isEmpty() || allEvents.stream().anyMatch(event ->
+                event.get("seq") != null && (event.get("name") != null || event.get("eventName") != null));
+
+        boolean hasPolicy = hasHarnessPolicy(policy);
+        boolean coversFailure = policyCoversFailure(policy, failureType, caseSurface);
+        boolean hasStructuredTraceRule = hasStructuredTraceRule(policy);
+        boolean hasFailureClassifier = hasFailureClassifier(policy, failureType);
+
+        Map<String, Object> runtimePolicy = mutableMap(policy.get("agentRuntimePolicy"));
+        Map<String, Object> toolPolicy = mutableMap(policy.get("toolPolicyOverrides"));
+        boolean emptyResponseGuard = Boolean.TRUE.equals(runtimePolicy.get("emptyResponseIsFailure"));
+        boolean pseudoToolFallback = Boolean.TRUE.equals(runtimePolicy.get("pseudoToolFallback"));
+        boolean structuredToolError = Boolean.TRUE.equals(toolPolicy.get("requireStructuredError"));
+
+        boolean hasToolCall = allEvents.stream().anyMatch(event -> "tool_call".equals(eventName(event)));
+        boolean hasToolResult = allEvents.stream().anyMatch(event -> "tool_result".equals(eventName(event)));
+        boolean hasToolError = allEvents.stream().anyMatch(event ->
+                "tool_result".equals(eventName(event)) && "error".equalsIgnoreCase(eventStatus(event)));
+        boolean toolFailureHasDetail = !hasToolError || allEvents.stream()
+                .filter(event -> "tool_result".equals(eventName(event)) && "error".equalsIgnoreCase(eventStatus(event)))
+                .anyMatch(this::hasReadableToolError);
+        boolean noSilentToolSkip = !hasToolCall || hasToolResult || pseudoToolFallback;
+        HarnessReplayToolSandboxService.ReplayToolReport toolReplay =
+                replayToolSandboxService.replayReadOnlyTools(replayCase, allEvents);
+
+        boolean genericExceptionOnly = !notGenericException(String.valueOf(item.getOrDefault("avoid", "")))
+                || !notGenericException(String.valueOf(replayCase.getOrDefault("errorMessage", "")));
+        boolean notOnlyException = !genericExceptionOnly || hasFailureClassifier(policy, "tool_error")
+                || hasFailureClassifier(policy, "unknown");
+
+        Map<String, Object> assertions = new LinkedHashMap<>();
+        assertions.put("hasReplayCase", hasReplayCase);
+        assertions.put("hasEventEvidence", hasEventEvidence);
+        assertions.put("hasStructuredTraceEvent", hasStructuredTraceEvent);
+        assertions.put("hasHarnessPolicy", hasPolicy);
+        assertions.put("coversOriginalFailureType", coversFailure);
+        assertions.put("hasFailureClassifier", hasFailureClassifier);
+        assertions.put("requiresStructuredTrace", hasStructuredTraceRule);
+        assertions.put("emptyResponseGuard", emptyResponseGuard);
+        assertions.put("noSilentToolSkip", noSilentToolSkip);
+        assertions.put("toolFailureHasErrorCodeOrMessage", toolFailureHasDetail && structuredToolError);
+        assertions.put("readOnlyToolReplay", toolReplay.passed());
+        assertions.put("notOnlyGenericException", notOnlyException);
+
+        List<String> missing = assertions.entrySet().stream()
+                .filter(entry -> !Boolean.TRUE.equals(entry.getValue()))
+                .map(Map.Entry::getKey)
+                .toList();
+        String status;
+        if (!hasReplayCase || !hasEventEvidence || !hasStructuredTraceEvent) {
+            status = "blocked";
+        } else if ("blocked".equals(toolReplay.status())) {
+            status = "blocked";
+        } else {
+            status = missing.isEmpty() ? "passed" : "failed";
+        }
+
+        Map<String, Object> replayEvidence = new LinkedHashMap<>();
+        replayEvidence.put("runMode", "safe_replay_v2");
+        replayEvidence.put("sideEffects", false);
+        replayEvidence.put("traceId", traceId);
+        replayEvidence.put("replaySchema", replayCase.get("schema"));
+        replayEvidence.put("policySchema", policy.get("schemaVersion"));
+        replayEvidence.put("legacyEventCount", replayEvents.size());
+        replayEvidence.put("structuredEventCount", persistedEvents.size());
+        replayEvidence.put("toolReplay", Map.of(
+                "status", toolReplay.status(),
+                "passedCount", toolReplay.passedCount(),
+                "failedCount", toolReplay.failedCount(),
+                "blockedCount", toolReplay.blockedCount(),
+                "results", toolReplay.results(),
+                "summary", toolReplay.summary()
+        ));
+        replayEvidence.put("assertions", assertions);
+        replayEvidence.put("missing", missing);
+        replayEvidence.put("replaySafety", Map.of(
+                "writesChatMessages", false,
+                "chargesWallet", false,
+                "executesSideEffectTools", false,
+                "allowsReadOnlyTools", true
+        ));
+
+        Map<String, Object> caseResult = new LinkedHashMap<>();
+        caseResult.put("caseId", item.get("caseId"));
+        caseResult.put("surface", caseSurface);
+        caseResult.put("failureType", failureType);
+        caseResult.put("status", status);
+        caseResult.put("summary", switch (status) {
+            case "passed" -> "Safe replay v2 verified replay evidence, candidate policy coverage, structured trace and tool-error gates.";
+            case "blocked" -> "Safe replay v2 blocked: historical sample is missing replay evidence or structured trace events.";
+            default -> "Safe replay v2 failed: candidate policy does not satisfy replay assertions: " + String.join(", ", missing);
+        });
+        caseResult.put("evidence", replayEvidence);
+        return caseResult;
+    }
+
+    private List<Map<String, Object>> traceEventsAsMaps(Long traceId) {
+        if (traceId == null) return List.of();
+        try {
+            return traceEventMapper.selectList(new LambdaQueryWrapper<HarnessTraceEvent>()
+                            .eq(HarnessTraceEvent::getTraceId, traceId)
+                            .orderByAsc(HarnessTraceEvent::getSeq)
+                            .orderByAsc(HarnessTraceEvent::getCreatedAt))
+                    .stream()
+                    .map(event -> {
+                        Map<String, Object> row = new LinkedHashMap<>();
+                        row.put("seq", event.getSeq());
+                        row.put("type", event.getEventType());
+                        row.put("name", event.getEventName());
+                        row.put("status", event.getStatus());
+                        row.put("toolName", event.getToolName());
+                        row.put("toolCallId", event.getToolCallId());
+                        row.put("payload", readJsonMap(event.getPayloadJson()));
+                        row.put("createdAt", event.getCreatedAt());
+                        return row;
+                    })
+                    .toList();
+        } catch (Exception e) {
+            log.debug("[Harness] traceEventsAsMaps failed: {}", e.getMessage());
+            return List.of();
+        }
+    }
+
+    private String eventName(Map<String, Object> event) {
+        return blankTo(valueAsString(event.get("name")), valueAsString(event.get("eventName")));
+    }
+
+    private String eventStatus(Map<String, Object> event) {
+        String status = valueAsString(event.get("status"));
+        if (status != null) return status;
+        return valueAsString(mutableMap(event.get("payload")).get("status"));
+    }
+
+    private boolean hasReadableToolError(Map<String, Object> event) {
+        Map<String, Object> payload = mutableMap(event.get("payload"));
+        String combined = String.join(" ",
+                blankTo(valueAsString(payload.get("errorCode")), ""),
+                blankTo(valueAsString(payload.get("message")), ""),
+                blankTo(valueAsString(payload.get("detail")), ""),
+                blankTo(valueAsString(payload.get("result")), ""),
+                blankTo(valueAsString(event.get("summary")), ""));
+        return notGenericException(combined);
+    }
+
+    private boolean notGenericException(String text) {
+        String value = blankTo(text, "").trim();
+        if (value.isBlank()) return false;
+        String normalized = value.toLowerCase();
+        return normalized.length() > 8
+                && !List.of("异常", "錯誤", "错误", "error", "exception", "failed", "失败")
+                .contains(normalized);
+    }
+
+    private Map<String, Object> normalizePolicyConfig(Map<String, Object> config) {
+        Map<String, Object> normalized = new LinkedHashMap<>();
+        if (config != null) {
+            normalized.putAll(config);
+        }
+        Map<String, Object> policy = policyFromConfig(normalized);
+        if (!hasHarnessPolicy(policy)) {
+            String surface = blankTo(valueAsString(normalized.get("surface")), "chat");
+            String failureType = blankTo(valueAsString(normalized.get("failureType")), "unknown");
+            List<String> recommendations = stringList(normalized.get("recommendations"));
+            if (recommendations.isEmpty()) {
+                recommendations = suggestRecommendations(surface, failureType);
+            }
+            policy = buildExecutablePolicy(surface, failureType, recommendations);
+        }
+        normalized.put("schemaVersion", "harness.policy.v1");
+        normalized.put("kind", "harness.policy.v1");
+        normalized.put("policy", policy);
+        normalized.putIfAbsent("surface", policy.get("surface"));
+        normalized.putIfAbsent("failureType", policy.get("failureType"));
+        normalized.putIfAbsent("recommendations", mutableMap(policy.get("promptGuidance")).getOrDefault("rules", List.of()));
+        normalized.put("promptGuidance", policy.get("promptGuidance"));
+        normalized.put("agentRuntimePolicy", policy.get("agentRuntimePolicy"));
+        normalized.put("toolPolicyOverrides", policy.get("toolPolicyOverrides"));
+        normalized.put("modelRoutingRules", policy.get("modelRoutingRules"));
+        normalized.put("failureClassifiers", policy.get("failureClassifiers"));
+        normalized.put("rollout", policy.get("rollout"));
+        return normalized;
+    }
+
+    @SuppressWarnings("unchecked")
+    private Map<String, Object> policyFromConfig(Map<String, Object> config) {
+        if (config == null || config.isEmpty()) return new LinkedHashMap<>();
+        Object policy = config.get("policy");
+        if (policy instanceof Map<?, ?> policyMap) {
+            Map<String, Object> normalized = new LinkedHashMap<>();
+            policyMap.forEach((key, value) -> {
+                if (key != null) normalized.put(String.valueOf(key), value);
+            });
+            return normalized;
+        }
+        Map<String, Object> policyLike = new LinkedHashMap<>();
+        for (String key : List.of("schemaVersion", "surface", "failureType", "promptGuidance",
+                "agentRuntimePolicy", "toolPolicyOverrides", "modelRoutingRules", "failureClassifiers", "rollout")) {
+            if (config.containsKey(key)) {
+                policyLike.put(key, config.get(key));
+            }
+        }
+        return policyLike;
+    }
+
+    private boolean hasHarnessPolicy(Map<String, Object> policy) {
+        return policy != null
+                && "harness.policy.v1".equals(String.valueOf(policy.get("schemaVersion")))
+                && policy.get("promptGuidance") instanceof Map<?, ?>
+                && policy.get("agentRuntimePolicy") instanceof Map<?, ?>
+                && policy.get("toolPolicyOverrides") instanceof Map<?, ?>
+                && policy.get("modelRoutingRules") instanceof Map<?, ?>
+                && policy.get("failureClassifiers") instanceof List<?>
+                && policy.get("rollout") instanceof Map<?, ?>;
+    }
+
+    private boolean policyCoversFailure(Map<String, Object> policy, String failureType, String surface) {
+        if (!hasHarnessPolicy(policy)) return false;
+        String normalizedFailure = blankTo(failureType, "unknown").toLowerCase();
+        if (containsToken(String.valueOf(policy.get("failureType")), normalizedFailure)) {
+            return true;
+        }
+        if (containsToken(String.valueOf(policy.get("surface")), surface)) {
+            return true;
+        }
+        for (String rule : stringList(mutableMap(policy.get("promptGuidance")).get("rules"))) {
+            if (containsToken(rule, normalizedFailure) || containsToken(rule, surface)) {
+                return true;
+            }
+        }
+        for (Map<String, Object> classifier : listOfMaps(policy.get("failureClassifiers"))) {
+            String classifierType = String.valueOf(classifier.getOrDefault("failureType", ""));
+            if (containsToken(classifierType, normalizedFailure)) {
+                return true;
+            }
+            for (String match : stringList(classifier.get("match"))) {
+                if (containsToken(normalizedFailure, match) || containsToken(match, normalizedFailure)) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    private boolean hasFailureClassifier(Map<String, Object> policy, String failureType) {
+        if (!hasHarnessPolicy(policy)) return false;
+        String normalizedFailure = blankTo(failureType, "unknown").toLowerCase();
+        for (Map<String, Object> classifier : listOfMaps(policy.get("failureClassifiers"))) {
+            String classifierType = String.valueOf(classifier.getOrDefault("failureType", ""));
+            if (containsToken(classifierType, normalizedFailure) || containsToken(normalizedFailure, classifierType)) {
+                return true;
+            }
+            for (String match : stringList(classifier.get("match"))) {
+                if (containsToken(match, normalizedFailure) || containsToken(normalizedFailure, match)) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    private boolean hasStructuredTraceRule(Map<String, Object> policy) {
+        if (!hasHarnessPolicy(policy)) return false;
+        Map<String, Object> runtime = mutableMap(policy.get("agentRuntimePolicy"));
+        Map<String, Object> toolPolicy = mutableMap(policy.get("toolPolicyOverrides"));
+        return "emit_agent_status".equals(String.valueOf(runtime.get("waitMessageHandling")))
+                && Boolean.TRUE.equals(toolPolicy.get("requireStructuredError"));
+    }
+
+    private Map<String, Object> mutableMap(Object value) {
+        Map<String, Object> result = new LinkedHashMap<>();
+        if (value instanceof Map<?, ?> map) {
+            map.forEach((key, val) -> {
+                if (key != null) result.put(String.valueOf(key), val);
+            });
+        }
+        return result;
     }
 
     private LambdaQueryWrapper<HarnessTrace> traceFilter(String surface) {
@@ -1290,6 +2141,47 @@ public class HarnessEvolutionService {
         } catch (Exception e) {
             return fallback;
         }
+    }
+
+    private Integer valueAsInteger(Object value) {
+        if (value == null) return null;
+        if (value instanceof Number number) return number.intValue();
+        try {
+            return Integer.parseInt(String.valueOf(value));
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    private Long valueAsLong(Object value) {
+        if (value == null) return null;
+        if (value instanceof Number number) return number.longValue();
+        try {
+            return Long.parseLong(String.valueOf(value));
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    private long valueAsLong(Object value, long fallback) {
+        Long parsed = valueAsLong(value);
+        return parsed != null ? parsed : fallback;
+    }
+
+    private double valueAsDouble(Object value, double fallback) {
+        if (value == null) return fallback;
+        if (value instanceof Number number) return number.doubleValue();
+        try {
+            return Double.parseDouble(String.valueOf(value));
+        } catch (Exception e) {
+            return fallback;
+        }
+    }
+
+    private String valueAsString(Object value) {
+        if (value == null) return null;
+        String text = String.valueOf(value);
+        return text.isBlank() ? null : text;
     }
 
     private String defaultRegressionSummary(String status, int total, int passed, int failed, int blocked) {

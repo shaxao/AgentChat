@@ -39,6 +39,36 @@ foreach ($p in @(
 Write-Host "Maven: $MVN_EXE" -ForegroundColor DarkGray
 
 $WORKSPACE = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
+
+function Import-DotEnv {
+    param([string]$Path)
+    if (-not (Test-Path $Path)) { return }
+    Get-Content -Encoding UTF8 $Path | ForEach-Object {
+        $line = $_.Trim()
+        if (-not $line -or $line.StartsWith("#")) { return }
+        if ($line -notmatch '^([A-Za-z_][A-Za-z0-9_]*)=(.*)$') { return }
+        $key = $Matches[1]
+        $value = $Matches[2].Trim()
+        if (($value.StartsWith('"') -and $value.EndsWith('"')) -or ($value.StartsWith("'") -and $value.EndsWith("'"))) {
+            $value = $value.Substring(1, $value.Length - 2)
+        }
+        if ([string]::IsNullOrEmpty([Environment]::GetEnvironmentVariable($key, "Process"))) {
+            [Environment]::SetEnvironmentVariable($key, $value, "Process")
+        }
+    }
+}
+
+function Get-FirstEnv {
+    param([string[]]$Names, [string]$Default)
+    foreach ($name in $Names) {
+        $value = [Environment]::GetEnvironmentVariable($name, "Process")
+        if (-not [string]::IsNullOrWhiteSpace($value)) { return $value }
+    }
+    return $Default
+}
+
+Import-DotEnv (Join-Path $WORKSPACE ".env")
+
 $HOST_A_IP = if ($env:MUHUGO_SERVER_A_IP) { $env:MUHUGO_SERVER_A_IP } else { "your-server-a-ip" }
 $HOST_B_IP = if ($env:MUHUGO_SERVER_B_IP) { $env:MUHUGO_SERVER_B_IP } else { "your-server-b-ip" }
 $HOST_OVERSEAS_IP = if ($env:MUHUGO_OVERSEAS_IP) { $env:MUHUGO_OVERSEAS_IP } else { "" }
@@ -47,13 +77,13 @@ $SSH_OPTS  = @("-o", "StrictHostKeyChecking=accept-new", "-o", "ConnectTimeout=3
 $MUHUGO_FE_DIR   = "/var/www/muhugochat-frontend"
 $AUTOCODE_FE_DIR = "/var/www/autocode-frontend"
 
-$DB_HOST     = if ($env:MUHUGO_DB_HOST) { $env:MUHUGO_DB_HOST } else { "your-server-c-ip" }
-$DB_PORT     = if ($env:MUHUGO_DB_PORT) { $env:MUHUGO_DB_PORT } else { "3306" }
-$DB_USER     = if ($env:MUHUGO_DB_USER) { $env:MUHUGO_DB_USER } else { "muhuoai" }
-$DB_PASS     = if ($env:MUHUGO_DB_PASS) { $env:MUHUGO_DB_PASS } else { "changeme" }
-$DB_NAME     = if ($env:MUHUGO_DB_NAME) { $env:MUHUGO_DB_NAME } else { "MuHuoAi" }
+$DB_HOST     = Get-FirstEnv @("MUHUGO_DB_HOST", "DB_HOST", "MUHUGOCHAT_DB_HOST") "your-server-c-ip"
+$DB_PORT     = Get-FirstEnv @("MUHUGO_DB_PORT", "DB_PORT", "MUHUGOCHAT_DB_PORT", "MYSQL_PORT") "3306"
+$DB_USER     = Get-FirstEnv @("MUHUGO_DB_USER", "DB_USERNAME", "MUHUGOCHAT_DB_USER") "muhuoai"
+$DB_PASS     = Get-FirstEnv @("MUHUGO_DB_PASS", "DB_PASSWORD", "MUHUGOCHAT_DB_PASSWORD") "changeme"
+$DB_NAME     = Get-FirstEnv @("MUHUGO_DB_NAME", "DB_NAME", "MUHUGOCHAT_DB_NAME") "MuHuoAi"
 
-$INTERNAL_API_KEY = if ($env:MUHUGO_INTERNAL_API_KEY) { $env:MUHUGO_INTERNAL_API_KEY } else { "change-me-internal-api-key" }
+$INTERNAL_API_KEY = Get-FirstEnv @("MUHUGO_INTERNAL_API_KEY", "INTERNAL_API_KEY", "MUHUGOCHAT_INTERNAL_API_KEY") "change-me-internal-api-key"
 
 $CACHE_LEDGER_BASE_URL = if ($env:CACHE_LEDGER_BASE_URL) { $env:CACHE_LEDGER_BASE_URL } else { "http://127.0.0.1:8000/api/cache" }
 
@@ -149,6 +179,12 @@ function Build-Frontend {
 
     Set-Location $appDir
     try {
+        if ([string]::IsNullOrWhiteSpace($env:VITE_API_URL)) { $env:VITE_API_URL = "/api" }
+        if ([string]::IsNullOrWhiteSpace($env:VITE_DEMO_MODE)) { $env:VITE_DEMO_MODE = "false" }
+        if ([string]::IsNullOrWhiteSpace($env:VITE_AUTOCODE_API_URL)) { $env:VITE_AUTOCODE_API_URL = "/autocode-api" }
+        if ([string]::IsNullOrWhiteSpace($env:VITE_AUTOCODE_URL)) { $env:VITE_AUTOCODE_URL = "/autocode" }
+        Write-Host "Frontend env: VITE_API_URL=$env:VITE_API_URL, VITE_DEMO_MODE=$env:VITE_DEMO_MODE" -ForegroundColor DarkGray
+
         Write-Host "npm install..." -ForegroundColor Cyan
         npm install --legacy-peer-deps
         if ($LASTEXITCODE -ne 0) { Write-Host "npm install failed" -ForegroundColor Red; return }
@@ -265,7 +301,8 @@ function Upload-AutoCode {
     Write-Host "========================================" -ForegroundColor Green
 
     $backendDir = "$WORKSPACE\agent-platform\backend"
-    $connectorInstaller = Get-ChildItem "$WORKSPACE\agent-platform\local-connector\src-tauri\target\release\bundle\nsis\AutoCode Local Connector_*_x64-setup.exe" -ErrorAction SilentlyContinue |
+    $connectorInstaller = Get-ChildItem "$WORKSPACE\agent-platform\local-connector\src-tauri\target\release\bundle\nsis\*_x64-setup.exe" -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -like "AutoCode IDE_*" -or $_.Name -like "AutoCode Local Connector_*" } |
         Sort-Object LastWriteTime -Descending |
         Select-Object -First 1
     $connectorExeFallback = "$WORKSPACE\agent-platform\local-connector\windows\AutoCodeLocalConnectorSetup.exe"
@@ -296,7 +333,48 @@ function Upload-AutoCode {
     if ($LASTEXITCODE -ne 0) { Write-Host "scp failed" -ForegroundColor Red; return }
 
     Write-Host "Extracting and restarting..." -ForegroundColor Cyan
-    SSH-B "cd /opt/autocode; tar -xzf autocode-backend.tar.gz; if [ ! -f .env ] || ! grep -q 'WORKSPACE_BASE_DIR=/data/autocode-workspaces' .env; then sed -i 's|^WORKSPACE_BASE_DIR=.*|WORKSPACE_BASE_DIR=/data/autocode-workspaces|' .env || echo 'WORKSPACE_BASE_DIR=/data/autocode-workspaces' >> .env; fi; bash start.sh; for i in 1 2 3 4 5 6 7 8 9 10; do ss -lntp | grep -q ':8000\b' && exit 0; sleep 2; done; echo 'ERROR: AutoCode did not listen on 8000 after restart' >&2; journalctl -u autocode --no-pager -n 80 >&2; tail -n 120 /var/log/autocode/app.log >&2 2>/dev/null || true; tail -n 80 /var/log/autocode/error.log >&2 2>/dev/null || true; exit 1"
+    $remote = @'
+set -e
+cd /opt/autocode
+tar -xzf autocode-backend.tar.gz
+if [ ! -f .env ] || ! grep -q 'WORKSPACE_BASE_DIR=/data/autocode-workspaces' .env; then
+  sed -i 's|^WORKSPACE_BASE_DIR=.*|WORKSPACE_BASE_DIR=/data/autocode-workspaces|' .env || echo 'WORKSPACE_BASE_DIR=/data/autocode-workspaces' >> .env
+fi
+
+echo '[lsp] Checking language server runtimes...'
+if command -v npm >/dev/null 2>&1; then
+  if ! command -v pyright-langserver >/dev/null 2>&1 || ! command -v typescript-language-server >/dev/null 2>&1; then
+    npm config set registry https://registry.npmmirror.com >/dev/null 2>&1 || true
+    npm install -g pyright typescript typescript-language-server || echo 'WARN: failed to install Pyright/TypeScript language servers'
+  fi
+else
+  echo 'WARN: npm not found; Python/TypeScript LSP will be unavailable until nodejs/npm are installed'
+fi
+
+if ! command -v gopls >/dev/null 2>&1; then
+  if command -v go >/dev/null 2>&1; then
+    GOPROXY=https://goproxy.cn,direct go install golang.org/x/tools/gopls@latest || echo 'WARN: failed to install gopls'
+  else
+    echo 'WARN: go not found; Go LSP will be unavailable until Go and gopls are installed'
+  fi
+fi
+
+pyright-langserver --version 2>/dev/null || true
+typescript-language-server --version 2>/dev/null || true
+gopls version 2>/dev/null || true
+
+bash start.sh
+for i in 1 2 3 4 5 6 7 8 9 10; do
+  ss -lntp | grep -q ':8000\b' && exit 0
+  sleep 2
+done
+echo 'ERROR: AutoCode did not listen on 8000 after restart' >&2
+journalctl -u autocode --no-pager -n 80 >&2
+tail -n 120 /var/log/autocode/app.log >&2 2>/dev/null || true
+tail -n 80 /var/log/autocode/error.log >&2 2>/dev/null || true
+exit 1
+'@
+    SSH-B $remote
     if ($LASTEXITCODE -ne 0) {
         Write-Host "remote extract/restart failed" -ForegroundColor Red
         Write-Host "Recent AutoCode logs:" -ForegroundColor Yellow
@@ -573,7 +651,7 @@ function Build-Backend {
     Set-Location $backendDir
     try {
         Write-Host "Maven clean package (skip tests)..." -ForegroundColor Cyan
-        & $MVN_EXE clean package -DskipTests -q
+        & $MVN_EXE clean package "-Dmaven.test.skip=true" -q
         if ($LASTEXITCODE -ne 0) {
             Write-Host "Maven build failed (exit code: $LASTEXITCODE)" -ForegroundColor Red
             return
@@ -1470,17 +1548,58 @@ server {
         add_header Cache-Control "no-cache, no-store, must-revalidate";
     }
 
+    location = /downloads/autocode/latest.json {
+        root /var/www/muhugochat-frontend;
+        default_type application/json;
+        try_files `$uri =404;
+        add_header Cache-Control "no-cache, no-store, must-revalidate";
+        add_header Pragma "no-cache";
+        add_header Expires "0";
+        add_header Access-Control-Allow-Origin "*" always;
+    }
+
+    location = /downloads/autocode/AutoCode-IDE-latest-x64-setup.exe {
+        root /var/www/muhugochat-frontend;
+        default_type application/octet-stream;
+        try_files `$uri =404;
+        add_header Cache-Control "no-cache, no-store, must-revalidate";
+        add_header Pragma "no-cache";
+        add_header Expires "0";
+        add_header Access-Control-Allow-Origin "*" always;
+    }
+
+    location = /downloads/autocode/AutoCode-IDE-latest-x64-setup.exe.sig {
+        root /var/www/muhugochat-frontend;
+        default_type application/octet-stream;
+        try_files `$uri =404;
+        add_header Cache-Control "no-cache, no-store, must-revalidate";
+        add_header Pragma "no-cache";
+        add_header Expires "0";
+        add_header Access-Control-Allow-Origin "*" always;
+    }
+
+    location ^~ /downloads/autocode/ {
+        root /var/www/muhugochat-frontend;
+        default_type application/octet-stream;
+        try_files `$uri =404;
+        add_header Cache-Control "public, max-age=31536000, immutable";
+        add_header Access-Control-Allow-Origin "*" always;
+    }
+
     location ^~ /v1/ {
         proxy_pass http://127.0.0.1:8080/v1/;
+        proxy_http_version 1.1;
         proxy_set_header Host `$host;
         proxy_set_header X-Real-IP `$remote_addr;
         proxy_set_header X-Forwarded-For `$proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto `$scheme;
+        proxy_set_header Connection "";
         proxy_connect_timeout 60s;
-        proxy_read_timeout 300s;
+        proxy_read_timeout 600s;
         proxy_send_timeout 900s;
         proxy_buffering off;
         proxy_cache off;
+        add_header X-Accel-Buffering "no" always;
     }
 
     location / {
@@ -2012,7 +2131,17 @@ print(f"channels_count={data_len(sys.argv[2], 'channels')}")
 PY
 if [ "${AUTOCODE_LLM_VIA_MUHUGOCHAT:-}" = "true" ]; then
   echo "probe: $url/internal/chat/completions"
-  chat_body='{"model":"deepseek-v4-flash","system":"你是内部连通性测试助手，只需要简短回复。","messages":[{"role":"user","content":"请回复 OK"}],"temperature":0,"maxTokens":64}'
+  chat_body="$(python3 - <<'PY'
+import json
+print(json.dumps({
+    "model": "deepseek-v4-flash",
+    "system": "Internal connectivity probe. Reply briefly.",
+    "messages": [{"role": "user", "content": "Reply OK"}],
+    "temperature": 0,
+    "maxTokens": 512,
+}, separators=(",", ":")))
+PY
+)"
   chat_resp="$(curl -sS --fail --max-time 30 -H "Content-Type: application/json" -H "X-Internal-Api-Key: $key" -d "$chat_body" "$url/internal/chat/completions")"
   printf '%s' "$chat_resp" | head -c 500
   echo
@@ -2039,6 +2168,210 @@ fi
     Write-Host "Bridge check completed" -ForegroundColor Green
 }
 
+function Get-AutoCode-Public-Origin {
+    $origin = Get-FirstEnv @("AUTOCODE_PUBLIC_ORIGIN", "MUHUO_PUBLIC_ORIGIN", "PUBLIC_ORIGIN") "https://muhuo.site"
+    return $origin.TrimEnd("/")
+}
+
+function Ensure-AutoCode-Signing-Key {
+    $keyPath = Get-FirstEnv @("AUTOCODE_SIGNING_PRIVATE_KEY_PATH", "TAURI_SIGNING_PRIVATE_KEY_PATH") (Join-Path $env:USERPROFILE ".tauri\autocode.key")
+    $passPath = Get-FirstEnv @("AUTOCODE_SIGNING_PRIVATE_KEY_PASSWORD_FILE") (Join-Path $env:USERPROFILE ".tauri\autocode.key.password")
+    $keyDir = Split-Path $keyPath
+    if (-not (Test-Path $keyDir)) { New-Item -ItemType Directory -Force -Path $keyDir | Out-Null }
+
+    if (-not (Test-Path $passPath)) {
+        $bytes = New-Object byte[] 32
+        $rng = New-Object System.Security.Cryptography.RNGCryptoServiceProvider
+        try { $rng.GetBytes($bytes) } finally { $rng.Dispose() }
+        [Convert]::ToBase64String($bytes) | Set-Content -Encoding UTF8 -NoNewline $passPath
+    }
+    $password = (Get-Content -Raw -Encoding UTF8 $passPath).Trim()
+
+    if (-not (Test-Path $keyPath)) {
+        Write-Host "Generating Tauri updater signing key: $keyPath" -ForegroundColor Cyan
+        Push-Location "$WORKSPACE\agent-platform\local-connector"
+        try {
+            npm.cmd run tauri signer generate -- --ci -p $password -w $keyPath
+            if ($LASTEXITCODE -ne 0) { throw "tauri signer generate failed" }
+        } finally { Pop-Location }
+    }
+
+    $pubPath = "$keyPath.pub"
+    if (-not (Test-Path $pubPath)) {
+        throw "Public key not found: $pubPath"
+    }
+    return @{
+        PrivateKeyPath = $keyPath
+        Password = $password
+        PublicKey = (Get-Content -Raw -Encoding UTF8 $pubPath).Trim()
+    }
+}
+
+function Sync-AutoCode-Updater-Config {
+    param([string]$PublicKey)
+    $confPath = "$WORKSPACE\agent-platform\local-connector\src-tauri\tauri.conf.json"
+    $endpoint = "$(Get-AutoCode-Public-Origin)/downloads/autocode/latest.json"
+    $raw = Get-Content -Raw -Encoding UTF8 $confPath
+    $escapedEndpoint = [System.Text.RegularExpressions.Regex]::Escape($endpoint)
+    $escapedPublicKey = $PublicKey.Replace("\", "\\").Replace('"', '\"')
+    $raw = [System.Text.RegularExpressions.Regex]::Replace(
+        $raw,
+        '"endpoints"\s*:\s*\[[\s\S]*?\]',
+        '"endpoints": [' + "`n        `"$endpoint`"" + "`n      ]",
+        1
+    )
+    $raw = [System.Text.RegularExpressions.Regex]::Replace(
+        $raw,
+        '"pubkey"\s*:\s*".*?"',
+        '"pubkey": "' + $escapedPublicKey + '"',
+        1
+    )
+    $null = $raw | ConvertFrom-Json
+    [System.IO.File]::WriteAllText($confPath, $raw.TrimEnd() + "`n", $Utf8NoBom)
+    Write-Host "Updater endpoint: $endpoint" -ForegroundColor DarkGray
+}
+
+function Build-AutoCode-Desktop {
+    Write-Host "========================================" -ForegroundColor Green
+    Write-Host "  Building AutoCode Desktop Installer"   -ForegroundColor Green
+    Write-Host "========================================" -ForegroundColor Green
+
+    $signing = Ensure-AutoCode-Signing-Key
+    Sync-AutoCode-Updater-Config $signing.PublicKey
+
+    $connectorDir = "$WORKSPACE\agent-platform\local-connector"
+    Push-Location $connectorDir
+    try {
+        npm.cmd install
+        if ($LASTEXITCODE -ne 0) { throw "npm install failed" }
+        $env:TAURI_SIGNING_PRIVATE_KEY = (Get-Content -Raw -Encoding UTF8 $signing.PrivateKeyPath).Trim()
+        $env:TAURI_SIGNING_PRIVATE_KEY_PATH = $signing.PrivateKeyPath
+        $env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD = $signing.Password
+        npm.cmd run build
+        if ($LASTEXITCODE -ne 0) { throw "tauri build failed" }
+    } finally {
+        Pop-Location
+    }
+
+    Write-Host "Desktop build OK" -ForegroundColor Green
+}
+
+function New-AutoCode-Desktop-Release {
+    $connectorDir = "$WORKSPACE\agent-platform\local-connector"
+    $conf = Get-Content -Raw -Encoding UTF8 "$connectorDir\src-tauri\tauri.conf.json" | ConvertFrom-Json
+    $version = [string]$conf.version
+    $origin = Get-AutoCode-Public-Origin
+    $bundleDir = "$connectorDir\src-tauri\target\release\bundle\nsis"
+    if (-not (Test-Path $bundleDir)) { throw "NSIS bundle dir not found: $bundleDir" }
+
+    $setupExe = Get-ChildItem $bundleDir -Filter "*_x64-setup.exe" -File | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+    $updateZip = Get-ChildItem $bundleDir -Filter "*.nsis.zip" -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+    $zipSignature = Get-ChildItem $bundleDir -Filter "*.nsis.zip.sig" -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+    $exeSignature = Get-ChildItem $bundleDir -Filter "*_x64-setup.exe.sig" -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+    if (-not $setupExe) { throw "Setup exe not found under $bundleDir" }
+
+    $stageDir = "$WORKSPACE\deploy\release\autocode-desktop"
+    if (Test-Path $stageDir) { Remove-Item -LiteralPath $stageDir -Recurse -Force }
+    New-Item -ItemType Directory -Force -Path $stageDir | Out-Null
+
+    $setupName = "AutoCode-IDE-$version-x64-setup.exe"
+    Copy-Item -Force $setupExe.FullName (Join-Path $stageDir $setupName)
+    Copy-Item -Force $setupExe.FullName (Join-Path $stageDir "AutoCode-IDE-latest-x64-setup.exe")
+
+    if ($updateZip -and $zipSignature) {
+        $updateName = "AutoCode-IDE-$version-x64-setup.nsis.zip"
+        $signatureFile = $zipSignature.FullName
+        Copy-Item -Force $updateZip.FullName (Join-Path $stageDir $updateName)
+        Copy-Item -Force $zipSignature.FullName (Join-Path $stageDir "$updateName.sig")
+    } elseif ($exeSignature) {
+        $updateName = $setupName
+        $signatureFile = $exeSignature.FullName
+        Copy-Item -Force $exeSignature.FullName (Join-Path $stageDir "$setupName.sig")
+        Copy-Item -Force $exeSignature.FullName (Join-Path $stageDir "AutoCode-IDE-latest-x64-setup.exe.sig")
+    } else {
+        throw "Updater signature not found under $bundleDir"
+    }
+
+    $notes = Get-FirstEnv @("AUTOCODE_RELEASE_NOTES") "AutoCode IDE $version release."
+    $manifest = [ordered]@{
+        version = $version
+        notes = $notes
+        pub_date = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+        platforms = [ordered]@{
+            "windows-x86_64" = [ordered]@{
+                signature = (Get-Content -Raw -Encoding UTF8 $signatureFile).Trim()
+                url = "$origin/downloads/autocode/$updateName"
+            }
+        }
+    }
+    [System.IO.File]::WriteAllText((Join-Path $stageDir "latest.json"), ($manifest | ConvertTo-Json -Depth 10), $Utf8NoBom)
+
+    Write-Host "Release staged: $stageDir" -ForegroundColor Green
+    Write-Host "Installer URL: $origin/downloads/autocode/AutoCode-IDE-latest-x64-setup.exe" -ForegroundColor Cyan
+    Write-Host "Updater JSON:  $origin/downloads/autocode/latest.json" -ForegroundColor Cyan
+    return $stageDir
+}
+
+function Upload-AutoCode-Desktop {
+    Write-Host "========================================" -ForegroundColor Green
+    Write-Host "  Uploading AutoCode Desktop Release"    -ForegroundColor Green
+    Write-Host "========================================" -ForegroundColor Green
+
+    $stageDir = "$WORKSPACE\deploy\release\autocode-desktop"
+    if (-not (Test-Path $stageDir)) { $stageDir = New-AutoCode-Desktop-Release }
+
+    $tarFile = "$env:TEMP\autocode-desktop-release.tar.gz"
+    & $TAR -czf $tarFile -C $stageDir .
+    if ($LASTEXITCODE -ne 0) { Write-Host "tar failed" -ForegroundColor Red; return }
+
+    SCP-To-A $tarFile "/tmp/autocode-desktop-release.tar.gz"
+    if ($LASTEXITCODE -ne 0) { Write-Host "scp failed" -ForegroundColor Red; return }
+
+    $remote = @'
+set -e
+release_dir="/var/www/muhugochat-frontend/downloads/autocode"
+mkdir -p "$release_dir"
+tar -xzf /tmp/autocode-desktop-release.tar.gz -C "$release_dir"
+rm -f /tmp/autocode-desktop-release.tar.gz
+chmod -R a+rX "$release_dir"
+nginx -s reload 2>/dev/null || systemctl reload nginx || true
+ls -lh "$release_dir"
+'@
+    SSH-A $remote
+    if ($LASTEXITCODE -ne 0) { Write-Host "remote desktop release upload failed" -ForegroundColor Red; return }
+
+    $latestInstaller = Join-Path $stageDir "AutoCode-IDE-latest-x64-setup.exe"
+    if (Test-Path $latestInstaller) {
+        Write-Host "Syncing connector installer to AutoCode backend download endpoint..." -ForegroundColor Cyan
+        SCP-To-B $latestInstaller "/tmp/AutoCodeLocalConnectorSetup.exe"
+        if ($LASTEXITCODE -ne 0) { Write-Host "backend connector installer upload failed" -ForegroundColor Red; return }
+        $backendConnectorRemote = @'
+set -e
+target_dir="/opt/autocode/static/local-connector"
+mkdir -p "$target_dir"
+mv /tmp/AutoCodeLocalConnectorSetup.exe "$target_dir/AutoCodeLocalConnectorSetup.exe"
+chmod a+r "$target_dir/AutoCodeLocalConnectorSetup.exe"
+ls -lh "$target_dir/AutoCodeLocalConnectorSetup.exe"
+'@
+        SSH-B $backendConnectorRemote
+        if ($LASTEXITCODE -ne 0) { Write-Host "backend connector installer sync failed" -ForegroundColor Red; return }
+    } else {
+        Write-Host "WARN: latest installer not found in release stage; backend connector endpoint was not updated." -ForegroundColor Yellow
+    }
+
+    $origin = Get-AutoCode-Public-Origin
+    Write-Host "Desktop release deployed OK" -ForegroundColor Green
+    Write-Host "Download: $origin/downloads/autocode/AutoCode-IDE-latest-x64-setup.exe" -ForegroundColor Cyan
+    Write-Host "Updater:  $origin/downloads/autocode/latest.json" -ForegroundColor Cyan
+}
+
+function Publish-AutoCode-Desktop {
+    Build-AutoCode-Desktop
+    if ($LASTEXITCODE -ne 0) { return }
+    New-AutoCode-Desktop-Release | Out-Null
+    Upload-AutoCode-Desktop
+}
+
 $cmd = $args[0]
 
 switch ($cmd) {
@@ -2061,6 +2394,9 @@ switch ($cmd) {
     "build-autocode-frontend"      { Build-AutoCode-Frontend }
     "upload-autocode-frontend"     { Upload-AutoCode-Frontend }
     "upload-autocode-frontend-b"   { Upload-AutoCode-Frontend-B }
+    "build-autocode-desktop"       { Build-AutoCode-Desktop; New-AutoCode-Desktop-Release | Out-Null }
+    "upload-autocode-desktop"      { Upload-AutoCode-Desktop }
+    "publish-autocode-desktop"     { Publish-AutoCode-Desktop }
     "reload-nginx"                 { Reload-Nginx }
     "reload-nginx-b"               { Reload-Nginx-B }
     "migrate-db"                   { Migrate-DB $args[1] }
@@ -2089,6 +2425,9 @@ switch ($cmd) {
         Write-Host "  build-autocode-frontend     Build AutoCode frontend"
         Write-Host "  upload-autocode-frontend    Upload AutoCode frontend to Server A ($HOST_A_IP)"
         Write-Host "  upload-autocode-frontend-b  Upload AutoCode frontend to Server B ($HOST_B_IP)"
+        Write-Host "  build-autocode-desktop      Build signed AutoCode IDE installer and latest.json"
+        Write-Host "  upload-autocode-desktop     Upload staged desktop release to /downloads/autocode"
+        Write-Host "  publish-autocode-desktop    Build, sign, stage, and upload AutoCode IDE release"
         Write-Host ""
         Write-Host "Maintenance:" -ForegroundColor Yellow
         Write-Host "  migrate-db <sql_file>       Run SQL migration on Server C MySQL (${DB_HOST}:${DB_PORT})"
@@ -2112,6 +2451,7 @@ switch ($cmd) {
         Write-Host "  5) .\deploy.ps1 build-frontend; .\deploy.ps1 build-docs; .\deploy.ps1 upload-frontendonly"
         Write-Host "  6) .\deploy.ps1 build-autocode-frontend; .\deploy.ps1 upload-autocode-frontend"
         Write-Host "  7) .\deploy.ps1 upload-autocode"
-        Write-Host "  8) .\deploy.ps1 repair-single-server-b"
+        Write-Host "  8) .\deploy.ps1 publish-autocode-desktop"
+        Write-Host "  9) .\deploy.ps1 repair-single-server-b"
     }
 }

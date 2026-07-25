@@ -1664,6 +1664,39 @@ export const MessageBubble = memo(function MessageBubble({ message, isRecent, re
         )}
 
         {/* Skill 工具调用展示 */}
+        {!isUser && (message.agentStatus || (message.agentWarnings && message.agentWarnings.length > 0)) && (
+          <div className="mb-2 space-y-1.5 rounded-md border border-border/60 bg-background/70 px-2.5 py-2 text-xs">
+            {message.agentStatus && (
+              <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-muted-foreground">
+                {message.agentStatus.status === 'completed' ? (
+                  <CheckCircle2 className="h-3.5 w-3.5 text-emerald-500" />
+                ) : message.agentStatus.status?.includes('error') ? (
+                  <AlertCircle className="h-3.5 w-3.5 text-amber-500" />
+                ) : (
+                  <Loader2 className="h-3.5 w-3.5 animate-spin text-primary" />
+                )}
+                <span className="font-medium text-foreground">
+                  {message.agentStatus.message || message.agentStatus.status}
+                </span>
+                {message.agentStatus.model && (
+                  <span className="rounded bg-muted px-1.5 py-0.5">{message.agentStatus.model}</span>
+                )}
+                {message.agentStatus.harnessVersion && (
+                  <span className="rounded bg-muted px-1.5 py-0.5">{message.agentStatus.harnessVersion}</span>
+                )}
+              </div>
+            )}
+            {message.agentWarnings?.slice(-2).map((warning, index) => (
+              <div key={`${warning.code}-${index}`} className="flex items-start gap-1.5 text-amber-600 dark:text-amber-400">
+                <AlertCircle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+                <span className="min-w-0 break-words">
+                  {warning.code ? `${warning.code}: ` : ''}{warning.message}
+                </span>
+              </div>
+            ))}
+          </div>
+        )}
+
         {message.toolCalls && message.toolCalls.length > 0 && (
           <div className="space-y-1.5 mb-2">
             {message.toolCalls.map(tc => {
@@ -1949,6 +1982,11 @@ export const MessageBubble = memo(function MessageBubble({ message, isRecent, re
   if (p.search?.query !== n.search?.query) return false
   if ((p.search?.documents?.length || 0) !== (n.search?.documents?.length || 0)) return false
   if (p.search?.errorMessage !== n.search?.errorMessage) return false
+  if (p.agentStatus?.status !== n.agentStatus?.status) return false
+  if (p.agentStatus?.message !== n.agentStatus?.message) return false
+  if (p.agentStatus?.model !== n.agentStatus?.model) return false
+  if (p.agentStatus?.harnessVersion !== n.agentStatus?.harnessVersion) return false
+  if ((p.agentWarnings?.length || 0) !== (n.agentWarnings?.length || 0)) return false
   // 文件附件变化
   if ((p.files?.length || 0) !== (n.files?.length || 0)) return false
   // 流式内容变化（streamingBuffers local state 驱动的实时更新）

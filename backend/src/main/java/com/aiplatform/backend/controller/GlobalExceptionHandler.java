@@ -37,6 +37,10 @@ public class GlobalExceptionHandler {
     @ExceptionHandler(RuntimeException.class)
     public Result<Void> handleRuntime(RuntimeException ex) {
         String message = ex.getMessage();
+        if (isSchemaMismatch(ex)) {
+            log.error("[GlobalException] 数据库结构版本不匹配: {}", message, ex);
+            return Result.fail(503, "数据库结构尚未完成升级，请执行 migrate_harness_evolution_runtime.sql 后重试");
+        }
         if (isInternalErrorMessage(message)) {
             log.error("[GlobalException] 内部运行异常: {}", message, ex);
             return Result.fail(500, "请求处理失败，请稍后重试或联系管理员");
@@ -68,6 +72,21 @@ public class GlobalExceptionHandler {
         return "数据不符合唯一性或完整性要求，请检查后重试";
     }
 
+    private boolean isSchemaMismatch(Throwable error) {
+        Throwable current = error;
+        int depth = 0;
+        while (current != null && depth++ < 8) {
+            String message = current.getMessage();
+            String normalized = message != null ? message.toLowerCase() : "";
+            if (normalized.contains("unknown column")
+                    || normalized.contains("table") && normalized.contains("doesn't exist")
+                    || normalized.contains("table") && normalized.contains("does not exist")) {
+                return true;
+            }
+            current = current.getCause();
+        }
+        return false;
+    }
     private boolean isInternalErrorMessage(String message) {
         if (message == null) {
             return false;

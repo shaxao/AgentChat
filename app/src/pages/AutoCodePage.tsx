@@ -1,4 +1,4 @@
-﻿import { useState, useRef, useEffect, useCallback, useMemo } from 'react'
+﻿import { useState, useRef, useEffect, useCallback, useMemo, lazy, Suspense } from 'react'
 import { marked } from 'marked'
 import { toast } from 'sonner'
 import { useAuthStore, useChatStore, type FileAttachment } from '@/store'
@@ -23,8 +23,10 @@ import {
   Image as ImageIcon, Paperclip, RotateCw, GitBranchPlus, Cpu, FileText,
   FilePen, TerminalSquare, FileSearch, GitCommitHorizontal, MessageCircleQuestion,
   CircleCheck, Hammer, MonitorPlay, CircleDot, Search, Package, ListOrdered, ListChecks, Layers, ArrowRight, CheckCircle2, Clock, AlertCircle, SkipForward, Activity,
+  Undo2,
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
+import { monacoLanguageForPath } from '@/lib/monaco-lang'
 import { useAvailableModels } from '@/hooks/useAvailableModels'
 import { Textarea } from '@/components/ui/textarea'
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from '@/components/ui/dialog'
@@ -33,13 +35,14 @@ import NewTaskDialog, { type NewTaskParams } from '@/components/autocode/NewTask
 import {
   createAutoCodeTask, getAutoCodeTask, getAutoCodeTaskStatus, getAutoCodeTaskEvents, resolveAutoCodeApproval, listAutoCodeTasks, deleteAutoCodeTask, renameAutoCodeTask, enableAutoCodeTaskPlanning, retryAutoCodeTask, stopAutoCodeTask, updateAutoCodeToolPolicy,
   setAutoCodeLocalRunnerMode, getAutoCodeLocalRunnerStatus, syncAutoCodeLocalRunnerSnapshot, getAutoCodeLocalRunnerDownloadUrl, createAutoCodeLocalRunnerSession, getAutoCodeLocalRunnerSessionStatus,
-  registerLocalRunnerTask, listAutoCodeLocalProjectGrants,
+  registerLocalRunnerTask, autoImportLocalConnectorProject, listAutoCodeLocalProjectGrants,
   cloneProject, uploadProject, getProject, registerImportedProjectTask, generatePrototype, confirmPlan, confirmPrototype,
+  confirmReview,
   listPrototypeRecords, getPrototypeRecord, updatePrototypeRecord, activatePrototypeRecord,
   listAutoCodeWorkspaceFiles, readAutoCodeWorkspaceFile, saveAutoCodeWorkspaceFile, runAutoCodeWorkspaceFile,
   listAutoCodeCommands, runAutoCodeCommand, runAutoCodePipeline,
   getAutoCodeGitStatus, getAutoCodeGitLog, getAutoCodeGitDiff, getAutoCodeWorkingDiff,
-  getAutoCodeQueueStatus, listAutoCodeTools,
+  getAutoCodeQueueStatus, listAutoCodeTools, undoAutoCodeCodeEditor,
   type AutoCodeReviewIssue, type AutoCodeReviewResult, type PrototypeRecord,
   type AutoCodeWorkspaceFile, type AutoCodeGitStatus, type AutoCodeGitCommit, type AutoCodeCommandRecord,
   type AutoCodePipelineRun, type AutoCodeRuntimeEvent, type AutoCodeQueueStatus, type AutoCodeToolPolicy, type AutoCodeLocalRunnerStatus, type AutoCodeLocalProjectGrant,
@@ -47,6 +50,8 @@ import {
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import PrototypeEditor, { type ExcalidrawElement as PrototypeEditorElement } from '@/components/autocode/PrototypeEditor'
+// Monaco 编辑器懒加载 → 独立 chunk，不拖慢主包
+const MonacoEditor = lazy(() => import('@/components/autocode/MonacoEditor'))
 
 // ──────────────────────────────────────────
 // AutoCode 认证辅助（read from localStorage）
@@ -69,8 +74,8 @@ function getAcAuthHeaders(): Record<string, string> {
 // 类型定义
 // ──────────────────────────────────────────
 
-type TaskStatus = 'pending' | 'running' | 'waiting_confirm' | 'waiting_plan_confirm' | 'waiting_prototype_confirm' | 'waiting_review_confirm' | 'reviewing' | 'completed' | 'failed' | 'stopped'
-type WorkspaceTab = 'preview' | 'files' | 'workfiles' | 'terminal' | 'git' | 'prototype' | 'plan' | 'review' | 'events'
+type TaskStatus = 'pending' | 'running' | 'waiting_confirm' | 'waiting_user_input' | 'waiting_plan_confirm' | 'waiting_prototype_confirm' | 'waiting_review_confirm' | 'reviewing' | 'completed' | 'failed' | 'stopped'
+type WorkspaceTab = 'preview' | 'files' | 'editor' | 'workfiles' | 'terminal' | 'git' | 'prototype' | 'plan' | 'review' | 'events'
 
 const TOOL_POLICY_OPTIONS: Array<{ value: AutoCodeToolPolicy; label: string; description: string }> = [
   { value: 'ask', label: '请求批准', description: '所有写入、命令和高风险动作都先询问。' },
@@ -191,6 +196,60 @@ function pendingConfirmationToEvent(task: AutoCodeTask): AutoCodeRuntimeEvent | 
   }
 }
 
+interface PendingUserInputOption {
+  label: string
+  message: string
+}
+
+interface PendingUserInputView {
+  question: string
+  fullText: string
+  options: PendingUserInputOption[]
+  allowFreeText: boolean
+  defaultAction: string
+  intervention?: Record<string, unknown> | null
+}
+
+function getPendingUserInput(task: AutoCodeTask): PendingUserInputView | null {
+  if (task.status !== 'waiting_user_input') return null
+  const pending = task.pendingUserInput
+  if (!pending || typeof pending !== 'object') return null
+
+  const options = Array.isArray(pending.options)
+    ? pending.options
+        .map((item): PendingUserInputOption | null => {
+          if (!item || typeof item !== 'object') return null
+          const option = item as Record<string, unknown>
+          const label = toDisplayText(option.label)
+          const message = toDisplayText(option.message || option.value, label)
+          return label && message ? { label, message } : null
+        })
+        .filter((item): item is PendingUserInputOption => Boolean(item))
+    : []
+
+  const intervention = (pending.intervention && typeof pending.intervention === 'object'
+    ? pending.intervention
+    : null) as Record<string, unknown> | null
+  const fullText = toDisplayText(
+    intervention?.full_text || pending.full_text || pending.question || pending.message || task.currentStep,
+    'Agent 需要你补充一个信息后继续。',
+  )
+  return {
+    question: toDisplayText(intervention?.question || pending.question || pending.message || task.currentStep, fullText),
+    fullText,
+    options,
+    allowFreeText: pending.allow_free_text !== false,
+    defaultAction: toDisplayText(intervention?.default_action || pending.default_action || options[0]?.message),
+    intervention,
+  }
+}
+
+function pendingUserInputFromRuntimeEvent(event: AutoCodeRuntimeEvent): Record<string, unknown> | null {
+  if (event.type !== 'user_input_requested') return null
+  const payload = event.payload && typeof event.payload === 'object' ? event.payload : {}
+  return { ...payload, event_id: event.id }
+}
+
 interface ChatMsg {
   id: string
   role: 'user' | 'assistant' | 'system'
@@ -200,6 +259,9 @@ interface ChatMsg {
   toolName?: string  // for system messages: which tool was executed
   toolDescription?: string  // for system messages: human-readable description
   toolResult?: string  // for system messages: tool result summary
+  editPath?: string  // code_editor：被编辑的文件路径
+  editDiff?: string  // code_editor：本次编辑的 unified diff
+  editCommand?: string  // code_editor：view/create/str_replace/insert/undo_edit
 }
 
 interface SubTask {
@@ -259,10 +321,14 @@ interface AutoCodeTask {
   progress: number
   currentStep: string
   workspaceId?: string
+  executionTarget?: 'cloud_workspace' | 'local_ide' | string
   previewUrl?: string
   model?: string
   toolPolicy?: AutoCodeToolPolicy
   pendingConfirmation?: Record<string, unknown> | null
+  pendingUserInput?: Record<string, unknown> | null
+  autonomyMode?: string
+  completionReport?: Record<string, unknown> | null
   localExecutionEnabled?: boolean
   localRunner?: AutoCodeLocalRunnerStatus
   localImportMode?: boolean
@@ -289,6 +355,8 @@ interface AutoCodeTask {
   complexity?: string
   recommendedFlow?: string
   prototypeRequired?: boolean
+  activeExecutionPlan?: Record<string, unknown>
+  taskCapabilityProfile?: Record<string, unknown>
   pipelineStatus?: string
   previewStatus?: string
   previewError?: string
@@ -325,27 +393,19 @@ const TYPE_COLOR: Record<string, string> = {
   tool: 'text-orange-500',
 }
 
-function getAgentTypesForProject(projectType: string): string[] {
-  switch (projectType) {
-    case 'api':
-    case 'tool':
-      return ['backend']
-    case 'miniapp':
-      return ['frontend']
-    case 'website':
-    default:
-      return ['frontend', 'backend']
-  }
+function getAgentTypesForProject(_projectType: string): string[] {
+  return ['general']
 }
 
 const STATUS_CONFIG: Record<TaskStatus, { label: string; color: string; dot: string }> = {
   pending:   { label: '等待中', color: 'text-muted-foreground', dot: 'bg-muted-foreground' },
   running:   { label: '开发中', color: 'text-blue-500', dot: 'bg-blue-500 animate-pulse' },
   waiting_confirm: { label: '待确认操作', color: 'text-amber-500', dot: 'bg-amber-500 animate-pulse' },
+  waiting_user_input: { label: '等待你的回复', color: 'text-amber-500', dot: 'bg-amber-500 animate-pulse' },
   waiting_plan_confirm: { label: '待确认计划', color: 'text-amber-500', dot: 'bg-amber-500 animate-pulse' },
   waiting_prototype_confirm: { label: '待确认原型', color: 'text-violet-500', dot: 'bg-violet-500 animate-pulse' },
   waiting_review_confirm: { label: '待确认审查', color: 'text-purple-500', dot: 'bg-purple-500 animate-pulse' },
-  reviewing: { label: '代码审查', color: 'text-purple-500', dot: 'bg-purple-500 animate-pulse' },
+  reviewing: { label: '产物审查', color: 'text-purple-500', dot: 'bg-purple-500 animate-pulse' },
   completed: { label: '已完成', color: 'text-green-500', dot: 'bg-green-500' },
   failed:    { label: '失败', color: 'text-destructive', dot: 'bg-destructive' },
   stopped:   { label: '已停止', color: 'text-orange-500', dot: 'bg-orange-500' },
@@ -359,6 +419,7 @@ function mapBackendStatus(status: string): TaskStatus {
     case 'waiting_prototype_confirm': return 'waiting_prototype_confirm'
     case 'waiting_review_confirm': return 'waiting_review_confirm'
     case 'waiting_confirm': return 'waiting_confirm'
+    case 'waiting_user_input': return 'waiting_user_input'
     case 'reviewing': return 'reviewing'
     default: return (status as TaskStatus) || 'pending'
   }
@@ -445,6 +506,21 @@ function compactText(value: unknown, maxLength = 220): string {
   return text.length > maxLength ? `${text.slice(0, maxLength)}...` : text
 }
 
+function summarizeStructuredList(value: unknown, keys: string[] = []): string {
+  if (!Array.isArray(value)) return compactText(value)
+  const labels = value.map(item => {
+    if (!item || typeof item !== 'object') return toDisplayText(item)
+    const record = item as Record<string, unknown>
+    for (const key of keys) {
+      const label = toDisplayText(record[key])
+      if (label) return label
+    }
+    return compactText(record, 80)
+  }).filter(Boolean)
+  if (labels.length <= 4) return labels.join('、')
+  return `${labels.slice(0, 4).join('、')} 等 ${labels.length} 项`
+}
+
 function normalizeLocalProjectPath(value: unknown): string {
   return toDisplayText(value)
     .replace(/^\\\\\?\\/, '')
@@ -468,11 +544,22 @@ const TOOL_DISPLAY: ToolDisplayMap = {
 }
 
 const EVENT_TYPE_DISPLAY: Record<string, string> = {
+  intent_routed: 'AI 意图路由',
+  capabilities_resolved: '能力解析',
+  execution_plan_selected: '执行计划',
+  execution_plan_reused: '复用执行计划',
+  artifact_verified: '产物验证',
+  capability_unavailable: '能力缺口',
+  task_stop_guard_triggered: '停止护栏',
+  light_task_completed: '轻量任务完成',
+  retrieval_plan_reused: '复用检索计划',
   permission_checked: '权限判断',
   tool_call: '工具调用',
   tool_result: '工具结果',
   approval_requested: '等待确认',
   approval_resolved: '确认结果',
+  user_input_requested: '等待用户输入',
+  user_input_resolved: '用户输入已接收',
   pre_edit_checkpoint: '编辑检查点',
   checkpoint_created: '自动快照',
   ci_finished: 'CI / 验证',
@@ -522,7 +609,7 @@ const EVENT_SOURCE_DISPLAY: Record<string, string> = {
   backend: '后端 Agent',
   frontend: '前端 Agent',
   devops: '运维 Agent',
-  reviewer: '代码审查',
+  reviewer: '产物审查',
   orchestrator: '任务编排',
   permission_engine: '权限引擎',
   git: 'Git 快照',
@@ -711,6 +798,86 @@ function summarizeRuntimeEvent(event: AutoCodeRuntimeEvent, toolRegistry: ToolDi
     ? ` 完整输出已保存：/workspace/${toDisplayText(payload.output_path)}`
     : ''
   switch (event.type) {
+    case 'intent_routed': {
+      const route = nestedRecord(payload.active_route)
+      const family = firstText(payload.task_family, route.task_family, payload.final_intent, route.intent, '通用任务')
+      const target = firstText(payload.target, route.target)
+      const artifacts = summarizeStructuredList(route.artifact_contracts || payload.expected_artifacts, ['path', 'name', 'format'])
+      return {
+        label: 'AI 意图路由',
+        title: `已识别为：${family}`,
+        description: compactText([target ? `目标：${target}` : '', artifacts ? `产物：${artifacts}` : '', firstText(payload.reason, route.reason)].filter(Boolean).join('；')),
+        tone: Number(payload.confidence || route.confidence || 1) < 0.6 ? 'warning' : 'default',
+      }
+    }
+    case 'capabilities_resolved': {
+      const capabilities = summarizeStructuredList(payload.required_capabilities)
+      const gaps = summarizeStructuredList(payload.capability_gaps || payload.missing_tools)
+      return {
+        label: gaps ? '能力缺口' : '能力解析',
+        title: gaps ? `缺少执行能力：${gaps}` : '任务能力与运行环境已解析',
+        description: compactText([capabilities ? `需要：${capabilities}` : '未声明额外能力', payload.artifact_source ? `产物来源：${payload.artifact_source}` : ''].filter(Boolean).join('；')),
+        tone: gaps ? 'warning' : 'success',
+      }
+    }
+    case 'execution_plan_selected': {
+      const family = firstText(payload.task_family, payload.intent, '通用任务')
+      const artifacts = summarizeStructuredList(payload.artifact_contracts, ['path', 'name', 'format'])
+      const validation = summarizeStructuredList(payload.validation_plan, ['label', 'kind', 'command', 'tool'])
+      return {
+        label: '执行计划',
+        title: `已选择 ${family} 执行流程`,
+        description: compactText([artifacts ? `产物：${artifacts}` : '', validation ? `验证：${validation}` : '按完成条件验证'].filter(Boolean).join('；')),
+        tone: 'default',
+      }
+    }
+    case 'artifact_verified': {
+      const passed = payload.passed !== false
+      const artifacts = summarizeStructuredList(payload.artifact_contracts, ['path', 'name', 'format'])
+      return {
+        label: passed ? '产物验证通过' : '产物验证失败',
+        title: payload.status === 'not_required' ? '执行计划未要求额外产物审查' : passed ? '目标产物已通过验证' : '目标产物未满足合同',
+        description: compactText(artifacts || payload.dimensions || payload.reason || (payload.score !== undefined ? `审查得分：${payload.score}` : '')),
+        tone: passed ? 'success' : 'destructive',
+      }
+    }
+    case 'capability_unavailable': {
+      const missing = summarizeStructuredList(payload.missing_tools || payload.capability_gaps)
+      return {
+        label: '能力不可用',
+        title: missing ? `缺少工具：${missing}` : '当前环境缺少计划所需能力',
+        description: compactText(payload.reason || payload.execution_plan || '任务会保留真实状态，不会改道到无关构建流程。'),
+        tone: 'destructive',
+      }
+    }
+    case 'task_stop_guard_triggered':
+      return {
+        label: '停止护栏',
+        title: '后端已根据完成或阻塞条件停止继续执行',
+        description: compactText(payload.reason || payload.message || payload.checks),
+        tone: String(payload.reason || '').includes('completed') ? 'success' : 'warning',
+      }
+    case 'light_task_completed':
+      return {
+        label: '轻量任务完成',
+        title: `文件已写入并校验：${toDisplayText(payload.path, '目标文件')}`,
+        description: compactText(payload.completion_checks || payload.size),
+        tone: 'success',
+      }
+    case 'execution_plan_reused':
+      return {
+        label: '复用执行计划',
+        title: '没有新需求，继续使用上次 AI 执行计划',
+        description: compactText(payload.reason || payload.task_family || payload.intent),
+        tone: 'success',
+      }
+    case 'retrieval_plan_reused':
+      return {
+        label: '复用检索计划',
+        title: '继续使用已有项目上下文和候选文件',
+        description: compactText(payload.reason || payload.candidate_files || payload.read_files),
+        tone: 'success',
+      }
     case 'permission_checked': {
       const decision = toDisplayText(payload.decision)
       const policy = toDisplayText(payload.task_tool_policy)
@@ -864,6 +1031,20 @@ function summarizeRuntimeEvent(event: AutoCodeRuntimeEvent, toolRegistry: ToolDi
         title: payload.approved ? '用户批准了操作' : '用户拒绝了操作',
         description: toDisplayText(payload.reason || payload.message || payload.approval_id),
         tone: payload.approved ? 'success' : 'destructive',
+      }
+    case 'user_input_requested':
+      return {
+        label: '等待用户输入',
+        title: 'Agent 需要一个产品或实现选择',
+        description: compactText(payload.question || payload.message),
+        tone: 'warning',
+      }
+    case 'user_input_resolved':
+      return {
+        label: '已收到回复',
+        title: '用户已补充信息，任务准备继续',
+        description: compactText(payload.message),
+        tone: 'success',
       }
     case 'role_write_blocked':
       return {
@@ -1295,6 +1476,14 @@ function normalizeGitCommit(commit: AutoCodeGitCommit): AutoCodeGitCommit {
 
 type BackendAutoCodeTask = Awaited<ReturnType<typeof listAutoCodeTasks>>[number]
 
+function inferExecutionTarget(bt: BackendAutoCodeTask): 'cloud_workspace' | 'local_ide' | string {
+  const explicit = toDisplayText(bt.execution_target)
+  if (explicit) return explicit
+  return (bt.local_import_mode || bt.local_execution_enabled || bt.local_runner?.enabled)
+    ? 'local_ide'
+    : 'cloud_workspace'
+}
+
 function backendTaskToUiTask(bt: BackendAutoCodeTask): AutoCodeTask {
   const status = mapBackendStatus(bt.status || 'pending')
   const isRunning = status === 'running' || status === 'pending'
@@ -1304,7 +1493,7 @@ function backendTaskToUiTask(bt: BackendAutoCodeTask): AutoCodeTask {
     || bt.local_runner_session_id
     || bt.local_runner?.connected,
   )
-  const isLocalImportReady = Boolean(bt.local_execution_enabled && hasLocalRunnerBinding && bt.project_type === 'imported')
+  const isLocalImportReady = Boolean(bt.local_execution_enabled && hasLocalRunnerBinding && bt.local_import_mode)
   const statusHeader: ChatMsg | null = isLocalImportReady && status === 'completed'
     ? null
     : status === 'completed'
@@ -1319,16 +1508,20 @@ function backendTaskToUiTask(bt: BackendAutoCodeTask): AutoCodeTask {
     id: `remote_${bt.id}`,
     title: toDisplayText(bt.title, '未命名任务'),
     description: toDisplayText(bt.description),
-    projectType: toDisplayText(bt.project_type, 'website'),
+    projectType: toDisplayText(bt.project_type, 'unknown'),
     techStack: '',
     status,
     progress: bt.progress ?? 0,
     currentStep: toDisplayText(bt.current_step, isRunning ? '同步恢复中...' : ''),
     workspaceId: toDisplayText(bt.workspace_id),
+    executionTarget: inferExecutionTarget(bt),
     previewUrl: toDisplayText(bt.preview_url),
     model: toDisplayText(bt.model),
     toolPolicy: normalizeToolPolicy(bt.tool_policy),
+    autonomyMode: toDisplayText(bt.autonomy_mode, 'strong'),
     pendingConfirmation: bt.pending_confirmation ?? null,
+    pendingUserInput: bt.pending_user_input ?? null,
+    completionReport: bt.completion_report ?? null,
     localExecutionEnabled: Boolean(bt.local_execution_enabled),
     localRunner: mergeLocalRunnerStatus(bt.local_runner, {
       enabled: Boolean(bt.local_execution_enabled || bt.local_runner?.enabled),
@@ -1355,6 +1548,8 @@ function backendTaskToUiTask(bt: BackendAutoCodeTask): AutoCodeTask {
     complexity: toDisplayText(bt.complexity),
     recommendedFlow: toDisplayText(bt.recommended_flow),
     prototypeRequired: bt.prototype_required,
+    activeExecutionPlan: bt.active_execution_plan,
+    taskCapabilityProfile: bt.task_capability_profile,
     pipelineStatus: toDisplayText(bt.pipeline_status),
     previewStatus: toDisplayText(bt.preview_status),
     previewError: toDisplayText(bt.preview_error),
@@ -1759,8 +1954,18 @@ export default function AutoCodePage({ onNavigate }: { onNavigate?: (page: AppPa
   const [connectionStatus, setConnectionStatus] = useState<'connecting' | 'connected' | 'disconnected' | 'mock'>('disconnected')
   const activeTaskRef = useRef<AutoCodeTask | null>(null) // 保持最新 activeTask 引用
   const notifiedKeysRef = useRef<Set<string>>(new Set())
-  const autoConnectGrantRef = useRef('')
+  const autoConnectInFlightRef = useRef<Set<string>>(new Set())
+  const autoConnectCompletedRef = useRef<Set<string>>(new Set())
   const autoConnectNoMatchWarnedRef = useRef('')
+  const localImportDeepLinkHandledRef = useRef(false)
+  const localImportAutoLaunchRef = useRef(false)
+  const localImportAutoRegisterRef = useRef(false)
+  const localImportAutoRegisterInFlightRef = useRef(false)
+  const localImportAutoRegisterAttemptsRef = useRef(0)
+  const localImportAutoSyncToCloudRef = useRef<boolean | null>(null)
+  // 多任务并行重连：按 backendTaskId 去重，避免同 task 并发重复发起。
+  const multiReconnectInFlightRef = useRef<Set<string>>(new Set())
+  const multiReconnectAttemptedRef = useRef<Set<string>>(new Set())
   const [previewRefreshKey, setPreviewRefreshKey] = useState(0) // 预览自动刷新
   const [chatPanelWidth, setChatPanelWidth] = useState(360) // 对话面板宽度（可拖拽调整）
   const [workspaceOpenFileRequest, setWorkspaceOpenFileRequest] = useState<{ path: string; line?: number } | null>(null)
@@ -1803,6 +2008,8 @@ export default function AutoCodePage({ onNavigate }: { onNavigate?: (page: AppPa
   const [localImportProjectPath, setLocalImportProjectPath] = useState('')
   const [localImportRunner, setLocalImportRunner] = useState<AutoCodeLocalRunnerStatus | null>(null)
   const [localImportSessionLoading, setLocalImportSessionLoading] = useState(false)
+  const [connectorAutoImporting, setConnectorAutoImporting] = useState(false)
+  const [localImportAutoRegisterRetryTick, setLocalImportAutoRegisterRetryTick] = useState(0)
   const [syncLocalSnapshots, setSyncLocalSnapshots] = useState(false)
   const [importRunnerCommandCopied, setImportRunnerCommandCopied] = useState(false)
   const [localProjectGrants, setLocalProjectGrants] = useState<AutoCodeLocalProjectGrant[]>([])
@@ -1824,14 +2031,75 @@ export default function AutoCodePage({ onNavigate }: { onNavigate?: (page: AppPa
       toast.error('复制失败，请手动选择命令复制')
     }
   }, [localImportRunner?.command])
+  const registerOnlineLocalGrant = useCallback(async (grant: AutoCodeLocalProjectGrant) => {
+    const projectPath = (grant.project_root || '').trim()
+    if (!projectPath) {
+      toast.warning('授权项目路径为空，请重新在本地 IDE 授权项目')
+      return false
+    }
+    if (!grant.device_online || !grant.device_id) {
+      return false
+    }
+    setConnectorAutoImporting(true)
+    setImportError('')
+    try {
+      const selectedModel = useChatStore.getState().selectedModel
+      const importModel = selectedModel !== 'auto' ? selectedModel : undefined
+      const registered = await autoImportLocalConnectorProject({
+        grant_id: grant.grant_id,
+        project_path: projectPath,
+        project_name: importName.trim() || grant.project_name || projectPath.split(/[\\/]/).filter(Boolean).pop() || '本地项目',
+        device_id: grant.device_id,
+        device_name: grant.device_name || '',
+        device_os: grant.device_os || '',
+        public_api_base: getPublicAutoCodeApiBase(),
+        enable_smart_planning: importEnableSmartPlanning,
+        sync_to_cloud: syncLocalSnapshots,
+        model: importModel,
+      })
+      const newTask = backendTaskToUiTask(registered)
+      setTasks(prev => [newTask, ...prev.filter(task => task.backendTaskId !== newTask.backendTaskId && task.id !== newTask.id)])
+      setActiveTaskId(newTask.id)
+      setActiveTab('events')
+      setImportOpen(false)
+      setImportName('')
+      setLocalImportProjectPath('')
+      setLocalImportRunner(registered.local_runner || null)
+      setLocalRunnerConnected(Boolean(registered.local_runner?.connected))
+      setLocalRunnerProjectRoot(registered.local_runner?.project_root || projectPath)
+      setImportEnableSmartPlanning(false)
+      setSyncLocalSnapshots(false)
+      localImportAutoRegisterRef.current = false
+      localImportAutoLaunchRef.current = false
+      localImportAutoSyncToCloudRef.current = null
+      toast.success('本地互联任务已创建', { description: '后续对话和执行会绑定到这台本地 IDE。' })
+      return true
+    } catch (err) {
+      const message = (err as Error).message || '连接器自动导入失败'
+      setImportError(message)
+      toast.error('本地互联任务创建失败', { description: message })
+      return false
+    } finally {
+      setConnectorAutoImporting(false)
+    }
+  }, [importEnableSmartPlanning, importName, syncLocalSnapshots])
+
   const handleLaunchLocalImportConnector = useCallback(() => {
+    const selectedGrant = localProjectGrants.find(item => item.grant_id === selectedLocalGrantId)
+    if (selectedGrant?.device_online && selectedGrant.device_id) {
+      void registerOnlineLocalGrant(selectedGrant)
+      return
+    }
     if (!localImportRunner?.launch_url) {
       toast.warning('请先生成本地连接会话')
       return
     }
+    localImportAutoRegisterRef.current = true
+    localImportAutoRegisterAttemptsRef.current = 0
+    localImportAutoSyncToCloudRef.current = syncLocalSnapshots
     window.location.href = localImportRunner.launch_url
     toast.info('正在唤起本地连接器', { description: '如果没有安装，会提示你先安装连接器。' })
-  }, [localImportRunner?.launch_url])
+  }, [localImportRunner?.launch_url, localProjectGrants, registerOnlineLocalGrant, selectedLocalGrantId, syncLocalSnapshots])
 
   const createLocalImportRunner = useCallback(async (force = false) => {
     if (!force && localImportRunner?.session_id) return
@@ -1862,6 +2130,10 @@ export default function AutoCodePage({ onNavigate }: { onNavigate?: (page: AppPa
     setLocalImportRunner(null)
     setLocalRunnerConnected(false)
     setLocalRunnerProjectRoot('')
+    if (grant.device_online && grant.device_id) {
+      const ok = await registerOnlineLocalGrant(grant)
+      if (ok) return
+    }
     setLocalImportSessionLoading(true)
     setImportError('')
     try {
@@ -1871,6 +2143,9 @@ export default function AutoCodePage({ onNavigate }: { onNavigate?: (page: AppPa
       setLocalRunnerProjectRoot(status.project_root || grant.project_root || '')
       toast.success('已使用授权项目生成连接会话')
       if (status.launch_url) {
+        localImportAutoRegisterRef.current = true
+        localImportAutoRegisterAttemptsRef.current = 0
+        localImportAutoSyncToCloudRef.current = syncLocalSnapshots
         window.setTimeout(() => {
           window.location.href = status.launch_url || ''
         }, 50)
@@ -1880,7 +2155,7 @@ export default function AutoCodePage({ onNavigate }: { onNavigate?: (page: AppPa
     } finally {
       setLocalImportSessionLoading(false)
     }
-  }, [])
+  }, [registerOnlineLocalGrant, syncLocalSnapshots])
 
   useEffect(() => {
     if (!importOpen || importTab !== 'local') return
@@ -1926,6 +2201,12 @@ export default function AutoCodePage({ onNavigate }: { onNavigate?: (page: AppPa
   activeTaskRef.current = activeTask
 
   useEffect(() => {
+    if (activeTask?.status === 'waiting_confirm') {
+      setActiveTab('events')
+    }
+  }, [activeTask?.id, activeTask?.status])
+
+  useEffect(() => {
     const requestedTaskId = new URLSearchParams(window.location.search).get('task_id') || ''
     if (!requestedTaskId || tasks.length === 0) return
     const matched = tasks.find(t => t.backendTaskId === requestedTaskId || t.id === requestedTaskId || t.id === `remote_${requestedTaskId}`)
@@ -1936,68 +2217,216 @@ export default function AutoCodePage({ onNavigate }: { onNavigate?: (page: AppPa
 
   useEffect(() => {
     const params = new URLSearchParams(window.location.search)
+    const connectorAction = params.get('connector_action') || ''
+    const autoImportLocal = params.get('auto_import_local') === '1'
+    if (connectorAction === 'import_local' || autoImportLocal) {
+      if (localImportDeepLinkHandledRef.current) return
+      localImportDeepLinkHandledRef.current = true
+      const projectPath = params.get('local_project_path') || ''
+      const projectName = params.get('local_project_name') || ''
+      const syncToCloud = params.get('sync_to_cloud') === '1'
+      setImportOpen(true)
+      setImportTab('local')
+      if (projectPath) setLocalImportProjectPath(projectPath)
+      if (projectName) setImportName(projectName)
+      setSyncLocalSnapshots(syncToCloud)
+      localImportAutoSyncToCloudRef.current = syncToCloud
+      if (autoImportLocal && projectPath) {
+        setConnectorAutoImporting(true)
+        setImportError('')
+        const selectedModel = useChatStore.getState().selectedModel
+        const importModel = selectedModel !== 'auto' ? selectedModel : undefined
+        void autoImportLocalConnectorProject({
+          grant_id: params.get('connector_grant_id') || '',
+          project_path: projectPath,
+          project_name: projectName,
+          device_id: params.get('connector_device_id') || '',
+          device_name: params.get('connector_device_name') || '',
+          device_os: params.get('connector_device_os') || '',
+          public_api_base: getPublicAutoCodeApiBase(),
+          sync_to_cloud: syncToCloud,
+          model: importModel,
+        })
+          .then(registered => {
+            const newTask = backendTaskToUiTask(registered)
+            setTasks(prev => [newTask, ...prev.filter(task => task.backendTaskId !== newTask.backendTaskId)])
+            setActiveTaskId(newTask.id)
+            setActiveTab('events')
+            setImportOpen(false)
+            setImportName('')
+            setLocalImportProjectPath('')
+            setLocalImportRunner(registered.local_runner || null)
+            setLocalRunnerConnected(Boolean(registered.local_runner?.connected))
+            setLocalRunnerProjectRoot(registered.local_runner?.project_root || projectPath)
+            setImportEnableSmartPlanning(false)
+            setSyncLocalSnapshots(false)
+            localImportAutoRegisterRef.current = false
+            localImportAutoLaunchRef.current = false
+            localImportAutoSyncToCloudRef.current = null
+            toast.success('本地互联任务已创建', { description: '已连接本地 IDE 项目，可直接开始开发。' })
+          })
+          .catch(err => {
+            const message = (err as Error).message || '连接器自动导入失败'
+            setImportError(`${message}。已保留本地互联面板，请确认连接器保持打开后点击“创建本地互联任务”。`)
+            toast.error('本地互联任务自动创建失败', { description: message })
+          })
+          .finally(() => setConnectorAutoImporting(false))
+      }
+      if (params.get('auto_launch_local') === '1' && !autoImportLocal) {
+        localImportAutoLaunchRef.current = true
+      }
+      if (autoImportLocal && !projectPath) {
+        localImportAutoRegisterRef.current = true
+        localImportAutoRegisterAttemptsRef.current = 0
+      }
+    }
+  }, [])
+
+  useEffect(() => {
+    if (!importOpen || importTab !== 'local' || !localImportRunner?.launch_url) return
+    if (!localImportAutoLaunchRef.current) return
+    localImportAutoLaunchRef.current = false
+    window.setTimeout(() => {
+      window.location.href = localImportRunner.launch_url || ''
+    }, 120)
+  }, [importOpen, importTab, localImportRunner?.launch_url])
+
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search)
     const requestedTaskId = params.get('task_id') || ''
     const grantId = params.get('local_grant_id') || ''
     const projectPath = params.get('local_project_path') || ''
     if ((!requestedTaskId && !grantId && !projectPath) || tasks.length === 0) return
     const dedupeKey = `${requestedTaskId}:${grantId}:${projectPath}`
-    if (autoConnectGrantRef.current === dedupeKey) return
+    if (autoConnectCompletedRef.current.has(dedupeKey) || autoConnectInFlightRef.current.has(dedupeKey)) return
+    autoConnectInFlightRef.current.add(dedupeKey)
     let cancelled = false
     void (async () => {
-      let targetTaskId = requestedTaskId
-      let targetGrantId = grantId
-      let targetProjectPath = projectPath
-      if (grantId) {
-        try {
-          const grants = await listAutoCodeLocalProjectGrants()
-          const grant = grants.find(item => item.grant_id === grantId)
-          targetTaskId = targetTaskId || grant?.task_id || ''
-          targetProjectPath = targetProjectPath || grant?.project_root || ''
-          targetGrantId = targetGrantId || grant?.grant_id || ''
-        } catch {
-          // Falling back to URL parameters is enough here.
-        }
-      }
-      if (cancelled) return
-      const normalizedTargetPath = normalizeLocalProjectPath(targetProjectPath)
-      const matched = tasks.find(t => (
-        (targetTaskId && (t.backendTaskId === targetTaskId || t.id === targetTaskId || t.id === `remote_${targetTaskId}`))
-        || (normalizedTargetPath && normalizeLocalProjectPath(t.localRunner?.project_root) === normalizedTargetPath)
-        || (normalizedTargetPath && normalizeLocalProjectPath(t.title) === normalizedTargetPath.split('/').pop())
-      ))
-      if (!matched) {
-        // 任务列表可能分批到达：此处不落 dedupe，允许 tasks 更新后重试，
-        // 仅对同一组参数提示一次，避免刷屏。
-        if (autoConnectNoMatchWarnedRef.current !== dedupeKey) {
-          autoConnectNoMatchWarnedRef.current = dedupeKey
-          toast.info('已进入代码开发', { description: '正在等待任务加载，如未自动打开请从左侧任务列表选择一次。' })
-        }
-        return
-      }
-      autoConnectGrantRef.current = dedupeKey
-      setActiveTaskId(matched.id)
-      setActiveTab('events')
-      if (!matched.backendTaskId || !targetGrantId) return
       try {
-        const status = await setAutoCodeLocalRunnerMode(matched.backendTaskId, true, {
-          public_api_base: getPublicAutoCodeApiBase(),
-          grant_id: targetGrantId,
-        })
-        if (cancelled) return
-        setTasks(prev => prev.map(t =>
-          t.id === matched.id
-            ? { ...t, localExecutionEnabled: Boolean(status.enabled), localRunner: mergeLocalRunnerStatus(t.localRunner, status) }
-            : t
-        ))
-        if (status.launch_url) {
-          window.setTimeout(() => {
-            window.location.href = status.launch_url || ''
-          }, 80)
+        let targetTaskId = requestedTaskId
+        let targetGrantId = grantId
+        let targetProjectPath = projectPath
+        let targetDeviceId = ''
+        if (grantId) {
+          try {
+            const grants = await listAutoCodeLocalProjectGrants()
+            const grant = grants.find(item => item.grant_id === grantId)
+            targetTaskId = targetTaskId || grant?.task_id || ''
+            targetProjectPath = targetProjectPath || grant?.project_root || ''
+            targetGrantId = targetGrantId || grant?.grant_id || ''
+            targetDeviceId = grant?.device_id || ''
+          } catch {
+            // Falling back to URL parameters is enough here.
+          }
         }
-      } catch (err) {
-        if (!cancelled) toast.error('本地项目快速连接失败', { description: (err as Error).message || '请手动点击本地执行连接。' })
+        if (cancelled) return
+        const normalizedTargetPath = normalizeLocalProjectPath(targetProjectPath)
+        // 优先按 task_id 精确匹配；同目录多会话时不能只靠 path 撞到别的 task。
+        const matched = (
+          tasks.find(t => targetTaskId && (t.backendTaskId === targetTaskId || t.id === targetTaskId || t.id === `remote_${targetTaskId}`))
+          || tasks.find(t => normalizedTargetPath && normalizeLocalProjectPath(t.localRunner?.project_root) === normalizedTargetPath)
+          || tasks.find(t => normalizedTargetPath && normalizeLocalProjectPath(t.title) === normalizedTargetPath.split('/').pop())
+        )
+        if (!matched) {
+          // Keep this request retryable until its task appears in the list.
+          if (autoConnectNoMatchWarnedRef.current !== dedupeKey) {
+            autoConnectNoMatchWarnedRef.current = dedupeKey
+            toast.info('已进入代码开发', { description: '正在等待任务加载，如未自动打开请从左侧任务列表选择一次。' })
+          }
+          return
+        }
+        autoConnectCompletedRef.current.add(dedupeKey)
+        setActiveTaskId(matched.id)
+        setActiveTab('events')
+        if (!matched.backendTaskId || !targetGrantId) return
+        // 已连接同一 session/grant 则不再重复唤起。
+        if (matched.localRunner?.connected && matched.localRunner?.local_project_grant_id === targetGrantId) return
+        try {
+          const status = await setAutoCodeLocalRunnerMode(matched.backendTaskId, true, {
+            public_api_base: getPublicAutoCodeApiBase(),
+            grant_id: targetGrantId,
+            ...(targetDeviceId ? { device_id: targetDeviceId } : {}),
+          })
+          if (cancelled) return
+          setTasks(prev => prev.map(t =>
+            t.id === matched.id
+              ? { ...t, localExecutionEnabled: Boolean(status.enabled), executionTarget: status.enabled ? 'local_ide' : 'cloud_workspace', localRunner: mergeLocalRunnerStatus(t.localRunner, status) }
+              : t
+          ))
+          // 设备通道已推送 connect_request 时不必再走深链，避免多余唤起。
+          if (!targetDeviceId && status.launch_url && !status.connected) {
+            window.setTimeout(() => {
+              window.location.href = status.launch_url || ''
+            }, 80)
+          }
+        } catch (err) {
+          if (!cancelled) toast.error('本地项目快速连接失败', { description: (err as Error).message || '请手动点击本地执行连接。' })
+        }
+      } finally {
+        autoConnectInFlightRef.current.delete(dedupeKey)
       }
     })()
+    return () => { cancelled = true }
+  }, [tasks])
+
+  // 多项目 / 多会话：对所有已开启本地执行但未连接的 task，在对应设备在线时并行重连。
+  // 走 device 通道的 connect_request，连接器 Phase 1 会按 session_id 并存，不再互踢。
+  useEffect(() => {
+    const candidates = tasks.filter(task => {
+      const backendId = task.backendTaskId
+      if (!backendId) return false
+      if (!(task.localExecutionEnabled || task.localRunner?.enabled)) return false
+      if (task.localRunner?.connected) return false
+      if (multiReconnectInFlightRef.current.has(backendId)) return false
+      // 同一 task 本页生命周期内只自动尝试一次，避免死循环；用户手动开关仍可再次连接。
+      if (multiReconnectAttemptedRef.current.has(backendId)) return false
+      return true
+    })
+    if (candidates.length === 0) return
+
+    let cancelled = false
+    void (async () => {
+      let grants: AutoCodeLocalProjectGrant[] = []
+      try {
+        grants = await listAutoCodeLocalProjectGrants()
+      } catch {
+        return
+      }
+      if (cancelled || grants.length === 0) return
+
+      const onlineGrants = grants.filter(g => g.device_online && g.grant_id)
+      if (onlineGrants.length === 0) return
+
+      await Promise.allSettled(candidates.map(async task => {
+        const backendId = task.backendTaskId!
+        const projectRoot = normalizeLocalProjectPath(task.localRunner?.project_root)
+        const grant = onlineGrants.find(g => g.task_id && g.task_id === backendId)
+          || onlineGrants.find(g => projectRoot && normalizeLocalProjectPath(g.project_root) === projectRoot)
+          || onlineGrants.find(g => g.grant_id === task.localRunner?.local_project_grant_id)
+        if (!grant?.grant_id || !grant.device_id) return
+
+        multiReconnectInFlightRef.current.add(backendId)
+        multiReconnectAttemptedRef.current.add(backendId)
+        try {
+          const status = await setAutoCodeLocalRunnerMode(backendId, true, {
+            public_api_base: getPublicAutoCodeApiBase(),
+            grant_id: grant.grant_id,
+            device_id: grant.device_id,
+          })
+          if (cancelled) return
+          setTasks(prev => prev.map(t =>
+            t.id === task.id
+              ? { ...t, localExecutionEnabled: Boolean(status.enabled), executionTarget: status.enabled ? 'local_ide' : 'cloud_workspace', localRunner: mergeLocalRunnerStatus(t.localRunner, status) }
+              : t
+          ))
+        } catch {
+          // 单路失败不影响其它 task；保留 attempted 避免刷屏，用户可手动重试。
+        } finally {
+          multiReconnectInFlightRef.current.delete(backendId)
+        }
+      }))
+    })()
+
     return () => { cancelled = true }
   }, [tasks])
 
@@ -2113,27 +2542,49 @@ export default function AutoCodePage({ onNavigate }: { onNavigate?: (page: AppPa
     return () => window.clearInterval(timer)
   }, [refreshQueueStatus])
 
+  const localRunnerPollingKey = useMemo(() => JSON.stringify(
+    tasks
+      .filter(task => task.backendTaskId && (task.localExecutionEnabled || task.localRunner?.enabled))
+      .map(task => ({ id: task.id, backendTaskId: task.backendTaskId! }))
+      .sort((a, b) => a.id.localeCompare(b.id)),
+  ), [tasks])
+
   useEffect(() => {
-    if (!activeTask?.backendTaskId || !activeTask.localExecutionEnabled) return
+    const targets = JSON.parse(localRunnerPollingKey) as Array<{ id: string; backendTaskId: string }>
+    if (targets.length === 0) return
     let cancelled = false
-    const refreshLocalRunner = async () => {
+    let refreshing = false
+    const refreshLocalRunners = async () => {
+      if (refreshing) return
+      refreshing = true
       try {
-        const status = await getAutoCodeLocalRunnerStatus(activeTask.backendTaskId!)
+        const results = await Promise.allSettled(targets.map(async target => ({
+          target,
+          status: await getAutoCodeLocalRunnerStatus(target.backendTaskId),
+        })))
         if (cancelled) return
-        setTasks(prev => prev.map(t =>
-          t.id === activeTask.id
-            ? { ...t, localExecutionEnabled: Boolean(status.enabled), localRunner: mergeLocalRunnerStatus(t.localRunner, status) }
-            : t
-        ))
-      } catch { /* ignore local runner status polling errors */ }
+        const updates = new Map<string, AutoCodeLocalRunnerStatus>()
+        for (const result of results) {
+          if (result.status === 'fulfilled') updates.set(result.value.target.id, result.value.status)
+        }
+        if (updates.size === 0) return
+        setTasks(prev => prev.map(task => {
+          const status = updates.get(task.id)
+          return status
+            ? { ...task, localExecutionEnabled: Boolean(status.enabled), executionTarget: status.enabled ? 'local_ide' : 'cloud_workspace', localRunner: mergeLocalRunnerStatus(task.localRunner, status) }
+            : task
+        }))
+      } finally {
+        refreshing = false
+      }
     }
-    void refreshLocalRunner()
-    const timer = window.setInterval(refreshLocalRunner, 3000)
+    void refreshLocalRunners()
+    const timer = window.setInterval(refreshLocalRunners, 3000)
     return () => {
       cancelled = true
       window.clearInterval(timer)
     }
-  }, [activeTask?.backendTaskId, activeTask?.id, activeTask?.localExecutionEnabled])
+  }, [localRunnerPollingKey])
 
   // 滚动到底部
   useEffect(() => {
@@ -2172,7 +2623,13 @@ export default function AutoCodePage({ onNavigate }: { onNavigate?: (page: AppPa
                 pendingConfirmation: nextStatus === 'waiting_confirm'
                   ? (data.pending_confirmation !== undefined ? data.pending_confirmation : t.pendingConfirmation)
                   : null,
+                pendingUserInput: nextStatus === 'waiting_user_input'
+                  ? (data.pending_user_input !== undefined ? data.pending_user_input : t.pendingUserInput)
+                  : null,
+                autonomyMode: toDisplayText((data as any).autonomy_mode, t.autonomyMode || 'strong'),
+                completionReport: (data as any).completion_report !== undefined ? (data as any).completion_report : t.completionReport,
                 workspaceId: toDisplayText(data.workspace_id, t.workspaceId),
+                executionTarget: toDisplayText(data.execution_target, t.executionTarget || (data.local_execution_enabled ? 'local_ide' : 'cloud_workspace')),
                 model: toDisplayText(data.model, t.model),
                 toolPolicy: normalizeToolPolicy(data.tool_policy || t.toolPolicy),
                 localExecutionEnabled: data.local_execution_enabled ?? t.localExecutionEnabled,
@@ -2191,6 +2648,8 @@ export default function AutoCodePage({ onNavigate }: { onNavigate?: (page: AppPa
                 complexity: toDisplayText(data.complexity, t.complexity),
                 recommendedFlow: toDisplayText(data.recommended_flow, t.recommendedFlow),
                 prototypeRequired: data.prototype_required ?? t.prototypeRequired,
+                activeExecutionPlan: data.active_execution_plan || t.activeExecutionPlan,
+                taskCapabilityProfile: data.task_capability_profile || t.taskCapabilityProfile,
                 pipelineStatus: toDisplayText(data.pipeline_status, t.pipelineStatus),
                 previewStatus: toDisplayText(data.preview_status, t.previewStatus),
                 previewError: data.preview_error !== undefined ? toDisplayText(data.preview_error) : t.previewError,
@@ -2211,6 +2670,9 @@ export default function AutoCodePage({ onNavigate }: { onNavigate?: (page: AppPa
         }
         if (data.status === 'waiting_review_confirm' || data.status === 'reviewing') {
           setActiveTab('review')
+        }
+        if (data.status === 'waiting_confirm') {
+          setActiveTab('events')
         }
         setConnectionStatus('connected')
       } catch { /* ignore parse errors */ }
@@ -2255,10 +2717,13 @@ export default function AutoCodePage({ onNavigate }: { onNavigate?: (page: AppPa
             'operationApproval',
           )
         }
+        const requestedUserInput = pendingUserInputFromRuntimeEvent(event)
         setTasks(prev => prev.map(t =>
           t.id === activeTaskId
             ? {
                 ...t,
+                status: requestedUserInput ? 'waiting_user_input' : t.status,
+                pendingUserInput: requestedUserInput || t.pendingUserInput,
                 events: mergeRuntimeEvents(t.events, [event]),
                 messages: mergeRuntimeMessages(t.messages, [event]),
               }
@@ -2281,6 +2746,11 @@ export default function AutoCodePage({ onNavigate }: { onNavigate?: (page: AppPa
                 status: nextStatus || t.status,
                 previewUrl: data.preview_url || t.previewUrl,
                 pendingConfirmation: nextStatus === 'waiting_confirm' ? t.pendingConfirmation : null,
+                pendingUserInput: nextStatus === 'waiting_user_input'
+                  ? (data.pending_user_input !== undefined ? data.pending_user_input : t.pendingUserInput)
+                  : null,
+                autonomyMode: toDisplayText((data as any).autonomy_mode, t.autonomyMode || 'strong'),
+                completionReport: (data as any).completion_report !== undefined ? (data as any).completion_report : t.completionReport,
               }
             : t
         ))
@@ -2319,6 +2789,12 @@ export default function AutoCodePage({ onNavigate }: { onNavigate?: (page: AppPa
                   pendingConfirmation: nextStatus === 'waiting_confirm'
                     ? (s.pending_confirmation !== undefined ? s.pending_confirmation : t.pendingConfirmation)
                     : null,
+                  pendingUserInput: nextStatus === 'waiting_user_input'
+                    ? (s.pending_user_input !== undefined ? s.pending_user_input : t.pendingUserInput)
+                    : null,
+                  autonomyMode: toDisplayText((s as any).autonomy_mode, t.autonomyMode || 'strong'),
+                  completionReport: (s as any).completion_report !== undefined ? (s as any).completion_report : t.completionReport,
+                  executionTarget: toDisplayText(s.execution_target, t.executionTarget || (s.local_execution_enabled ? 'local_ide' : 'cloud_workspace')),
                   localExecutionEnabled: s.local_execution_enabled ?? t.localExecutionEnabled,
                   localRunner: mergeLocalRunnerStatus(t.localRunner, s.local_runner),
                   plan: normalizePlan(s.plan) || t.plan,
@@ -2332,12 +2808,17 @@ export default function AutoCodePage({ onNavigate }: { onNavigate?: (page: AppPa
                   complexity: toDisplayText(s.complexity, t.complexity),
                   recommendedFlow: toDisplayText(s.recommended_flow, t.recommendedFlow),
                   prototypeRequired: s.prototype_required ?? t.prototypeRequired,
+                  activeExecutionPlan: s.active_execution_plan || t.activeExecutionPlan,
+                  taskCapabilityProfile: s.task_capability_profile || t.taskCapabilityProfile,
                   pipelineStatus: toDisplayText(s.pipeline_status, t.pipelineStatus),
                   previewStatus: toDisplayText(s.preview_status, t.previewStatus),
                   previewError: s.preview_error !== undefined ? toDisplayText(s.preview_error) : t.previewError,
                 }
               : t
           ))
+          if (s.status === 'waiting_confirm') {
+            setActiveTab('events')
+          }
           try {
             const eventData = await getAutoCodeTaskEvents(btId)
             for (const event of eventData.events || []) {
@@ -2384,6 +2865,7 @@ export default function AutoCodePage({ onNavigate }: { onNavigate?: (page: AppPa
       techStack: params.techStack,
       model: params.model,
       toolPolicy: 'full_access',
+      executionTarget: 'cloud_workspace',
       localExecutionEnabled: false,
       status: 'pending',
       progress: 0,
@@ -2393,7 +2875,7 @@ export default function AutoCodePage({ onNavigate }: { onNavigate?: (page: AppPa
         {
           id: `sys_${Date.now()}`,
           role: 'assistant',
-          content: `✅ 任务已创建！正在为你开发 **${params.title}**\n\n**技术栈**: ${params.techStack}\n**类型**: ${params.projectType === 'website' ? '网站开发' : params.projectType === 'api' ? 'API 服务' : params.projectType === 'miniapp' ? '小程序' : '工具脚本'}\n\n你可以随时在下方对话来指导开发方向、调整功能需求或查询进度。`,
+          content: `任务已创建，正在进行 AI 意图路由、能力解析和产物规划：**${params.title}**${params.techStack ? `\n\n**环境提示**：${params.techStack}` : ''}\n\n你可以继续补充目标、附件或约束。`,
           timestamp: new Date().toISOString(),
         }
       ],
@@ -2407,8 +2889,8 @@ export default function AutoCodePage({ onNavigate }: { onNavigate?: (page: AppPa
     try {
       const result = await createAutoCodeTask({
         title: params.title,
-        description: `[${params.techStack}] ${params.description}`,
-        project_type: params.projectType === 'website' ? 'nextjs' : params.projectType,
+        description: params.techStack ? `[环境提示：${params.techStack}] ${params.description}` : params.description,
+        project_type: 'unknown',
         agent_types: getAgentTypesForProject(params.projectType),
         model: params.model,
         spec: params.spec,
@@ -2432,6 +2914,8 @@ export default function AutoCodePage({ onNavigate }: { onNavigate?: (page: AppPa
               complexity: toDisplayText(result.complexity),
               recommendedFlow: toDisplayText(result.recommended_flow),
               prototypeRequired: result.prototype_required,
+              activeExecutionPlan: result.active_execution_plan,
+              taskCapabilityProfile: result.task_capability_profile,
               plan: normalizePlan(result.plan),
               review: normalizeReview(result.review),
               phase_reviews: Array.isArray(result.phase_reviews) ? result.phase_reviews.map(normalizeReview).filter(Boolean) as ReviewResult[] : [],
@@ -2515,6 +2999,32 @@ export default function AutoCodePage({ onNavigate }: { onNavigate?: (page: AppPa
     }
   }, [refreshTaskDetail])
 
+  const handleConfirmReview = useCallback(async (confirmed: boolean) => {
+    const task = activeTaskRef.current
+    if (!task?.backendTaskId) return
+    try {
+      const result = await confirmReview(task.backendTaskId, confirmed)
+      toast.success(result.message || (confirmed ? '产物审查已确认，任务继续执行' : '产物审查已拒绝，任务已停止'))
+      setTasks(prev => prev.map(t =>
+        t.id === task.id
+          ? {
+              ...t,
+              status: confirmed ? 'running' : 'stopped',
+              review_confirmed: confirmed,
+              currentStep: confirmed ? '产物审查已确认，继续执行。' : '用户拒绝了产物审查',
+              runtimeState: confirmed ? 'active' : 'terminal',
+              runtimeNote: confirmed ? '产物审查已确认，后台正在继续处理...' : undefined,
+            }
+          : t
+      ))
+      await refreshTaskDetail(task.backendTaskId, task.id).catch(() => undefined)
+      void refreshQueueStatus()
+    } catch (err) {
+      toast.error('产物审查确认失败', { description: (err as Error)?.message || '请刷新任务后重试。' })
+      await refreshTaskDetail(task.backendTaskId, task.id).catch(() => undefined)
+    }
+  }, [refreshQueueStatus, refreshTaskDetail])
+
   const handleSetLocalRunnerMode = useCallback(async (enabled: boolean, options?: { grant_id?: string; device_id?: string }) => {
     const task = activeTaskRef.current
     if (!task?.backendTaskId) return
@@ -2529,13 +3039,14 @@ export default function AutoCodePage({ onNavigate }: { onNavigate?: (page: AppPa
           ? {
               ...t,
               localExecutionEnabled: Boolean(status.enabled),
+              executionTarget: status.enabled ? 'local_ide' : 'cloud_workspace',
               localRunner: mergeLocalRunnerStatus(t.localRunner, status),
               messages: mergeChatMessages(t.messages, [{
                 id: `local_runner_${Date.now()}`,
                 role: 'system',
                 content: enabled
-                  ? '已开启本地执行模式。请点击“一键连接本地项目”唤起 AutoCode Local Connector；连接成功后 AI 会优先在你的本地项目中读取、写入和运行测试。'
-                  : '已关闭本地执行模式，后续工具调用将回到服务器工作区执行。',
+                  ? '已开启本地 IDE 互联。请点击“一键连接本地项目”唤起 AutoCode IDE / Local Connector；连接成功后 AI 会优先在你的电脑项目中读取、写入、运行命令和验证。'
+                  : '已切回云端工作区，后续工具调用将使用服务器工作区执行。',
                 timestamp: new Date().toISOString(),
               }]),
             }
@@ -2548,14 +3059,14 @@ export default function AutoCodePage({ onNavigate }: { onNavigate?: (page: AppPa
             window.location.href = status.launch_url || ''
           }, 50)
         }
-        toast.info('本地执行模式已开启', { description: '正在唤起 AutoCode Local Connector；如果没有反应，请先安装本地连接器。' })
+        toast.info('本地 IDE 互联已开启', { description: '正在唤起 AutoCode IDE / Local Connector；如果没有反应，请先安装或更新。' })
       } else {
-        toast.success('已关闭本地执行模式')
+        toast.success('已切回云端工作区')
       }
     } catch (err) {
-      const message = (err as Error).message || '切换本地执行模式失败'
-      toast.error(message.includes('未同步云端') ? '不能切换到云端执行' : '切换本地执行模式失败', {
-        description: message.includes('未同步云端') ? '请在本地执行菜单里先点击“同步云端副本”，同步完成后再关闭本地执行。' : message,
+      const message = (err as Error).message || '切换执行目标失败'
+      toast.error(message.includes('未同步云端') ? '不能切回云端工作区' : '切换执行目标失败', {
+        description: message.includes('未同步云端') ? '当前本地项目没有云端副本。请保持本地 IDE 互联执行，或手动同步云端副本后再切回云端。' : message,
       })
     }
   }, [])
@@ -2567,7 +3078,7 @@ export default function AutoCodePage({ onNavigate }: { onNavigate?: (page: AppPa
     setTasks(prev => prev.map(t =>
       t.id === task.id ? mergeBackendTaskIntoUiTask(t, updated) : t
     ))
-    toast.success('云端副本已同步', { description: '现在可以关闭本地执行并切换到云端工作区。' })
+    toast.success('云端副本已同步', { description: '需要时可以切回云端工作区继续执行或审查。' })
   }, [])
 
   // ── Dev Server 管理（主组件版本，供本地指令路由使用） ──
@@ -2710,8 +3221,8 @@ export default function AutoCodePage({ onNavigate }: { onNavigate?: (page: AppPa
       return
     }
 
-    // 导航类：切换到代码审查视图
-    if (/^(代码审查|查看审查|审查代码)/.test(cmd)) {
+    // 导航类：切换到产物审查视图
+    if (/^(产物审查|代码审查|查看审查|审查代码|查看产物审查)/.test(cmd)) {
       setActiveTab('review')
       return
     }
@@ -2729,13 +3240,19 @@ export default function AutoCodePage({ onNavigate }: { onNavigate?: (page: AppPa
     }
 
     const wasTerminalTask = activeTask.status === 'completed' || activeTask.status === 'failed' || activeTask.status === 'stopped'
+    const resumesFromUserInput = activeTask.status === 'waiting_user_input'
     setTasks(prev => prev.map(t =>
       t.id === activeTask.id
         ? {
             ...t,
-            status: wasTerminalTask ? 'pending' : t.status,
-            runtimeState: wasTerminalTask ? 'waiting' : t.runtimeState,
-            runtimeNote: wasTerminalTask ? '已收到新指令，正在从已完成任务继续迭代...' : t.runtimeNote,
+            status: wasTerminalTask || resumesFromUserInput ? 'pending' : t.status,
+            pendingUserInput: resumesFromUserInput ? null : t.pendingUserInput,
+            runtimeState: wasTerminalTask || resumesFromUserInput ? 'waiting' : t.runtimeState,
+            runtimeNote: wasTerminalTask
+              ? '已收到新指令，正在从已完成任务继续迭代...'
+              : resumesFromUserInput
+                ? '已收到你的选择，正在恢复 Agent 执行...'
+                : t.runtimeNote,
             messages: [...t.messages, userMsg],
           }
         : t
@@ -2792,7 +3309,12 @@ export default function AutoCodePage({ onNavigate }: { onNavigate?: (page: AppPa
           }
           setTasks(prev => prev.map(t =>
             t.id === activeTask.id
-              ? { ...t, status: activeTask.status, messages: [...t.messages, fallbackMsg] }
+              ? {
+                  ...t,
+                  status: activeTask.status,
+                  pendingUserInput: activeTask.pendingUserInput,
+                  messages: [...t.messages, fallbackMsg],
+                }
               : t
           ))
           setChatLoading(false)
@@ -2917,10 +3439,13 @@ export default function AutoCodePage({ onNavigate }: { onNavigate?: (page: AppPa
                       'operationApproval',
                     )
                   }
+                  const requestedUserInput = pendingUserInputFromRuntimeEvent(event)
                   setTasks(prev => prev.map(t =>
                     t.id === activeTask.id
                       ? {
                           ...t,
+                          status: requestedUserInput ? 'waiting_user_input' : t.status,
+                          pendingUserInput: requestedUserInput || t.pendingUserInput,
                           events: mergeRuntimeEvents(t.events, [event]),
                           messages: mergeRuntimeMessages(t.messages, [event]),
                         }
@@ -2941,13 +3466,22 @@ export default function AutoCodePage({ onNavigate }: { onNavigate?: (page: AppPa
                     toolDescription: toDisplayText(data.description),
                     toolResult: toDisplayText(data.result_summary),
                   }
+                  // code_editor：附带 diff / 路径 / 命令，供 FileEditCard 渲染与撤销
+                  if (toolName === 'code_editor') {
+                    const editDiff = toDisplayText(data.diff)
+                    const editPath = toDisplayText(data.path)
+                    const editCommand = toDisplayText(data.edit_command)
+                    if (editDiff) toolMsg.editDiff = editDiff
+                    if (editPath) toolMsg.editPath = editPath
+                    if (editCommand) toolMsg.editCommand = editCommand
+                  }
                   setTasks(prev => prev.map(t =>
                     t.id === activeTask.id
                       ? { ...t, messages: [...t.messages, toolMsg] }
                       : t
                   ))
-                  // write_file 操作 → 触发预览刷新
-                  if (toolName === 'write_file') {
+                  // write_file / code_editor 写操作 → 触发预览刷新
+                  if (toolName === 'write_file' || (toolName === 'code_editor' && toolMsg.editCommand && toolMsg.editCommand !== 'view')) {
                     setPreviewRefreshKey(k => k + 1)
                   }
                 } else if (currentEvent === 'phase_progress') {
@@ -3034,7 +3568,12 @@ export default function AutoCodePage({ onNavigate }: { onNavigate?: (page: AppPa
         }
         setTasks(prev => prev.map(t =>
           t.id === activeTask.id
-            ? { ...t, messages: [...t.messages, errMsg] }
+            ? {
+                ...t,
+                status: activeTask.status,
+                pendingUserInput: activeTask.pendingUserInput,
+                messages: [...t.messages, errMsg],
+              }
             : t
         ))
       }
@@ -3177,6 +3716,8 @@ export default function AutoCodePage({ onNavigate }: { onNavigate?: (page: AppPa
     if (!importGitUrl.trim()) { setImportError('请输入 Git 仓库地址'); return }
     setImportLoading(true)
     setImportError('')
+    const selectedModel = useChatStore.getState().selectedModel
+    const importModel = selectedModel !== 'auto' ? selectedModel : undefined
     try {
       const result = await cloneProject(importGitUrl.trim(), importName.trim() || undefined)
       const tempTaskId = `import_git_${result.project_id}`
@@ -3184,13 +3725,14 @@ export default function AutoCodePage({ onNavigate }: { onNavigate?: (page: AppPa
         id: tempTaskId,
         title: result.name,
         description: `从 Git 导入的项目：${result.name}`,
-        projectType: 'website',
+        projectType: 'unknown',
         techStack: '',
         status: 'running',
         progress: 15,
         currentStep: 'Git 仓库克隆中...',
         createdAt: new Date().toISOString(),
         workspaceId: `pj-${result.project_id}`,
+        model: importModel,
         backendTaskId: undefined,
         messages: [{
           id: `import_sys_${Date.now()}`,
@@ -3214,6 +3756,7 @@ export default function AutoCodePage({ onNavigate }: { onNavigate?: (page: AppPa
             clearInterval(pollClone)
             const registered = await registerImportedProjectTask(result.project_id, {
               enable_smart_planning: importEnableSmartPlanning,
+              model: importModel,
             })
             const newTask = backendTaskToUiTask(registered)
             setTasks(prev => prev.map(t => t.id === tempTaskId ? newTask : t))
@@ -3251,6 +3794,8 @@ export default function AutoCodePage({ onNavigate }: { onNavigate?: (page: AppPa
     if (!importUploadFile) { setImportError('请选择项目文件'); return }
     setImportLoading(true)
     setImportError('')
+    const selectedModel = useChatStore.getState().selectedModel
+    const importModel = selectedModel !== 'auto' ? selectedModel : undefined
     const uploadFileName = importUploadFile.name
     try {
       const result = await uploadProject(importUploadFile, importName.trim() || importUploadFile.name.replace(/\.[^.]+$/, ''))
@@ -3259,13 +3804,14 @@ export default function AutoCodePage({ onNavigate }: { onNavigate?: (page: AppPa
         id: tempTaskId,
         title: result.name,
         description: `从本地上传的文件导入：${uploadFileName}`,
-        projectType: 'website',
+        projectType: 'unknown',
         techStack: '',
         status: 'running',
         progress: result.status === 'ready' ? 80 : 30,
         currentStep: result.status === 'ready' ? '上传完成，正在注册任务...' : '项目上传处理中...',
         createdAt: new Date().toISOString(),
         workspaceId: `pj-${result.project_id}`,
+        model: importModel,
         backendTaskId: undefined,
         messages: [{
           id: `import_sys_${Date.now()}`,
@@ -3289,6 +3835,7 @@ export default function AutoCodePage({ onNavigate }: { onNavigate?: (page: AppPa
             clearInterval(pollUpload)
             const registered = await registerImportedProjectTask(result.project_id, {
               enable_smart_planning: importEnableSmartPlanning,
+              model: importModel,
             })
             const newTask = backendTaskToUiTask(registered)
             setTasks(prev => prev.map(t => t.id === tempTaskId ? newTask : t))
@@ -3321,24 +3868,30 @@ export default function AutoCodePage({ onNavigate }: { onNavigate?: (page: AppPa
     }
   }, [importUploadFile, importName, importEnableSmartPlanning])
 
-  const handleImportLocal = useCallback(async () => {
+  const handleImportLocal = useCallback(async (options?: { auto?: boolean }): Promise<boolean> => {
     if (!localImportRunner?.session_id) {
       setImportError('请先生成本地连接会话并启动连接器')
-      return
+      return false
     }
     if (!localRunnerConnected) {
       setImportError('本地连接器尚未连接，请点击“一键连接本地项目”或先安装连接器')
-      return
+      return false
     }
     setImportLoading(true)
     setImportError('')
+    const selectedModel = useChatStore.getState().selectedModel
+    const importModel = selectedModel !== 'auto' ? selectedModel : undefined
     try {
       const projectPath = localImportProjectPath.trim() || localRunnerProjectRoot || localImportRunner.project_root || ''
+      const syncToCloud = options?.auto && localImportAutoSyncToCloudRef.current !== null
+        ? localImportAutoSyncToCloudRef.current
+        : syncLocalSnapshots
       const registered = await registerLocalRunnerTask(localImportRunner.session_id, {
         title: importName.trim() || (projectPath ? projectPath.split(/[\\/]/).filter(Boolean).pop() : undefined),
         project_path: projectPath,
         enable_smart_planning: importEnableSmartPlanning,
-        sync_to_cloud: syncLocalSnapshots,
+        sync_to_cloud: syncToCloud,
+        model: importModel,
       })
       const newTask = backendTaskToUiTask(registered)
       setTasks(prev => [newTask, ...prev])
@@ -3352,9 +3905,12 @@ export default function AutoCodePage({ onNavigate }: { onNavigate?: (page: AppPa
       setLocalRunnerProjectRoot(registered.local_runner?.project_root || localRunnerProjectRoot)
       setImportEnableSmartPlanning(false)
       setSyncLocalSnapshots(false)
+      localImportAutoSyncToCloudRef.current = null
       toast.success('本地项目已导入', { description: '现在可以直接在 AI 助手中描述要修改的需求。' })
+      return true
     } catch (err) {
       setImportError((err as Error).message || '本地项目导入失败')
+      return false
     } finally {
       setImportLoading(false)
     }
@@ -3366,6 +3922,43 @@ export default function AutoCodePage({ onNavigate }: { onNavigate?: (page: AppPa
     localRunnerConnected,
     localRunnerProjectRoot,
     syncLocalSnapshots,
+  ])
+
+  useEffect(() => {
+    if (!importOpen || importTab !== 'local') return
+    if (!localImportAutoRegisterRef.current || importLoading || localImportSessionLoading) return
+    if (!localImportRunner?.session_id || !localRunnerConnected) return
+    if (localImportAutoRegisterInFlightRef.current) return
+    localImportAutoRegisterInFlightRef.current = true
+    localImportAutoRegisterAttemptsRef.current += 1
+    void handleImportLocal({ auto: true })
+      .then(ok => {
+        if (ok) {
+          localImportAutoRegisterRef.current = false
+          localImportAutoSyncToCloudRef.current = null
+          return
+        }
+        if (localImportAutoRegisterAttemptsRef.current >= 6) {
+          localImportAutoRegisterRef.current = false
+          toast.error('本地互联任务自动创建失败', { description: '连接已打开，但任务没有自动创建。请点击“创建本地互联任务”重试。' })
+          return
+        }
+        window.setTimeout(() => {
+          setLocalImportAutoRegisterRetryTick(tick => tick + 1)
+        }, 1500)
+      })
+      .finally(() => {
+        localImportAutoRegisterInFlightRef.current = false
+      })
+  }, [
+    handleImportLocal,
+    importLoading,
+    importOpen,
+    importTab,
+    localImportAutoRegisterRetryTick,
+    localImportRunner?.session_id,
+    localImportSessionLoading,
+    localRunnerConnected,
   ])
 
   // 用于"继续/修改需求"按钮：点击后切到对应任务，状态横幅会引导用户在下方输入框发消息
@@ -3432,7 +4025,7 @@ export default function AutoCodePage({ onNavigate }: { onNavigate?: (page: AppPa
             size="sm"
           >
             <Plus className="w-4 h-4" />
-            新建开发任务
+            新建云端任务
           </Button>
           <Button
             variant="outline"
@@ -3441,7 +4034,7 @@ export default function AutoCodePage({ onNavigate }: { onNavigate?: (page: AppPa
             size="sm"
           >
             <GitBranchPlus className="w-4 h-4" />
-            导入项目
+            连接或导入项目
           </Button>
         </div>
 
@@ -3465,7 +4058,7 @@ export default function AutoCodePage({ onNavigate }: { onNavigate?: (page: AppPa
             <div className="flex flex-col items-center justify-center h-32 text-center px-3">
               <Sparkles className="w-7 h-7 text-muted-foreground/40 mb-2" />
               <p className="text-xs text-muted-foreground">还没有开发任务</p>
-              <p className="text-xs text-muted-foreground">点击"新建开发任务"开始</p>
+              <p className="text-xs text-muted-foreground">可新建云端任务，或连接本地 IDE 项目</p>
             </div>
           ) : (
             <>
@@ -3526,6 +4119,7 @@ export default function AutoCodePage({ onNavigate }: { onNavigate?: (page: AppPa
             onStop={() => activeTask && handleStopTask(activeTask.id)}
             onEnablePlanning={() => activeTask && openPlanningDialog(activeTask.id)}
             onUpdateToolPolicy={handleUpdateToolPolicy}
+            onConfirmReview={handleConfirmReview}
             onSetLocalRunnerMode={handleSetLocalRunnerMode}
             onSyncLocalSnapshot={handleSyncLocalSnapshot}
             onResolveApproval={async (event, approved) => {
@@ -3594,7 +4188,12 @@ export default function AutoCodePage({ onNavigate }: { onNavigate?: (page: AppPa
           )}
         </>
       ) : (
-        <EmptyState onNewTask={() => setNewTaskOpen(true)} queueStatus={queueStatus} queueStatusError={queueStatusError} />
+        <EmptyState
+          onNewTask={() => setNewTaskOpen(true)}
+          onConnectLocal={() => { setImportTab('local'); setImportOpen(true) }}
+          queueStatus={queueStatus}
+          queueStatusError={queueStatusError}
+        />
       )}
 
       {/* 新建任务弹窗 */}
@@ -3661,23 +4260,24 @@ export default function AutoCodePage({ onNavigate }: { onNavigate?: (page: AppPa
         </DialogContent>
       </Dialog>
 
-      {/* 导入项目弹窗（Git + 本地上传） */}
+      {/* 导入/连接项目弹窗（云端导入 + 本地 IDE 互联） */}
       <Dialog open={importOpen} onOpenChange={setImportOpen}>
         <DialogContent className="flex max-h-[90dvh] max-w-[95vw] flex-col overflow-hidden sm:max-w-md">
           <DialogHeader className="shrink-0">
             <DialogTitle className="flex items-center gap-2 text-base">
               <GitBranchPlus className="w-5 h-5" />
-              导入项目
+              连接或导入项目
             </DialogTitle>
             <DialogDescription>
-              从 Git 仓库、压缩包或本地目录导入项目。本地导入模式直接操作你电脑上的文件，不需要上传到服务器。
+              云端任务可从 Git 或压缩包创建工作区；本地 IDE 互联任务默认不上传完整项目，真实读写、命令和 Git 在你的电脑执行。
             </DialogDescription>
           </DialogHeader>
           {/* Tab 切换 */}
           <div className="flex shrink-0 items-center gap-1 border-b pb-0">
             {[
               { id: 'git' as const, label: 'Git 仓库', icon: GitBranchPlus },
-              { id: 'upload' as const, label: '本地上传', icon: FileArchive },{ id: 'local' as const, label: '本地导入', icon: FolderRoot },
+              { id: 'upload' as const, label: '本地上传', icon: FileArchive },
+              { id: 'local' as const, label: '本地 IDE 互联', icon: FolderRoot },
             ].map(({ id, label, icon: Icon }) => (
               <button
                 key={id}
@@ -3765,9 +4365,9 @@ export default function AutoCodePage({ onNavigate }: { onNavigate?: (page: AppPa
               {importTab === 'local' && (
                 <div className="space-y-4">
                   <div className="space-y-2">
-                    <p className="text-sm text-muted-foreground">本地导入模式会直接操作你电脑上的项目文件，不需要上传到服务器，也不需要安装 Python。首次使用只需安装一次 AutoCode Local Connector。</p>
+                    <p className="text-sm text-muted-foreground">本地 IDE 互联模式会直接操作你电脑上的项目文件。网页端继续提供需求输入、计划确认、Todo、审批、日志和结果展示；默认不上传完整代码到服务器。首次使用只需安装一次 AutoCode IDE / Local Connector。</p>
                     <div className="p-3 bg-muted/50 rounded-lg space-y-2">
-                      <p className="text-sm font-medium">步骤 1：连接本地项目</p>
+                      <p className="text-sm font-medium">步骤 1：连接本地 IDE 项目</p>
                       <div className="flex flex-col gap-1">
                         <Label htmlFor="local-project-path" className="text-xs text-muted-foreground">本地项目目录（可选，连接器也可以选择目录）</Label>
                         <div className="flex items-center gap-2">
@@ -3809,12 +4409,18 @@ export default function AutoCodePage({ onNavigate }: { onNavigate?: (page: AppPa
                           </Button>
                         </div>
                       </div>
-                      <p className="text-xs text-muted-foreground">点击“一键连接”会唤起已安装的本地连接器；如果浏览器没有反应，请先安装连接器。</p>
+                      <p className="text-xs text-muted-foreground">点击“一键连接”会唤起已安装的 AutoCode IDE / Local Connector；如果浏览器没有反应，请先安装或更新。</p>
+                      {connectorAutoImporting && (
+                        <div className="flex items-center gap-2 rounded-md border border-primary/20 bg-primary/5 px-2 py-1.5 text-xs text-primary">
+                          <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                          <span>正在通过连接器自动创建本地开发任务，请保持连接器窗口打开...</span>
+                        </div>
+                      )}
                       {localProjectGrants.length > 0 && (
                         <div className="rounded-md border bg-background/70 p-2">
                           <div className="mb-2 flex items-center justify-between gap-2">
                             <span className="text-xs font-medium">最近授权项目</span>
-                            <span className="text-[11px] text-muted-foreground">30 天内可快速连接</span>
+                            <span className="text-[11px] text-muted-foreground">在线项目可直接创建互联任务</span>
                           </div>
                           <div className="max-h-56 space-y-1.5 overflow-y-auto pr-1">
                             {localProjectGrants.map(grant => (
@@ -3826,14 +4432,17 @@ export default function AutoCodePage({ onNavigate }: { onNavigate?: (page: AppPa
                                   selectedLocalGrantId === grant.grant_id && 'border-primary/60 bg-primary/5'
                                 )}
                                 onClick={() => void handleUseLocalGrant(grant)}
-                                disabled={localImportSessionLoading}
+                                disabled={localImportSessionLoading || connectorAutoImporting}
                               >
                                 <span className="min-w-0">
                                   <span className="block truncate font-medium">{grant.project_name || grant.project_root || '本地项目'}</span>
                                   <span className="block truncate text-[11px] text-muted-foreground">{grant.project_root}</span>
                                 </span>
-                                <span className="shrink-0 text-[11px] text-muted-foreground">
-                                  {grant.expires_at ? `至 ${formatBeijingDateTime(grant.expires_at)}` : '30 天'}
+                                <span className="flex shrink-0 flex-col items-end gap-1 text-[11px] text-muted-foreground">
+                                  <span className={cn('inline-flex items-center rounded-full px-1.5 py-0.5', grant.device_online ? 'bg-green-500/10 text-green-600 dark:text-green-400' : 'bg-muted text-muted-foreground')}>
+                                    {grant.device_online ? '在线' : '离线'}
+                                  </span>
+                                  <span>{grant.expires_at ? `至 ${formatBeijingDateTime(grant.expires_at)}` : '30 天'}</span>
                                 </span>
                               </button>
                             ))}
@@ -3879,10 +4488,10 @@ export default function AutoCodePage({ onNavigate }: { onNavigate?: (page: AppPa
                     </div>
                     <div className="flex items-center gap-2">
                       <Switch id="sync-snapshots" checked={syncLocalSnapshots} onCheckedChange={setSyncLocalSnapshots} />
-                      <Label htmlFor="sync-snapshots" className="text-sm">同步项目快照到云端（用于云端执行、代码审查、版本回溯，可选）</Label>
+                      <Label htmlFor="sync-snapshots" className="text-sm">同步项目快照到云端（可选，用于切回云端执行、云端审查或版本回溯）</Label>
                     </div>
                     <p className="text-xs text-muted-foreground">
-                      未同步云端时，任务只能通过本地 Runner 执行；关闭本地执行会被拦截，避免云端工作区没有项目文件。
+                      默认不上传完整本地代码。未同步云端副本时，任务会保持本地 IDE 互联执行；只有你要切回云端工作区继续开发时才需要同步。
                     </p>
                   </div>
                 </div>
@@ -3894,15 +4503,17 @@ export default function AutoCodePage({ onNavigate }: { onNavigate?: (page: AppPa
               </div>
             )}
             <div className="flex justify-end gap-2 pt-2">
-              <Button variant="outline" onClick={() => { setImportOpen(false); setImportError(''); setImportGitUrl(''); setImportName(''); setImportUploadFile(null); setImportEnableSmartPlanning(false); setImportTab('git') }} disabled={importLoading}>取消</Button>
+              <Button variant="outline" onClick={() => { setImportOpen(false); setImportError(''); setImportGitUrl(''); setImportName(''); setImportUploadFile(null); setImportEnableSmartPlanning(false); setSyncLocalSnapshots(false); setConnectorAutoImporting(false); localImportAutoRegisterRef.current = false; localImportAutoLaunchRef.current = false; localImportAutoSyncToCloudRef.current = null; setImportTab('git') }} disabled={importLoading}>取消</Button>
               <Button
-                onClick={importTab === 'git' ? handleImportClone : importTab === 'upload' ? handleImportUpload : handleImportLocal}
-                disabled={importLoading}
+                onClick={importTab === 'git' ? handleImportClone : importTab === 'upload' ? handleImportUpload : () => { void handleImportLocal() }}
+                disabled={importLoading || connectorAutoImporting}
               >
-                {importLoading ? <Loader2 className="w-4 h-4 animate-spin mr-2" /> : importTab === 'git' ? <GitBranchPlus className="w-4 h-4 mr-2" /> : importTab === 'upload' ? <FileArchive className="w-4 h-4 mr-2" /> : <FolderRoot className="w-4 h-4 mr-2" />}
-                {importLoading
+                {(importLoading || connectorAutoImporting) ? <Loader2 className="w-4 h-4 animate-spin mr-2" /> : importTab === 'git' ? <GitBranchPlus className="w-4 h-4 mr-2" /> : importTab === 'upload' ? <FileArchive className="w-4 h-4 mr-2" /> : <FolderRoot className="w-4 h-4 mr-2" />}
+                {connectorAutoImporting
+                  ? '自动导入中...'
+                  : importLoading
                   ? (importTab === 'git' ? '克隆中...' : '处理中...')
-                  : (importTab === 'git' ? '开始克隆' : importTab === 'upload' ? '开始上传' : '导入本地项目')}
+                  : (importTab === 'git' ? '开始克隆' : importTab === 'upload' ? '开始上传' : '创建本地互联任务')}
               </Button>
             </div>
           </div>
@@ -4066,11 +4677,11 @@ function AutoCodeSidebar({
       <div className="p-3 space-y-2">
         <Button onClick={onNewTask} className="w-full gap-2 justify-start" size="sm">
           <Plus className="w-4 h-4" />
-          新建开发任务
+          新建云端任务
         </Button>
         <Button variant="outline" onClick={onImport} className="w-full gap-2 justify-start" size="sm">
           <GitBranchPlus className="w-4 h-4" />
-          导入项目
+          连接或导入项目
         </Button>
       </div>
 
@@ -4094,7 +4705,7 @@ function AutoCodeSidebar({
           <div className="flex flex-col items-center justify-center h-32 text-center px-3">
             <Sparkles className="w-7 h-7 text-muted-foreground/40 mb-2" />
             <p className="text-xs text-muted-foreground">还没有开发任务</p>
-            <p className="text-xs text-muted-foreground">点击"新建开发任务"开始</p>
+            <p className="text-xs text-muted-foreground">可新建云端任务，或连接本地 IDE 项目</p>
           </div>
         ) : (
           <>
@@ -4169,6 +4780,27 @@ function TaskItem({ task, active, onSelect, onDelete, onRename, onEnablePlanning
   const Icon = TYPE_ICON[task.projectType] || Globe
   const sc = STATUS_CONFIG[task.status] || STATUS_CONFIG['pending']
   const canContinue = task.status === 'failed' || task.status === 'stopped' || task.status === 'completed'
+  const localRunnerEnabled = Boolean(task.localExecutionEnabled || task.localRunner?.enabled)
+  const localRunnerConnected = Boolean(task.localRunner?.connected)
+  const localRunnerStale = task.localRunner?.connection_state === 'stale'
+  const localRunnerUpdateRequired = Boolean(task.localRunner?.connector_update_required)
+  const localProjectRoot = task.localRunner?.project_root || ''
+  const localProjectName = localProjectRoot
+    ? (localProjectRoot.split(/[\\/]/).filter(Boolean).pop() || localProjectRoot)
+    : ''
+  // 多项目并存时，仅显示“本地已连接”不够——附上项目名便于区分同列表多路会话。
+  const localRunnerLabel = localRunnerUpdateRequired
+    ? '连接器需更新'
+    : localRunnerConnected
+      ? (localProjectName ? `本地 · ${localProjectName}` : '本地已连接')
+      : localRunnerStale
+        ? '本地连接中断'
+        : '等待本地连接'
+  const localRunnerTone = localRunnerUpdateRequired
+    ? 'border-red-500/30 bg-red-500/10 text-red-600 dark:text-red-300'
+    : localRunnerConnected
+      ? 'border-green-500/30 bg-green-500/10 text-green-600 dark:text-green-300'
+      : 'border-amber-500/30 bg-amber-500/10 text-amber-700 dark:text-amber-300'
   const [editing, setEditing] = useState(false)
   const [draftTitle, setDraftTitle] = useState(task.title)
 
@@ -4222,6 +4854,19 @@ function TaskItem({ task, active, onSelect, onDelete, onRename, onEnablePlanning
           <span className={cn('text-[10px]', sc.color)}>{sc.label}</span>
           {task.status === 'running' && (
             <span className="text-[10px] text-muted-foreground">{task.progress}%</span>
+          )}
+          {localRunnerEnabled && (
+            <span
+              className={cn('inline-flex max-w-full items-center gap-1 rounded-full border px-1.5 py-0.5 text-[9px] font-medium', localRunnerTone)}
+              title={
+                localProjectRoot
+                  ? `${localRunnerLabel}\n${localProjectRoot}${task.localRunner?.session_id ? `\nsession: ${task.localRunner.session_id}` : ''}`
+                  : localRunnerLabel
+              }
+            >
+              <MonitorPlay className="h-2.5 w-2.5 shrink-0" />
+              <span className="truncate max-w-[9rem]">{localRunnerLabel}</span>
+            </span>
           )}
         </div>
         {!editing && (
@@ -4329,6 +4974,7 @@ function WorkspaceArea({
   onRetry, onStop,
   onEnablePlanning,
   onUpdateToolPolicy,
+  onConfirmReview,
   onSetLocalRunnerMode,
   onSyncLocalSnapshot,
   onResolveApproval,
@@ -4350,6 +4996,7 @@ function WorkspaceArea({
   onStop: () => void
   onEnablePlanning: () => void
   onUpdateToolPolicy: (policy: AutoCodeToolPolicy) => Promise<void>
+  onConfirmReview: (confirmed: boolean) => Promise<void>
   onSetLocalRunnerMode: (enabled: boolean, options?: { grant_id?: string; device_id?: string }) => Promise<void>
   onSyncLocalSnapshot: () => Promise<void>
   onResolveApproval: (event: AutoCodeRuntimeEvent, approved: boolean) => Promise<void>
@@ -4436,6 +5083,19 @@ function WorkspaceArea({
     '有一个操作需要审批'
   )
   const pendingApprovalMeta = useMemo(() => getApprovalMeta(pendingApprovalEvent), [pendingApprovalEvent])
+  const pendingUserInput = useMemo(() => getPendingUserInput(task), [task])
+  const waitingReviewConfirm = task.status === 'waiting_review_confirm'
+  const reviewIssueCount = task.review?.issues?.length ?? 0
+  const reviewScore = task.review?.score ?? 0
+  const [runDetailsOpen, setRunDetailsOpen] = useState(false)
+  const conversationMessages = useMemo(
+    () => (task.messages || []).filter(msg => msg.role !== 'system'),
+    [task.messages],
+  )
+  const activityMessages = useMemo(
+    () => (task.messages || []).filter(msg => msg.role === 'system'),
+    [task.messages],
+  )
   const refreshLocalDeviceGrants = useCallback(async () => {
     try {
       setLocalDeviceGrants(await listAutoCodeLocalProjectGrants())
@@ -4536,12 +5196,12 @@ function WorkspaceArea({
   }, [localRunner?.launch_url])
   const handleLaunchLocalConnector = useCallback(() => {
     if (!localRunner?.launch_url) {
-      toast.warning('请先开启本地执行模式生成连接会话')
+      toast.warning('请先开启本地 IDE 互联生成连接会话')
       return
     }
     window.location.href = localRunner.launch_url
-    toast.info('正在唤起 AutoCode Local Connector', {
-      description: '如果浏览器没有反应，请先安装本地连接器，或使用高级脚本方式。',
+    toast.info('正在唤起 AutoCode IDE / Local Connector', {
+      description: '如果浏览器没有反应，请先安装或更新本地连接器，或使用高级脚本方式。',
     })
   }, [localRunner?.launch_url])
   const [localRequestedFilePath, setLocalRequestedFilePath] = useState<string | null>(null)
@@ -4759,21 +5419,21 @@ function WorkspaceArea({
                     >
                       {updatingLocalRunner ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <MonitorPlay className="h-3.5 w-3.5" />}
                       <span className="hidden xl:inline">
-                        {localRunnerUpdateRequired ? '需更新' : localRunnerConnected ? '本地已连接' : localRunnerEnabled ? '等待本地' : '云端执行'}
+                        {localRunnerUpdateRequired ? '需更新' : localRunnerConnected ? '本地 IDE' : localRunnerEnabled ? '等待 IDE' : '云端工作区'}
                       </span>
                       <ChevronDown className="h-3 w-3 opacity-60" />
                     </Button>
                   </DropdownMenuTrigger>
                 </TooltipTrigger>
-                <TooltipContent>本地执行模式</TooltipContent>
+                <TooltipContent>执行目标 / 本地 IDE 互联</TooltipContent>
               </Tooltip>
               <DropdownMenuContent align="end" className="w-96 max-w-[calc(100vw-1rem)]">
                 <div className="px-3 py-2">
                   <div className="flex items-center justify-between gap-3">
                     <div>
-                      <div className="text-xs font-medium">本地执行模式</div>
+                      <div className="text-xs font-medium">执行目标 / 本地 IDE 互联</div>
                       <div className="mt-0.5 text-[11px] text-muted-foreground">
-                        让 AI 在你的电脑项目目录中读写文件、运行测试，再把变更镜像回云端审查。
+                        云端开发使用服务器工作区；本地 IDE 互联由网页端负责任务、计划、审批和进度，真实文件、终端、Git 与验证优先在你的电脑执行。
                       </div>
                     </div>
                     <Button
@@ -4789,7 +5449,7 @@ function WorkspaceArea({
                 <DropdownMenuSeparator />
                 <div className="space-y-2 px-3 py-2 text-[11px] leading-relaxed text-muted-foreground">
                   <div className={cn('font-medium', localRunnerUpdateRequired ? 'text-red-600 dark:text-red-400' : localRunnerConnected ? 'text-green-600 dark:text-green-400' : localRunnerEnabled ? 'text-amber-600 dark:text-amber-400' : 'text-muted-foreground')}>
-                    {localRunnerUpdateRequired ? '本地连接器版本过低，请安装最新版' : localRunnerConnected ? `已连接：${localRunner?.project_root || '本地项目'}` : localRunnerEnabled ? '已开启，等待本地 Runner 连接' : '当前使用服务器工作区执行'}
+                    {localRunnerUpdateRequired ? '本地连接器版本过低，请安装最新版' : localRunnerConnected ? `本地 IDE 已连接：${localRunner?.project_root || '本地项目'}` : localRunnerEnabled ? '已开启，等待 AutoCode IDE / Local Connector 连接' : '当前使用云端工作区执行'}
                   </div>
                   {(localRunnerEnabled || localRunnerConnected || localDeviceGrants.length > 0) && (
                     <>
@@ -4815,12 +5475,12 @@ function WorkspaceArea({
                             : <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />}
                           <div className="min-w-0 flex-1">
                             <div className="font-medium">
-                              {task.cloudSnapshotStatus === 'synced' ? '云端副本已同步' : '本地导入项目尚未同步云端副本'}
+                              {task.cloudSnapshotStatus === 'synced' ? '云端副本已同步' : '本地互联任务未同步云端副本'}
                             </div>
                             <div className="mt-0.5">
                               {task.cloudSnapshotStatus === 'synced'
-                                ? '关闭本地执行后，AI 可以使用云端工作区继续操作。'
-                                : task.cloudSnapshotError || '关闭本地执行前需要先同步云端副本，否则云端没有项目文件。'}
+                                ? '如需切回云端执行，AI 可以使用这份云端工作区继续操作。'
+                                : task.cloudSnapshotError || '默认不会上传完整本地代码；只有要切回云端执行或云端审查时才需要同步。'}
                             </div>
                           </div>
                           {needsCloudSnapshot && (
@@ -5018,6 +5678,62 @@ function WorkspaceArea({
           </div>
         )}
 
+        {waitingReviewConfirm && (
+          <div className="shrink-0 border-b border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs">
+            <div className="flex flex-wrap items-center gap-2">
+              <Shield className="h-4 w-4 shrink-0 text-amber-600" />
+              <div className="min-w-0 flex-1 text-amber-950 dark:text-amber-50">
+                <div className="font-medium">产物审查需要确认</div>
+                <div className="mt-0.5 text-amber-900/80 dark:text-amber-100/80">
+                  分数 {reviewScore}/100，发现 {reviewIssueCount} 个问题。确认后继续执行，拒绝会停止任务。
+                </div>
+              </div>
+              <Button
+                size="sm"
+                variant="ghost"
+                className="h-8 px-2 text-xs"
+                onClick={() => onTabChange('review')}
+              >
+                查看审查
+              </Button>
+              <Button
+                size="sm"
+                variant="outline"
+                className="h-8 px-2 text-xs"
+                onClick={() => { void onConfirmReview(false) }}
+              >
+                拒绝
+              </Button>
+              <Button
+                size="sm"
+                className="h-8 px-2 text-xs"
+                onClick={() => { void onConfirmReview(true) }}
+              >
+                确认继续
+              </Button>
+            </div>
+          </div>
+        )}
+
+        {task.activeExecutionPlan && (
+          <div className="flex shrink-0 items-center gap-2 border-b bg-emerald-500/5 px-3 py-1.5 text-[11px] text-muted-foreground">
+            <CircleDot className="h-3.5 w-3.5 shrink-0 text-emerald-600" />
+            <span className="min-w-0 flex-1 truncate">
+              AI 执行计划：{toDisplayText(task.activeExecutionPlan.task_family, toDisplayText(task.activeExecutionPlan.intent, '通用任务'))}
+              {' · '}{summarizeStructuredList(task.activeExecutionPlan.required_capabilities) || '通用能力'}
+              {' · '}{Array.isArray(task.activeExecutionPlan.artifact_contracts) ? task.activeExecutionPlan.artifact_contracts.length : 0} 个目标产物
+            </span>
+            <Button
+              variant="ghost"
+              size="sm"
+              className="h-6 shrink-0 px-2 text-[11px]"
+              onClick={() => onTabChange('events')}
+            >
+              查看依据
+            </Button>
+          </div>
+        )}
+
         {task.projectRecon && (
           <div className="flex shrink-0 items-center gap-2 border-b bg-blue-500/5 px-3 py-1.5 text-[11px] text-muted-foreground">
             <FileSearch className="h-3.5 w-3.5 shrink-0 text-blue-500" />
@@ -5044,13 +5760,14 @@ function WorkspaceArea({
           {[
             { id: 'preview' as const, icon: Eye, label: '预览' },
             { id: 'files' as const, icon: FolderIcon, label: '文件' },
+            { id: 'editor' as const, icon: Code2, label: '编辑器' },
             { id: 'workfiles' as const, icon: FileText, label: '工作文件' },
             { id: 'plan' as const, icon: CircleDot, label: '计划' },
             { id: 'terminal' as const, icon: Terminal, label: '终端' },
             { id: 'git' as const, icon: GitBranch, label: 'Git' },
             { id: 'events' as const, icon: Activity, label: '活动', badge: pendingApprovalEvent ? '!' : undefined },
             { id: 'prototype' as const, icon: Sparkles, label: 'UI原型' },
-            { id: 'review' as const, icon: Shield, label: '代码审查', badge: task.review ? (task.review.passed ? '✓' : '!') : undefined },
+            { id: 'review' as const, icon: Shield, label: '产物审查', badge: task.review ? (task.review.passed ? '✓' : '!') : undefined },
           ].map(({ id, icon: TabIcon, label, badge }: { id: string; icon: React.ElementType; label: string; badge?: string }) => (
             <button
               key={id}
@@ -5088,6 +5805,17 @@ function WorkspaceArea({
               }}
             />
           )}
+          {activeTab === 'editor' && (
+            <EditorPanel
+              task={task}
+              requestedPath={requestedFileRequest?.path || localRequestedFilePath}
+              requestedLine={requestedFileRequest?.line}
+              onRequestedPathHandled={() => {
+                setLocalRequestedFilePath(null)
+                onRequestedFilePathHandled?.()
+              }}
+            />
+          )}
           {activeTab === 'workfiles' && (
             <WorkFilesPanel
               task={task}
@@ -5113,7 +5841,7 @@ function WorkspaceArea({
             <PrototypePanel task={task} />
           )}
           {activeTab === 'review' && (
-            <ReviewPanel task={task} />
+            <ReviewPanel task={task} onConfirmReview={onConfirmReview} />
           )}
         </div>
       </div>
@@ -5141,36 +5869,77 @@ function WorkspaceArea({
           <span className="text-sm font-medium">AI 开发助手</span>
           {/* 模型选择器 */}
           <ModelSelector taskModel={task.model} />
-          <span className="ml-auto text-[10px] text-muted-foreground bg-muted px-1.5 py-0.5 rounded shrink-0">
-            {task.messages.length} 条消息
-          </span>
+          <Button
+            size="sm"
+            variant="ghost"
+            className="ml-auto h-7 shrink-0 gap-1.5 px-2 text-[11px] text-muted-foreground"
+            onClick={() => setRunDetailsOpen(true)}
+          >
+            <Activity className="h-3.5 w-3.5" />
+            运行详情
+            {activityMessages.length > 0 && (
+              <span className="rounded bg-muted px-1 py-0.5 text-[10px]">{activityMessages.length}</span>
+            )}
+          </Button>
         </div>
 
-        {/* 当前步骤提示 */}
-        {task.status === 'running' && (
-          <div className="mx-3 mt-3 px-3 py-2 bg-blue-500/10 rounded-lg border border-blue-500/20">
-            <div className="flex items-center gap-1.5">
-              <Loader2 className="w-3.5 h-3.5 text-blue-500 animate-spin shrink-0" />
-              <p className="text-xs text-blue-600 dark:text-blue-400 font-medium">{task.currentStep}</p>
+        <Dialog open={runDetailsOpen} onOpenChange={setRunDetailsOpen}>
+          <DialogContent className="max-h-[86dvh] max-w-[95vw] overflow-hidden sm:max-w-3xl">
+            <DialogHeader>
+              <DialogTitle className="flex items-center gap-2 text-base">
+                <Activity className="h-4 w-4" />
+                运行详情
+              </DialogTitle>
+              <DialogDescription>
+                任务状态、驾驶舱、工具调用和系统流水集中放在这里，聊天区保持干净。
+              </DialogDescription>
+            </DialogHeader>
+            <ScrollArea className="max-h-[66dvh] pr-3">
+              <div className="space-y-3">
+                {task.status === 'running' && task.currentStep && (
+                  <div className="rounded-md border border-blue-500/20 bg-blue-500/10 px-3 py-2 text-xs text-blue-700 dark:text-blue-300">
+                    <div className="flex items-center gap-1.5">
+                      <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin" />
+                      <span className="font-medium">{task.currentStep}</span>
+                    </div>
+                  </div>
+                )}
+                {task.runtimeNote && task.runtimeState !== 'terminal' && (
+                  <div className="rounded-md border bg-muted/45 px-3 py-2 text-xs text-muted-foreground">
+                    <div className="flex items-center gap-1.5">
+                      {task.runtimeState === 'active' ? <CircleDot className="h-3.5 w-3.5 shrink-0" /> : <Clock className="h-3.5 w-3.5 shrink-0" />}
+                      <span>{task.runtimeNote}</span>
+                    </div>
+                  </div>
+                )}
+                <AutoCodeCockpit task={task} compact />
+                <div className="rounded-md border bg-muted/20 p-2">
+                  <div className="mb-2 flex items-center justify-between gap-2 px-1 text-xs font-medium text-muted-foreground">
+                    <span>工具与系统流水</span>
+                    <span>{activityMessages.length} 条</span>
+                  </div>
+                  {activityMessages.length === 0 ? (
+                    <div className="px-2 py-6 text-center text-xs text-muted-foreground">暂无工具流水</div>
+                  ) : (
+                    <div className="space-y-2">
+                      {activityMessages.map(msg => (
+                        <ChatBubble
+                          key={msg.id}
+                          msg={msg}
+                          onOpenFile={openWorkspaceFile}
+                          undoTaskId={task.backendTaskId || task.id}
+                        />
+                      ))}
+                    </div>
+                  )}
+                </div>
+              </div>
+            </ScrollArea>
+            <div className="flex justify-end">
+              <Button variant="outline" onClick={() => setRunDetailsOpen(false)}>关闭</Button>
             </div>
-          </div>
-        )}
-
-        {task.runtimeNote && task.runtimeState !== 'terminal' && (
-          <div className={cn(
-            'mx-3 mt-2 px-3 py-2 rounded-lg border text-xs',
-            task.runtimeState === 'active'
-              ? 'bg-emerald-500/10 border-emerald-500/20 text-emerald-700 dark:text-emerald-400'
-              : task.runtimeState === 'waiting'
-                ? 'bg-amber-500/10 border-amber-500/25 text-amber-700 dark:text-amber-400'
-                : 'bg-muted/60 border-border text-muted-foreground'
-          )}>
-            <div className="flex items-center gap-1.5">
-              {task.runtimeState === 'active' ? <CircleDot className="w-3.5 h-3.5 shrink-0" /> : <Clock className="w-3.5 h-3.5 shrink-0" />}
-              <span className="leading-relaxed">{task.runtimeNote}</span>
-            </div>
-          </div>
-        )}
+          </DialogContent>
+        </Dialog>
 
         {/* 停止/失败/完成后的"继续"提示横幅 */}
         {(task.status === 'stopped' || task.status === 'failed' || task.status === 'completed') && (
@@ -5190,11 +5959,26 @@ function WorkspaceArea({
         )}
 
         {/* 消息列表 */}
-        <ScrollArea className="flex-1 px-3 py-2 min-w-0">
-          <div className="space-y-3 min-w-0 pb-4">
-            {task.messages.map(msg => (
-              <ChatBubble key={msg.id} msg={msg} onOpenFile={openWorkspaceFile} />
-            ))}
+        <ScrollArea className="flex-1 px-4 py-4 min-w-0">
+          <div className="space-y-4 min-w-0 pb-4">
+            {conversationMessages.length === 0 && !chatLoading ? (
+              <div className="flex h-full min-h-[220px] flex-col items-center justify-center gap-2 text-center text-sm text-muted-foreground">
+                <Bot className="h-8 w-8 text-muted-foreground/35" />
+                <div className="font-medium text-foreground">干净对话模式</div>
+                <div className="max-w-[260px] text-xs leading-5">
+                  运行细节已收进右上角“运行详情”，这里专注显示你和 AI 的交流。
+                </div>
+              </div>
+            ) : (
+              conversationMessages.map(msg => (
+                <ChatBubble
+                  key={msg.id}
+                  msg={msg}
+                  onOpenFile={openWorkspaceFile}
+                  undoTaskId={task.backendTaskId || task.id}
+                />
+              ))
+            )}
             {chatLoading && (
               <div className="flex items-start gap-2">
                 <div className="w-6 h-6 rounded-full bg-primary/10 flex items-center justify-center shrink-0">
@@ -5222,23 +6006,52 @@ function WorkspaceArea({
           placeholder={
             task.status === 'running'
               ? '告诉 AI 你想要的功能，或上传图片/文件...'
+              : task.status === 'waiting_user_input'
+                ? '选择一个处理方式，或直接输入路径和补充说明...'
+              : task.status === 'waiting_review_confirm'
+                ? '请先确认产物审查结果，或输入“确认/继续”“拒绝/取消”...'
               : task.status === 'completed' || task.status === 'failed' || task.status === 'stopped'
                 ? '输入新指令让 AI 继续开发，可修改需求...'
                 : '告诉 AI 你想要的功能...'
           }
           hintText="Enter 发送 · Shift+Enter 换行 · 支持粘贴截图和文件"
           aboveSlot={
-            <div className="flex gap-1 mb-2 overflow-x-auto px-2 sm:px-0 pb-1">
-              {['添加登录功能', '优化样式', '添加深色模式', '一键部署'].map(q => (
-                <button
-                  key={q}
-                  onClick={() => onSend(q)}
-                  className="shrink-0 text-[10px] px-2 py-1 rounded-full border border-border hover:bg-accent transition-colors text-muted-foreground hover:text-foreground"
-                >
-                  {q}
-                </button>
-              ))}
-            </div>
+            pendingUserInput ? (
+              <PendingUserInputCard
+                pendingUserInput={pendingUserInput}
+                chatLoading={chatLoading}
+                onSend={onSend}
+              />
+            ) : waitingReviewConfirm ? (
+              <div className="mb-2 rounded-lg border border-amber-500/30 bg-amber-500/10 p-2 text-xs">
+                <div className="flex items-start gap-2">
+                  <Shield className="mt-0.5 h-3.5 w-3.5 shrink-0 text-amber-600" />
+                  <div className="min-w-0 flex-1">
+                    <div className="font-medium text-amber-950 dark:text-amber-50">产物审查等待确认</div>
+                    <div className="mt-0.5 text-[11px] text-amber-900/80 dark:text-amber-100/80">
+                      分数 {reviewScore}/100，问题 {reviewIssueCount} 个。
+                    </div>
+                  </div>
+                </div>
+                <div className="mt-2 flex gap-2">
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    className="h-7 flex-1 text-xs"
+                    onClick={() => { void onConfirmReview(false) }}
+                  >
+                    拒绝
+                  </Button>
+                  <Button
+                    size="sm"
+                    className="h-7 flex-1 text-xs"
+                    onClick={() => { void onConfirmReview(true) }}
+                  >
+                    确认继续
+                  </Button>
+                </div>
+              </div>
+            ) : null
           }
         />
       </div>
@@ -5270,6 +6083,267 @@ function SimpleMarkdown({ content }: { content: string }) {
   )
 }
 
+function AutoCodeCockpit({ task, compact = false }: { task: AutoCodeTask; compact?: boolean }) {
+  const [reportOpen, setReportOpen] = useState(false)
+  const events = Array.isArray(task.events) ? task.events : []
+  const changedFiles = collectReviewChangedFiles(task)
+  const report = task.completionReport || {}
+  const hasReport = Object.keys(report).length > 0
+  const reportChanged = toTextArray(report.changed_files)
+  const autoDecision = [...events].reverse().find(event => event.type === 'agent_auto_decision')
+  const validation = (report.validation && typeof report.validation === 'object' ? report.validation : {}) as Record<string, unknown>
+  const validationCommands = toTextArray(validation.commands)
+  const validationEvidence = toTextArray(validation.evidence || report.validation_evidence)
+  const coverage = toTextArray(report.requirements_coverage)
+  const uiEntrypoints = toTextArray(report.ui_entrypoints || report.ui_entry || report.entrypoints)
+  const unfinished = toTextArray(report.unfinished_items || report.open_items)
+  const reproSteps = toTextArray(report.reproduction_steps || report.user_repro_steps || report.how_to_verify)
+  const reviewIssueCount = task.review?.issues?.length ?? 0
+  const reviewScore = task.review?.score
+  const primaryFiles = (reportChanged.length ? reportChanged : changedFiles).slice(0, 4)
+  const risks = toTextArray(report.risks).slice(0, 2)
+  const nextAction = task.status === 'waiting_user_input'
+    ? '等待硬阻塞确认'
+    : task.status === 'running' || task.status === 'pending'
+      ? (autoDecision ? '强自主继续执行' : '自动执行中')
+      : task.status === 'completed'
+        ? '查看完成报告'
+        : task.currentStep || '待命'
+
+  return (
+    <div className={cn('rounded-lg border bg-background/70 p-3 text-xs', !compact && 'mx-3 mt-3')}>
+      <div className="mb-2 flex items-center justify-between gap-2">
+        <div className="flex items-center gap-1.5 font-medium">
+          <Activity className="h-3.5 w-3.5 text-primary" />
+          任务驾驶舱
+        </div>
+        <div className="flex items-center gap-1.5">
+          {hasReport && (
+            <Button size="sm" variant="outline" className="h-6 px-2 text-[10px]" onClick={() => setReportOpen(true)}>
+              完成报告
+            </Button>
+          )}
+          <Badge variant="secondary" className="h-5 px-1.5 text-[10px]">
+            {task.autonomyMode === 'strong' ? '强自主' : task.autonomyMode || 'strong'}
+          </Badge>
+        </div>
+      </div>
+      <div className="grid gap-2 sm:grid-cols-2">
+        <div className="min-w-0 rounded-md bg-muted/45 px-2 py-1.5">
+          <div className="text-[10px] text-muted-foreground">目标</div>
+          <div className="truncate font-medium" title={task.description || task.title}>{task.description || task.title}</div>
+        </div>
+        <div className="min-w-0 rounded-md bg-muted/45 px-2 py-1.5">
+          <div className="text-[10px] text-muted-foreground">下一步</div>
+          <div className="truncate font-medium" title={nextAction}>{nextAction}</div>
+        </div>
+        <div className="min-w-0 rounded-md bg-muted/45 px-2 py-1.5">
+          <div className="text-[10px] text-muted-foreground">主要文件</div>
+          <div className="truncate font-medium" title={primaryFiles.join(', ') || '暂无'}>
+            {primaryFiles.length ? primaryFiles.join(', ') : '暂无'}
+          </div>
+        </div>
+        <div className="min-w-0 rounded-md bg-muted/45 px-2 py-1.5">
+          <div className="text-[10px] text-muted-foreground">验证 / 审查</div>
+          <div className="truncate font-medium" title={validationCommands.join(', ')}>
+            {validationCommands[0] || '未记录命令'}
+            {reviewScore !== undefined ? ` · 审查 ${reviewScore}/100 (${reviewIssueCount})` : ''}
+          </div>
+        </div>
+      </div>
+      {(risks.length > 0 || autoDecision) && (
+        <div className="mt-2 rounded-md border border-amber-500/20 bg-amber-500/10 px-2 py-1.5 text-[11px] text-amber-800 dark:text-amber-100">
+          {risks[0] || toDisplayText(autoDecision?.payload?.default_action, '已自动处理软阻塞并继续。')}
+        </div>
+      )}
+      <Dialog open={reportOpen} onOpenChange={setReportOpen}>
+        <DialogContent className="max-h-[85dvh] max-w-[95vw] overflow-hidden sm:max-w-3xl">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2 text-base">
+              <ListChecks className="h-4 w-4" />
+              完成报告
+            </DialogTitle>
+            <DialogDescription>
+              汇总需求覆盖、入口、改动文件、验证证据、未完成项和复现步骤。
+            </DialogDescription>
+          </DialogHeader>
+          <ScrollArea className="max-h-[62dvh] pr-3">
+            <div className="space-y-3 text-xs">
+              <CompletionReportSection title="需求覆盖" empty="未记录需求覆盖" hasContent={coverage.length > 0}>
+                <TextList items={coverage} />
+              </CompletionReportSection>
+              <CompletionReportSection title="UI 入口" empty="未记录 UI 入口" hasContent={uiEntrypoints.length > 0}>
+                <TextList items={uiEntrypoints} />
+              </CompletionReportSection>
+              <CompletionReportSection title="改动文件" empty="未记录改动文件" hasContent={(reportChanged.length ? reportChanged : changedFiles).length > 0}>
+                <TextList items={(reportChanged.length ? reportChanged : changedFiles)} mono />
+              </CompletionReportSection>
+              <CompletionReportSection title="验证证据" empty="未记录验证证据" hasContent={[...validationCommands, ...validationEvidence].length > 0}>
+                <TextList items={[...validationCommands, ...validationEvidence]} mono />
+              </CompletionReportSection>
+              <CompletionReportSection title="剩余风险" empty="未记录剩余风险" hasContent={(risks.length ? toTextArray(report.risks) : []).length > 0}>
+                <TextList items={risks.length ? toTextArray(report.risks) : []} />
+              </CompletionReportSection>
+              <CompletionReportSection title="未完成项" empty="无明确未完成项" hasContent={unfinished.length > 0}>
+                <TextList items={unfinished} />
+              </CompletionReportSection>
+              <CompletionReportSection title="用户可复现步骤" empty="未记录复现步骤" hasContent={reproSteps.length > 0}>
+                <TextList items={reproSteps} />
+              </CompletionReportSection>
+            </div>
+          </ScrollArea>
+          <div className="flex justify-end">
+            <Button variant="outline" onClick={() => setReportOpen(false)}>关闭</Button>
+          </div>
+        </DialogContent>
+      </Dialog>
+    </div>
+  )
+}
+
+function CompletionReportSection({
+  title,
+  empty,
+  hasContent,
+  children,
+}: {
+  title: string
+  empty: string
+  hasContent: boolean
+  children: JSX.Element | null
+}) {
+  return (
+    <div>
+      <div className="mb-1 font-medium text-muted-foreground">{title}</div>
+      <div className="rounded-md border bg-muted/35 p-3 leading-5">
+        {hasContent ? children : <span className="text-muted-foreground">{empty}</span>}
+      </div>
+    </div>
+  )
+}
+
+function TextList({ items, mono = false }: { items: string[]; mono?: boolean }) {
+  if (!items.length) return null
+  return (
+    <div className="space-y-1">
+      {items.map((item, index) => (
+        <div key={`${item}-${index}`} className={cn('whitespace-pre-wrap break-words', mono && 'font-mono')}>
+          {item}
+        </div>
+      ))}
+    </div>
+  )
+}
+
+function PendingUserInputCard({
+  pendingUserInput,
+  chatLoading,
+  onSend,
+}: {
+  pendingUserInput: PendingUserInputView
+  chatLoading: boolean
+  onSend: (message: string) => void
+}) {
+  const [detailsOpen, setDetailsOpen] = useState(false)
+  const evidence = (pendingUserInput.intervention?.evidence && typeof pendingUserInput.intervention.evidence === 'object'
+    ? pendingUserInput.intervention.evidence
+    : {}) as Record<string, unknown>
+  const evidenceFiles = toTextArray(evidence.files)
+  const defaultAction = pendingUserInput.defaultAction || pendingUserInput.options[0]?.message || '请基于现有上下文继续实现；缺少明确入口时按最合理位置新建或接入。'
+
+  return (
+    <>
+      <div className="mb-2 rounded-md border border-amber-500/30 bg-amber-500/10 p-3 text-xs">
+        <div className="flex items-start gap-2">
+          <MessageCircleQuestion className="mt-0.5 h-4 w-4 shrink-0 text-amber-600" />
+          <div className="min-w-0 flex-1">
+            <div className="font-medium text-amber-950 dark:text-amber-50">需要你的选择</div>
+            <div className="mt-1 max-h-16 overflow-hidden text-[11px] leading-5 text-amber-900/80 dark:text-amber-100/80">
+              {pendingUserInput.question}
+            </div>
+          </div>
+        </div>
+        <div className="mt-2 flex flex-wrap gap-2">
+          <Button
+            size="sm"
+            className="h-7 text-xs"
+            disabled={chatLoading}
+            onClick={() => onSend(defaultAction)}
+          >
+            采用推荐继续
+          </Button>
+          <Button
+            size="sm"
+            variant="outline"
+            className="h-7 text-xs"
+            onClick={() => setDetailsOpen(true)}
+          >
+            展开详情
+          </Button>
+          {pendingUserInput.options.map(option => (
+            <Button
+              key={option.label}
+              size="sm"
+              variant="outline"
+              className="h-7 text-xs"
+              disabled={chatLoading}
+              onClick={() => onSend(option.message)}
+            >
+              {option.label}
+            </Button>
+          ))}
+        </div>
+        {pendingUserInput.allowFreeText && (
+          <div className="mt-2 text-[11px] text-muted-foreground">
+            也可以直接在下方输入源码路径、页面位置或其他补充说明。
+          </div>
+        )}
+      </div>
+      <Dialog open={detailsOpen} onOpenChange={setDetailsOpen}>
+        <DialogContent className="max-h-[85dvh] max-w-[95vw] overflow-hidden sm:max-w-2xl">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2 text-base">
+              <MessageCircleQuestion className="h-4 w-4" />
+              阻塞详情
+            </DialogTitle>
+            <DialogDescription>
+              完整原因、证据和推荐动作都在这里，不再挤在输入框上方的小卡片里。
+            </DialogDescription>
+          </DialogHeader>
+          <ScrollArea className="max-h-[60dvh] pr-3">
+            <div className="space-y-3 text-sm">
+              <div>
+                <div className="mb-1 text-xs font-medium text-muted-foreground">完整内容</div>
+                <div className="whitespace-pre-wrap rounded-md border bg-muted/40 p-3 text-xs leading-5">
+                  {pendingUserInput.fullText}
+                </div>
+              </div>
+              {evidenceFiles.length > 0 && (
+                <div>
+                  <div className="mb-1 text-xs font-medium text-muted-foreground">证据文件</div>
+                  <div className="flex flex-wrap gap-1.5">
+                    {evidenceFiles.map(file => (
+                      <Badge key={file} variant="outline" className="max-w-full truncate">{file}</Badge>
+                    ))}
+                  </div>
+                </div>
+              )}
+              <div>
+                <div className="mb-1 text-xs font-medium text-muted-foreground">推荐动作</div>
+                <div className="rounded-md border bg-primary/5 p-3 text-xs leading-5">{defaultAction}</div>
+              </div>
+            </div>
+          </ScrollArea>
+          <div className="flex justify-end gap-2">
+            <Button variant="outline" onClick={() => setDetailsOpen(false)}>关闭</Button>
+            <Button disabled={chatLoading} onClick={() => { setDetailsOpen(false); onSend(defaultAction) }}>采用推荐继续</Button>
+          </div>
+        </DialogContent>
+      </Dialog>
+    </>
+  )
+}
+
 const WORKSPACE_FILE_PATTERN = /(?:^|[\s([`"'，。；：])((?:(?:\.?\/)?(?:src|app|components|pages|lib|utils|hooks|store|stores|backend|frontend|agent-platform|public|api|core|services|schemas|tests|test|deploy|scripts|\.autocode)\/|[A-Za-z0-9_.-]+\/)[A-Za-z0-9_./@()+-]+\.(?:tsx|ts|jsx|js|mjs|cjs|vue|svelte|css|scss|less|html|md|json|py|java|kt|go|rs|php|rb|sh|ps1|sql|yml|yaml|toml|xml|env|txt))(?:[:#][0-9]+)?/g
 
 function extractFileReferences(content: string): string[] {
@@ -5286,14 +6360,164 @@ function extractFileReferences(content: string): string[] {
 }
 
 // ──────────────────────────────────────────
+// code_editor 文件编辑卡片（diff 展示 + 撤销）
+// ──────────────────────────────────────────
+
+const EDIT_COMMAND_LABEL: Record<string, string> = {
+  create: '新建文件',
+  str_replace: '替换内容',
+  insert: '插入内容',
+  undo_edit: '撤销编辑',
+}
+
+function FileEditCard({
+  path,
+  diff,
+  command,
+  undoTaskId,
+  onOpenFile,
+}: {
+  path: string
+  diff: string
+  command: string
+  undoTaskId?: string
+  onOpenFile?: (path: string) => void
+}) {
+  const [undoing, setUndoing] = useState(false)
+  const [undone, setUndone] = useState(false)
+  const [collapsed, setCollapsed] = useState(false)
+
+  const { added, removed } = useMemo(() => {
+    let a = 0, r = 0
+    for (const line of diff.split('\n')) {
+      if (line.startsWith('+') && !line.startsWith('+++')) a++
+      else if (line.startsWith('-') && !line.startsWith('---')) r++
+    }
+    return { added: a, removed: r }
+  }, [diff])
+
+  const handleUndo = async () => {
+    if (!undoTaskId || undoing || undone) return
+    setUndoing(true)
+    try {
+      const res = await undoAutoCodeCodeEditor(undoTaskId, path)
+      if (res.ok) {
+        setUndone(true)
+        toast.success(res.deleted ? `已撤销并删除 ${path}` : `已撤销对 ${path} 的编辑`)
+      } else {
+        toast.error(res.result || '撤销失败')
+      }
+    } catch (e) {
+      toast.error((e as Error)?.message || '撤销失败')
+    } finally {
+      setUndoing(false)
+    }
+  }
+
+  const cmdLabel = EDIT_COMMAND_LABEL[command] || command
+
+  return (
+    <div className="flex justify-center py-0.5">
+      <div className={cn(
+        'w-full max-w-[95%] overflow-hidden rounded-md border border-border/50 bg-muted/20 backdrop-blur-sm',
+        undone && 'opacity-60'
+      )}>
+        {/* 头部：文件路径 + 增删统计 + 操作 */}
+        <div className="flex items-center gap-2 border-b border-border/40 bg-muted/40 px-2.5 py-1.5">
+          <FilePen className="w-3.5 h-3.5 shrink-0 text-sky-500" />
+          <button
+            type="button"
+            onClick={() => onOpenFile?.(path)}
+            className="min-w-0 flex-1 truncate text-left text-[11px] font-mono text-foreground/90 hover:text-primary hover:underline"
+            title={`打开 ${path}`}
+          >
+            {path}
+          </button>
+          <span className="shrink-0 rounded bg-muted px-1.5 py-0.5 text-[9px] font-medium text-muted-foreground">
+            {cmdLabel}
+          </span>
+          {(added > 0 || removed > 0) && (
+            <span className="shrink-0 font-mono text-[10px] tabular-nums">
+              <span className="text-emerald-500">+{added}</span>{' '}
+              <span className="text-red-500">−{removed}</span>
+            </span>
+          )}
+          <button
+            type="button"
+            onClick={() => setCollapsed(c => !c)}
+            className="shrink-0 text-muted-foreground/60 hover:text-foreground"
+            title={collapsed ? '展开 Diff' : '收起 Diff'}
+          >
+            {collapsed ? <ChevronRight className="w-3.5 h-3.5" /> : <ChevronDown className="w-3.5 h-3.5" />}
+          </button>
+          {undoTaskId && (
+            <button
+              type="button"
+              onClick={handleUndo}
+              disabled={undoing || undone}
+              className={cn(
+                'flex shrink-0 items-center gap-1 rounded px-1.5 py-0.5 text-[10px] font-medium transition-colors',
+                undone
+                  ? 'text-muted-foreground/50'
+                  : 'text-amber-600 hover:bg-amber-500/10 hover:text-amber-500 disabled:opacity-50'
+              )}
+              title={undone ? '已撤销' : '撤销此次编辑'}
+            >
+              {undoing ? <Loader2 className="w-3 h-3 animate-spin" /> : <Undo2 className="w-3 h-3" />}
+              {undone ? '已撤销' : '撤销'}
+            </button>
+          )}
+        </div>
+        {/* diff 内容 */}
+        {!collapsed && (
+          <ScrollArea className="max-h-72 bg-[#0f172a]">
+            <pre className="min-w-max p-2 font-mono text-[11px] leading-relaxed">
+              {diff.split('\n').map((line, idx) => {
+                const cls = line.startsWith('+') && !line.startsWith('+++')
+                  ? 'text-emerald-300 bg-emerald-500/10'
+                  : line.startsWith('-') && !line.startsWith('---')
+                    ? 'text-red-300 bg-red-500/10'
+                    : line.startsWith('@@')
+                      ? 'text-sky-300 bg-sky-500/10'
+                      : line.startsWith('diff --git') || line.startsWith('---') || line.startsWith('+++')
+                        ? 'text-violet-300'
+                        : 'text-slate-300'
+                return (
+                  <div key={idx} className={cn('min-h-[1.1rem] whitespace-pre px-2', cls)}>
+                    {line || ' '}
+                  </div>
+                )
+              })}
+            </pre>
+          </ScrollArea>
+        )}
+      </div>
+    </div>
+  )
+}
+
+// ──────────────────────────────────────────
 // 对话气泡
 // ──────────────────────────────────────────
 
-function ChatBubble({ msg, onOpenFile }: { msg: ChatMsg; onOpenFile?: (path: string) => void }) {
+function ChatBubble({ msg, onOpenFile, undoTaskId }: { msg: ChatMsg; onOpenFile?: (path: string) => void; undoTaskId?: string }) {
   const isUser = msg.role === 'user'
   const isSystem = msg.role === 'system'
   const files = msg.files || []
   const fileRefs = useMemo(() => extractFileReferences(`${msg.content}\n${msg.toolResult || ''}`), [msg.content, msg.toolResult])
+
+  // code_editor 编辑消息 → diff 卡片 + 撤销按钮（view 命令只读，不出卡片）
+  if (isSystem && msg.editDiff && msg.editPath && msg.editCommand && msg.editCommand !== 'view') {
+    return (
+      <FileEditCard
+        path={msg.editPath}
+        diff={msg.editDiff}
+        command={msg.editCommand}
+        undoTaskId={undoTaskId}
+        onOpenFile={onOpenFile}
+      />
+    )
+  }
 
   // 系统消息（工具进度、阶段进度）→ 科技感紧凑设计
   if (isSystem) {
@@ -6178,6 +7402,414 @@ function PreviewPanel({ task, previewSrc, onRetry, previewRefreshKey, setPreview
           )}
         </DialogContent>
       </Dialog>
+    </div>
+  )
+}
+
+// ──────────────────────────────────────────
+// P3 独立编辑器面板：文件树 + Monaco 多标签编辑 + 会话改动列表
+// ──────────────────────────────────────────
+
+interface OpenFile {
+  path: string
+  name: string
+  language: string
+  original: string   // 服务端最近一次已知内容
+  draft: string      // 编辑器当前内容
+  loading: boolean
+  error?: string
+}
+
+/** 文件树节点：自身负责懒加载子目录，避免一次性拉取整棵树。 */
+function EditorTreeNode({
+  node,
+  depth,
+  taskId,
+  activePath,
+  expanded,
+  childrenMap,
+  onToggleDir,
+  onOpenFile,
+}: {
+  node: AutoCodeWorkspaceFile
+  depth: number
+  taskId: string
+  activePath: string | null
+  expanded: Set<string>
+  childrenMap: Record<string, AutoCodeWorkspaceFile[]>
+  onToggleDir: (path: string) => void
+  onOpenFile: (path: string, name: string) => void
+}) {
+  const itemPath = (node.path ? toDisplayText(node.path) : node.name).replace(/^\/+/, '')
+  const isDir = node.type === 'dir'
+  const isExpanded = expanded.has(itemPath)
+  const isActive = !isDir && activePath === itemPath
+  const kids = childrenMap[itemPath]
+
+  return (
+    <div>
+      <button
+        type="button"
+        onClick={() => isDir ? onToggleDir(itemPath) : onOpenFile(itemPath, node.name)}
+        className={cn(
+          'flex w-full items-center gap-1 rounded px-1.5 py-1 text-left text-xs hover:bg-muted/60',
+          isActive && 'bg-primary/15 text-primary'
+        )}
+        style={{ paddingLeft: `${depth * 12 + 6}px` }}
+        title={itemPath}
+      >
+        {isDir ? (
+          <>
+            {isExpanded ? <ChevronDown className="w-3 h-3 shrink-0 text-muted-foreground" /> : <ChevronRight className="w-3 h-3 shrink-0 text-muted-foreground" />}
+            <FolderIcon className="w-3.5 h-3.5 shrink-0 text-yellow-500" />
+          </>
+        ) : (
+          <>
+            <span className="w-3 shrink-0" />
+            <FileIcon className="w-3.5 h-3.5 shrink-0 text-muted-foreground" />
+          </>
+        )}
+        <span className="truncate">{node.name}</span>
+      </button>
+      {isDir && isExpanded && (
+        kids === undefined ? (
+          <div className="flex items-center gap-1.5 px-2 py-1 text-[10px] text-muted-foreground" style={{ paddingLeft: `${(depth + 1) * 12 + 6}px` }}>
+            <Loader2 className="w-3 h-3 animate-spin" /> 加载中...
+          </div>
+        ) : kids.length === 0 ? (
+          <div className="px-2 py-1 text-[10px] text-muted-foreground/60" style={{ paddingLeft: `${(depth + 1) * 12 + 6}px` }}>空目录</div>
+        ) : (
+          kids.map(child => (
+            <EditorTreeNode
+              key={(child.path ? toDisplayText(child.path) : child.name)}
+              node={child}
+              depth={depth + 1}
+              taskId={taskId}
+              activePath={activePath}
+              expanded={expanded}
+              childrenMap={childrenMap}
+              onToggleDir={onToggleDir}
+              onOpenFile={onOpenFile}
+            />
+          ))
+        )
+      )}
+    </div>
+  )
+}
+
+function EditorPanel({
+  task,
+  requestedPath,
+  requestedLine,
+  onRequestedPathHandled,
+}: {
+  task: AutoCodeTask
+  requestedPath?: string | null
+  requestedLine?: number
+  onRequestedPathHandled?: () => void
+}) {
+  const taskId = task.backendTaskId
+  const [rootFiles, setRootFiles] = useState<AutoCodeWorkspaceFile[]>([])
+  const [treeLoading, setTreeLoading] = useState(false)
+  const [treeError, setTreeError] = useState('')
+  const [expanded, setExpanded] = useState<Set<string>>(new Set())
+  const [childrenMap, setChildrenMap] = useState<Record<string, AutoCodeWorkspaceFile[]>>({})
+
+  const [openTabs, setOpenTabs] = useState<OpenFile[]>([])
+  const [activePath, setActivePath] = useState<string | null>(null)
+  const [saving, setSaving] = useState(false)
+  const [savedPaths, setSavedPaths] = useState<string[]>([])
+  const editorRef = useRef<import('monaco-editor').editor.IStandaloneCodeEditor | null>(null)
+
+  const activeTab = openTabs.find(t => t.path === activePath) || null
+  const dirtyCount = openTabs.filter(t => t.draft !== t.original).length
+
+  const loadRoot = useCallback(async () => {
+    if (!taskId) return
+    setTreeLoading(true)
+    setTreeError('')
+    try {
+      const data = await listAutoCodeWorkspaceFiles(taskId, '/')
+      setRootFiles(Array.isArray(data.files) ? data.files.map(normalizeWorkspaceFile) : [])
+    } catch (err) {
+      setTreeError((err as Error).message || '文件树加载失败')
+    } finally {
+      setTreeLoading(false)
+    }
+  }, [taskId])
+
+  const loadDir = useCallback(async (dirPath: string) => {
+    if (!taskId) return
+    try {
+      const data = await listAutoCodeWorkspaceFiles(taskId, `/${dirPath}`)
+      setChildrenMap(prev => ({
+        ...prev,
+        [dirPath]: Array.isArray(data.files) ? data.files.map(normalizeWorkspaceFile) : [],
+      }))
+    } catch {
+      setChildrenMap(prev => ({ ...prev, [dirPath]: [] }))
+    }
+  }, [taskId])
+
+  const toggleDir = useCallback((dirPath: string) => {
+    setExpanded(prev => {
+      const next = new Set(prev)
+      if (next.has(dirPath)) {
+        next.delete(dirPath)
+      } else {
+        next.add(dirPath)
+        if (childrenMap[dirPath] === undefined) loadDir(dirPath)
+      }
+      return next
+    })
+  }, [childrenMap, loadDir])
+
+  const openFile = useCallback(async (path: string, name?: string) => {
+    if (!taskId) return
+    const normalized = path.replace(/\\/g, '/').replace(/^\/+/, '')
+    setActivePath(normalized)
+    // 已打开则直接激活
+    if (openTabs.some(t => t.path === normalized)) return
+    const displayName = name || normalized.split('/').pop() || normalized
+    const placeholder: OpenFile = {
+      path: normalized,
+      name: displayName,
+      language: monacoLanguageForPath(normalized),
+      original: '',
+      draft: '',
+      loading: true,
+    }
+    setOpenTabs(prev => [...prev, placeholder])
+    try {
+      const data = await readAutoCodeWorkspaceFile(taskId, normalized)
+      const content = toDisplayText(data.content)
+      setOpenTabs(prev => prev.map(t =>
+        t.path === normalized ? { ...t, original: content, draft: content, loading: false } : t
+      ))
+    } catch (err) {
+      setOpenTabs(prev => prev.map(t =>
+        t.path === normalized ? { ...t, loading: false, error: (err as Error).message || '读取失败' } : t
+      ))
+    }
+  }, [openTabs, taskId])
+
+  const closeTab = useCallback((path: string) => {
+    setOpenTabs(prev => {
+      const tab = prev.find(t => t.path === path)
+      if (tab && tab.draft !== tab.original && !window.confirm(`${tab.name} 有未保存的改动，确定关闭？`)) {
+        return prev
+      }
+      const next = prev.filter(t => t.path !== path)
+      setActivePath(cur => {
+        if (cur !== path) return cur
+        return next.length ? next[next.length - 1].path : null
+      })
+      return next
+    })
+  }, [])
+
+  const updateDraft = useCallback((path: string, value: string) => {
+    setOpenTabs(prev => prev.map(t => t.path === path ? { ...t, draft: value } : t))
+  }, [])
+
+  const saveActive = useCallback(async () => {
+    if (!taskId || !activeTab || activeTab.draft === activeTab.original) return
+    setSaving(true)
+    try {
+      await saveAutoCodeWorkspaceFile(taskId, activeTab.path, activeTab.draft)
+      setOpenTabs(prev => prev.map(t => t.path === activeTab.path ? { ...t, original: t.draft } : t))
+      setSavedPaths(prev => (prev.includes(activeTab.path) ? prev : [...prev, activeTab.path]))
+      toast.success(`已保存 ${activeTab.name}`)
+    } catch (err) {
+      toast.error((err as Error).message || '保存失败')
+    } finally {
+      setSaving(false)
+    }
+  }, [activeTab, taskId])
+
+  // saveActive 的最新引用，供 Monaco Ctrl+S 命令闭包使用
+  const saveActiveRef = useRef(saveActive)
+  useEffect(() => { saveActiveRef.current = saveActive }, [saveActive])
+
+  useEffect(() => {
+    loadRoot()
+  }, [loadRoot])
+
+  // 外部请求打开某文件（点击对话中的文件引用等）
+  useEffect(() => {
+    if (!requestedPath) return
+    openFile(requestedPath)
+    onRequestedPathHandled?.()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [requestedPath])
+
+  // 请求定位到指定行
+  useEffect(() => {
+    if (!requestedLine || !editorRef.current || !activeTab || activeTab.loading) return
+    const ed = editorRef.current
+    const timer = window.setTimeout(() => {
+      ed.revealLineInCenter(requestedLine)
+      ed.setPosition({ lineNumber: requestedLine, column: 1 })
+      ed.focus()
+    }, 120)
+    return () => window.clearTimeout(timer)
+  }, [requestedLine, activeTab])
+
+  if (!taskId) {
+    return (
+      <div className="flex h-full flex-col items-center justify-center gap-3 px-8 text-center text-sm text-muted-foreground">
+        <Code2 className="w-10 h-10 text-muted-foreground/40" />
+        <p>当前任务还没有连接到工作空间</p>
+      </div>
+    )
+  }
+
+  return (
+    <div className="flex h-full min-h-0">
+      {/* 左侧：文件树 */}
+      <div className="flex w-56 shrink-0 flex-col border-r bg-muted/10">
+        <div className="flex items-center justify-between gap-2 border-b px-2 py-1.5 shrink-0">
+          <span className="text-[11px] font-medium text-muted-foreground">资源管理器</span>
+          <button type="button" onClick={loadRoot} className="text-muted-foreground/60 hover:text-foreground" title="刷新">
+            {treeLoading ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <RefreshCw className="w-3.5 h-3.5" />}
+          </button>
+        </div>
+        <ScrollArea className="flex-1 min-h-0">
+          <div className="p-1">
+            {treeError ? (
+              <div className="px-2 py-2 text-[11px] text-destructive">{treeError}</div>
+            ) : treeLoading && rootFiles.length === 0 ? (
+              <div className="flex items-center gap-1.5 px-2 py-2 text-[11px] text-muted-foreground">
+                <Loader2 className="w-3 h-3 animate-spin" /> 加载中...
+              </div>
+            ) : rootFiles.length === 0 ? (
+              <div className="px-2 py-2 text-[11px] text-muted-foreground/60">工作区为空</div>
+            ) : (
+              rootFiles.map(f => (
+                <EditorTreeNode
+                  key={(f.path ? toDisplayText(f.path) : f.name)}
+                  node={f}
+                  depth={0}
+                  taskId={taskId}
+                  activePath={activePath}
+                  expanded={expanded}
+                  childrenMap={childrenMap}
+                  onToggleDir={toggleDir}
+                  onOpenFile={openFile}
+                />
+              ))
+            )}
+          </div>
+        </ScrollArea>
+        {/* 会话改动列表 */}
+        {savedPaths.length > 0 && (
+          <div className="border-t shrink-0">
+            <div className="px-2 py-1.5 text-[11px] font-medium text-muted-foreground">本次会话已保存 ({savedPaths.length})</div>
+            <ScrollArea className="max-h-32">
+              <div className="p-1">
+                {savedPaths.map(p => (
+                  <button
+                    key={p}
+                    type="button"
+                    onClick={() => openFile(p)}
+                    className="flex w-full items-center gap-1.5 rounded px-1.5 py-1 text-left text-[11px] text-muted-foreground hover:bg-muted/60 hover:text-foreground"
+                    title={p}
+                  >
+                    <CheckCircle2 className="w-3 h-3 shrink-0 text-green-500" />
+                    <span className="truncate font-mono">{p}</span>
+                  </button>
+                ))}
+              </div>
+            </ScrollArea>
+          </div>
+        )}
+      </div>
+
+      {/* 右侧：编辑区 */}
+      <div className="flex flex-1 min-w-0 flex-col">
+        {/* 标签栏 */}
+        <div className="flex items-center gap-0.5 border-b bg-muted/20 px-1 h-9 shrink-0 overflow-x-auto">
+          {openTabs.length === 0 ? (
+            <span className="px-3 text-[11px] text-muted-foreground/60">从左侧选择文件开始编辑</span>
+          ) : (
+            openTabs.map(t => {
+              const dirty = t.draft !== t.original
+              return (
+                <div
+                  key={t.path}
+                  className={cn(
+                    'group flex shrink-0 items-center gap-1.5 rounded-t px-2.5 py-1 text-xs cursor-pointer border-b-2',
+                    t.path === activePath ? 'bg-background text-foreground border-primary' : 'text-muted-foreground border-transparent hover:bg-background/50'
+                  )}
+                  onClick={() => setActivePath(t.path)}
+                  title={t.path}
+                >
+                  <FileIcon className="w-3 h-3 shrink-0" />
+                  <span className="max-w-[140px] truncate">{t.name}</span>
+                  {dirty && <span className="w-1.5 h-1.5 rounded-full bg-amber-500 shrink-0" title="未保存" />}
+                  <button
+                    type="button"
+                    onClick={e => { e.stopPropagation(); closeTab(t.path) }}
+                    className="shrink-0 text-muted-foreground/50 hover:text-foreground"
+                  >
+                    <X className="w-3 h-3" />
+                  </button>
+                </div>
+              )
+            })
+          )}
+        </div>
+
+        {/* 操作栏 */}
+        {activeTab && (
+          <div className="flex items-center justify-between gap-2 border-b bg-muted/10 px-3 py-1 shrink-0">
+            <span className="min-w-0 flex-1 truncate font-mono text-[11px] text-muted-foreground">{activeTab.path}</span>
+            <Button
+              size="sm"
+              variant="outline"
+              className="h-6 gap-1 text-[11px]"
+              onClick={saveActive}
+              disabled={saving || activeTab.draft === activeTab.original}
+            >
+              {saving ? <Loader2 className="w-3 h-3 animate-spin" /> : <Save className="w-3 h-3" />}
+              保存
+            </Button>
+          </div>
+        )}
+
+        {/* 编辑器 */}
+        <div className="flex-1 min-h-0 relative">
+          {!activeTab ? (
+            <div className="flex h-full flex-col items-center justify-center gap-3 text-sm text-muted-foreground">
+              <Code2 className="w-10 h-10 text-muted-foreground/30" />
+              <p>选择左侧文件在此编辑</p>
+            </div>
+          ) : activeTab.loading ? (
+            <div className="flex h-full items-center justify-center gap-2 text-sm text-muted-foreground">
+              <Loader2 className="w-4 h-4 animate-spin" /> 加载文件...
+            </div>
+          ) : activeTab.error ? (
+            <div className="flex h-full flex-col items-center justify-center gap-2 px-8 text-center text-sm text-destructive">
+              <AlertTriangle className="w-8 h-8" />
+              <p>{activeTab.error}</p>
+            </div>
+          ) : (
+            <Suspense fallback={<div className="flex h-full items-center justify-center gap-2 text-sm text-muted-foreground"><Loader2 className="w-4 h-4 animate-spin" /> 加载编辑器...</div>}>
+              <MonacoEditor
+                value={activeTab.draft}
+                language={activeTab.language}
+                path={activeTab.path}
+                onChange={val => updateDraft(activeTab.path, val ?? '')}
+                onMount={(editor, monaco) => {
+                  editorRef.current = editor
+                  editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, () => { saveActiveRef.current() })
+                }}
+              />
+            </Suspense>
+          )}
+        </div>
+      </div>
     </div>
   )
 }
@@ -8680,11 +10312,14 @@ function PrototypeConfirmPanel({ task, onConfirm }: PrototypeConfirmPanelProps) 
 // 空状态
 // ──────────────────────────────────────────
 
-// ── 代码审查面板 ──────────────────────────
-function ReviewPanel({ task }: { task: AutoCodeTask }) {
+// ── 产物审查面板 ──────────────────────────
+function ReviewPanel({ task, onConfirmReview }: { task: AutoCodeTask; onConfirmReview: (confirmed: boolean) => Promise<void> }) {
   const review = task.review
   const phaseReviews = task.phase_reviews ?? []
   const hasAnyReview = !!review || phaseReviews.length > 0
+  const waitingReviewConfirm = task.status === 'waiting_review_confirm'
+  const reviewIssueCount = review?.issues?.length ?? 0
+  const reviewScore = review?.score ?? 0
   const agenticGuardrailCount = phaseReviews.filter(r => r.guardrail_kind === 'agentic').length
   const reviewGroupLabel = agenticGuardrailCount > 0 && agenticGuardrailCount === phaseReviews.length
     ? 'Agentic 护栏审查'
@@ -8700,8 +10335,8 @@ function ReviewPanel({ task }: { task: AutoCodeTask }) {
           <Shield className="w-7 h-7 text-purple-500" />
         </div>
         <div>
-          <p className="font-medium text-sm">代码审查中...</p>
-          <p className="text-xs text-muted-foreground mt-1">正在检查代码规范、安全和性能</p>
+          <p className="font-medium text-sm">产物审查中...</p>
+          <p className="text-xs text-muted-foreground mt-1">正在检查目标产物、验证结果和交付风险</p>
         </div>
       </div>
     )
@@ -8711,7 +10346,7 @@ function ReviewPanel({ task }: { task: AutoCodeTask }) {
     return (
       <div className="flex flex-col items-center justify-center h-full gap-4 text-center px-8">
         <Shield className="w-10 h-10 text-muted-foreground/30" />
-        <p className="text-sm text-muted-foreground">每完成一个执行组后会显示代码审查报告</p>
+        <p className="text-sm text-muted-foreground">完成执行组后会显示产物审查报告</p>
       </div>
     )
   }
@@ -8722,7 +10357,34 @@ function ReviewPanel({ task }: { task: AutoCodeTask }) {
         {task.status === 'reviewing' && (
           <div className="rounded-lg border border-purple-500/20 bg-purple-500/10 px-3 py-2 text-xs text-purple-700 dark:text-purple-300 flex items-center gap-2">
             <Loader2 className="w-3.5 h-3.5 animate-spin shrink-0" />
-            正在进行当前阶段代码审查，已完成的阶段报告会保留在下方。
+            正在进行当前阶段产物审查，已完成的阶段报告会保留在下方。
+          </div>
+        )}
+
+        {waitingReviewConfirm && (
+          <div className="rounded-lg border border-amber-500/30 bg-amber-500/10 p-3">
+            <div className="flex flex-wrap items-center gap-3">
+              <Shield className="h-4 w-4 shrink-0 text-amber-600" />
+              <div className="min-w-0 flex-1">
+                <div className="text-sm font-medium text-amber-950 dark:text-amber-50">产物审查未通过，等待确认</div>
+                <div className="mt-1 text-xs text-amber-900/80 dark:text-amber-100/80">
+                  分数 {reviewScore}/100，发现 {reviewIssueCount} 个问题。确认表示接受当前风险并继续后续流程；拒绝会停止任务。
+                </div>
+              </div>
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={() => { void onConfirmReview(false) }}
+              >
+                拒绝
+              </Button>
+              <Button
+                size="sm"
+                onClick={() => { void onConfirmReview(true) }}
+              >
+                确认继续
+              </Button>
+            </div>
           </div>
         )}
 
@@ -8754,7 +10416,7 @@ function ReviewPanel({ task }: { task: AutoCodeTask }) {
                 最终审查
               </div>
             )}
-            <ReviewResultCard review={review} title="最终代码审查" />
+            <ReviewResultCard review={review} title="最终产物审查" />
           </div>
         )}
       </div>
@@ -8985,10 +10647,12 @@ function ReviewResultCard({ review, title, compact = false }: { review: ReviewRe
 
 function EmptyState({
   onNewTask,
+  onConnectLocal,
   queueStatus,
   queueStatusError,
 }: {
   onNewTask: () => void
+  onConnectLocal: () => void
   queueStatus?: AutoCodeQueueStatus | null
   queueStatusError?: string
 }) {
@@ -9000,14 +10664,42 @@ function EmptyState({
       <div>
         <h2 className="text-2xl font-bold mb-2">AI 代码开发助手</h2>
         <p className="text-muted-foreground text-sm max-w-md">
-          描述你想要开发的项目，AI Agent 会自动完成整个开发流程。
-          支持网站、API、小程序和工具脚本。
+          网页端可独立进行云端代码开发，也可以连接 AutoCode IDE 操作你电脑上的本地项目。
+          需求、计划、Todo、审批和结果展示保持同一套体验。
         </p>
       </div>
-      <Button size="lg" className="gap-2" onClick={onNewTask}>
-        <Sparkles className="w-5 h-5" />
-        新建开发任务
-      </Button>
+      <div className="grid w-full max-w-2xl gap-3 sm:grid-cols-2">
+        <button
+          type="button"
+          onClick={onNewTask}
+          className="flex min-h-32 flex-col items-start gap-3 rounded-xl border bg-background p-4 text-left shadow-sm transition-colors hover:border-primary/50 hover:bg-primary/5"
+        >
+          <span className="inline-flex h-9 w-9 items-center justify-center rounded-lg bg-primary text-primary-foreground">
+            <Sparkles className="h-5 w-5" />
+          </span>
+          <span>
+            <span className="block text-sm font-semibold">新建云端开发任务</span>
+            <span className="mt-1 block text-xs leading-relaxed text-muted-foreground">
+              使用服务器工作区、网页文件树、网页编辑器、终端、Git 和云端 Agent 完整开发。
+            </span>
+          </span>
+        </button>
+        <button
+          type="button"
+          onClick={onConnectLocal}
+          className="flex min-h-32 flex-col items-start gap-3 rounded-xl border bg-background p-4 text-left shadow-sm transition-colors hover:border-primary/50 hover:bg-primary/5"
+        >
+          <span className="inline-flex h-9 w-9 items-center justify-center rounded-lg bg-muted text-foreground">
+            <MonitorPlay className="h-5 w-5" />
+          </span>
+          <span>
+            <span className="block text-sm font-semibold">连接本地 IDE 项目</span>
+            <span className="mt-1 block text-xs leading-relaxed text-muted-foreground">
+              网页端负责任务、计划、审批和进度；真实文件、终端、Git 与验证优先在你的电脑执行。
+            </span>
+          </span>
+        </button>
+      </div>
       <div className="w-full max-w-md">
         <QueueStatusStrip status={queueStatus ?? null} error={queueStatusError} />
       </div>
@@ -9027,9 +10719,3 @@ function EmptyState({
     </div>
   )
 }
-
-
-
-
-
-

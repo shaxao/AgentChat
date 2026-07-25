@@ -34,6 +34,7 @@ public class ChatService {
     private final MemoryService memoryService;
     private final UsageTrackingService usageTrackingService;
     private final PrivacySettingService privacySettingService;
+    private final StreamRelayService streamRelayService;
 
     private static final DateTimeFormatter FMT = DateTimeFormatter.ISO_LOCAL_DATE_TIME;
 
@@ -517,6 +518,14 @@ public class ChatService {
                     vo.setMessages(msgs.stream().map(this::toMsgVO).collect(Collectors.toList()));
                     vo.setHasMore(false);
                 }
+            }
+
+            // 断线续传：标记该对话是否有正在后台进行的生成，供前端加载后自动接入 resume 流。
+            String activeGid = streamRelayService.getActiveGeneration(c.getUuid());
+            if (activeGid != null) {
+                vo.setStreaming(true);
+                Object msgId = streamRelayService.getMeta(activeGid).get("assistantMsgId");
+                vo.setStreamingMessageId(msgId != null ? msgId.toString() : null);
             }
         }
         return vo;

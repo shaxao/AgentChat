@@ -1,6 +1,7 @@
 package com.aiplatform.backend.controller;
 
 import com.aiplatform.backend.dto.AuthDTO;
+import com.aiplatform.backend.dto.ModelPriceLibraryDTO;
 import com.aiplatform.backend.dto.Result;
 import com.aiplatform.backend.agent.ToolDefinition;
 import com.aiplatform.backend.entity.ModelChannel;
@@ -10,6 +11,7 @@ import com.aiplatform.backend.entity.SysUser;
 import com.aiplatform.backend.mapper.SysUserMapper;
 import com.aiplatform.backend.service.AdminService;
 import com.aiplatform.backend.service.AiService;
+import com.aiplatform.backend.service.ModelPriceLibraryService;
 import com.aiplatform.backend.service.UsageTrackingService;
 import com.aiplatform.backend.util.ClientIpUtil;
 import com.aiplatform.backend.billing.BillingException;
@@ -35,6 +37,7 @@ public class AdminController {
 
     private final AdminService adminService;
     private final AiService aiService;
+    private final ModelPriceLibraryService modelPriceLibraryService;
     private final UsageTrackingService usageTrackingService;
     private final SysUserMapper sysUserMapper;
     private final ObjectMapper objectMapper;
@@ -151,6 +154,7 @@ public class AdminController {
         private Object tags;
         private String status;
         private String channelType;
+        private String apiFormat;
         private Integer priority;
         private Integer rateLimit;
         private String uuid;
@@ -371,6 +375,7 @@ public class AdminController {
         channel.setModels(req.getModelsAsString());
         channel.setTags(req.getTagsAsString());
         channel.setChannelType(req.getChannelType() != null ? req.getChannelType() : "chat");
+        channel.setApiFormat(req.getApiFormat() != null && !req.getApiFormat().isBlank() ? req.getApiFormat() : "chat_completions");
         channel.setStatus(req.getStatus() != null ? req.getStatus() : "active");
         channel.setPriority(req.getPriority() != null ? req.getPriority() : 1);
         channel.setRateLimit(req.getRateLimit() != null ? req.getRateLimit() : 60);
@@ -397,6 +402,7 @@ public class AdminController {
         if (req.getModels() != null) channel.setModels(req.getModelsAsString());
         if (req.getTags() != null) channel.setTags(req.getTagsAsString());
         if (req.getChannelType() != null) channel.setChannelType(req.getChannelType());
+        if (req.getApiFormat() != null && !req.getApiFormat().isBlank()) channel.setApiFormat(req.getApiFormat());
         if (req.getStatus() != null) channel.setStatus(req.getStatus());
         if (req.getPriority() != null) channel.setPriority(req.getPriority());
         if (req.getRateLimit() != null) channel.setRateLimit(req.getRateLimit());
@@ -464,6 +470,7 @@ public class AdminController {
         private Object cachedInputPrice;
         private Object outputPrice;
         private Object capabilities;  // 接收 List<String> 或 String
+        private String aliases;       // 模型别名，逗号分隔（供外部 API 模型名映射）
         private Boolean enabled;
 
         public String getCapabilitiesAsString() {
@@ -514,6 +521,7 @@ public class AdminController {
         model.setCachedInputPrice(req.getCachedInputPriceAsBigDecimal());
         model.setOutputPrice(req.getOutputPriceAsBigDecimal());
         model.setCapabilities(req.getCapabilitiesAsString());
+        if (req.getAliases() != null) model.setAliases(req.getAliases());
         model.setEnabled(req.getEnabled() != null ? req.getEnabled() : true);
         return Result.ok(adminService.saveModel(model));
     }
@@ -536,6 +544,7 @@ public class AdminController {
         if (req.getCachedInputPrice() != null) model.setCachedInputPrice(req.getCachedInputPriceAsBigDecimal());
         if (req.getOutputPrice() != null) model.setOutputPrice(req.getOutputPriceAsBigDecimal());
         if (req.getCapabilities() != null) model.setCapabilities(req.getCapabilitiesAsString());
+        if (req.getAliases() != null) model.setAliases(req.getAliases());
         if (req.getEnabled() != null) model.setEnabled(req.getEnabled());
         return Result.ok(adminService.saveModel(model));
     }
@@ -566,6 +575,7 @@ public class AdminController {
         if (req.getCachedInputPrice() != null) model.setCachedInputPrice(req.getCachedInputPriceAsBigDecimal());
         if (req.getOutputPrice() != null) model.setOutputPrice(req.getOutputPriceAsBigDecimal());
         if (req.getCapabilities() != null) model.setCapabilities(req.getCapabilitiesAsString());
+        if (req.getAliases() != null) model.setAliases(req.getAliases());
         if (req.getEnabled() != null) model.setEnabled(req.getEnabled());
         return Result.ok(adminService.saveModel(model));
     }
@@ -578,6 +588,28 @@ public class AdminController {
     }
 
     // ====== 订阅管理 ======
+
+    @GetMapping("/model-price-library")
+    public Result<ModelPriceLibraryDTO.LibraryResponse> getModelPriceLibrary(@RequestAttribute String userRole) {
+        requireAdmin(userRole);
+        return Result.ok(modelPriceLibraryService.library());
+    }
+
+    @PostMapping("/model-price-library/preview")
+    public Result<ModelPriceLibraryDTO.PreviewResponse> previewModelPriceLibrary(
+            @RequestAttribute String userRole,
+            @RequestBody(required = false) ModelPriceLibraryDTO.PreviewRequest req) {
+        requireAdmin(userRole);
+        return Result.ok(modelPriceLibraryService.preview(req != null ? req : new ModelPriceLibraryDTO.PreviewRequest()));
+    }
+
+    @PostMapping("/model-price-library/apply")
+    public Result<ModelPriceLibraryDTO.ApplyResponse> applyModelPriceLibrary(
+            @RequestAttribute String userRole,
+            @RequestBody(required = false) ModelPriceLibraryDTO.ApplyRequest req) {
+        requireAdmin(userRole);
+        return Result.ok(modelPriceLibraryService.apply(req != null ? req : new ModelPriceLibraryDTO.ApplyRequest()));
+    }
 
     @GetMapping("/subscriptions")
     public Result<Result.PageResult<Object>> listSubscriptions(

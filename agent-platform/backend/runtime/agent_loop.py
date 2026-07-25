@@ -17,6 +17,16 @@ class AgentDecision:
     action: str
     confidence: float = 0.0
     answer: str = ""
+    intent: str = ""
+    reason: str = ""
+    expected_artifacts: list | None = None
+    artifact_contracts: list | None = None
+    completion_checks: list | None = None
+    validation_plan: list | None = None
+    required_capabilities: list | None = None
+    task_family: str | None = None
+    retrieval_plan: Any = None
+    risk_level: str | None = None
     path: str | None = None
     line: int | None = None
     command: str | None = None
@@ -50,7 +60,7 @@ def _normalize_tool_policy(value: Any) -> str:
 
 
 def _apply_task_tool_policy(decision: PermissionDecision, policy: str) -> PermissionDecision:
-    if policy == "ask":
+    if policy == "ask" or decision.decision == "deny":
         return decision
     if decision.approval_payload.get("high_risk") or decision.approval_payload.get("destructive"):
         return PermissionDecision(
@@ -86,9 +96,11 @@ def _apply_task_tool_policy(decision: PermissionDecision, policy: str) -> Permis
             approval_payload=decision.approval_payload,
         )
     if policy == "auto_safe":
+        if decision.decision != "allow":
+            return decision
         return PermissionDecision(
             "allow",
-            reason=f"task tool policy auto_safe auto-approved: {decision.reason}",
+            reason=f"task tool policy auto_safe accepted safe operation: {decision.reason}",
             tool=decision.tool,
             risk_level=decision.risk_level,
             approval_payload=decision.approval_payload,
@@ -331,6 +343,16 @@ class AgentLoop:
             action=action,
             confidence=confidence,
             answer=str(data.get("answer") or ""),
+            intent=str(data.get("intent") or ""),
+            reason=str(data.get("reason") or ""),
+            expected_artifacts=data.get("expected_artifacts") if isinstance(data.get("expected_artifacts"), list) else None,
+            artifact_contracts=data.get("artifact_contracts") if isinstance(data.get("artifact_contracts"), list) else None,
+            completion_checks=data.get("completion_checks") if isinstance(data.get("completion_checks"), list) else None,
+            validation_plan=data.get("validation_plan") if isinstance(data.get("validation_plan"), list) else None,
+            required_capabilities=data.get("required_capabilities") if isinstance(data.get("required_capabilities"), list) else None,
+            task_family=str(data.get("task_family")) if data.get("task_family") else None,
+            retrieval_plan=data.get("retrieval_plan"),
+            risk_level=str(data.get("risk_level")) if data.get("risk_level") is not None else None,
             path=str(data.get("path")) if data.get("path") else None,
             line=line,
             command=command,
@@ -351,6 +373,15 @@ class AgentLoop:
             "continue_development. This includes vague-but-actionable feedback such as '这里不对', "
             "'效果不好', '加一个导出能力', '移动端有问题', or '按这个思路继续'. Do not require the user "
             "to say fixed words like modify/add/implement. "
+            "\n\n"
+            "Imperative execution requests are ALSO continue_development, not answer. When the user tells "
+            "the workspace to run/start/execute something ('帮我启动 npm run dev', '你去执行啊', "
+            "'跑一下测试', '把服务起起来', 'run the dev server', 'go execute it'), the agent loop must "
+            "handle it end-to-end (spawn the process, observe output, report result). Do NOT answer with "
+            "a suggestion like '你可以运行 npm run dev' — that leaves the request unresolved. Only choose "
+            "run_command when the user explicitly frames it as a single shell command with the exact "
+            "string ('执行命令: xxx' / 'run command: xxx'); imperative natural language goes to "
+            "continue_development. "
             "If the user lists concrete functions, files, properties, error messages, review findings, or "
             "code symbols, infer that they want the workspace changed and choose continue_development unless "
             "they explicitly ask only for explanation. "
@@ -365,7 +396,17 @@ class AgentLoop:
             "For continue_development, the answer should be a short acknowledgement that you will analyze the "
             "current workspace, make the necessary changes, validate, and snapshot. Do not output a generic menu "
             "of things the user can ask for when the message is actionable. "
-            "Return JSON only with fields: action, confidence, answer, path, line, command, target."
+            "\n\n"
+            "Classify the request by execution shape, never by a finite project-type whitelist. Valid intent "
+            "values are: answer_only, workspace_action, ide_action, artifact_creation, light_local_file_task, "
+            "code_development, run_command, pipeline, review_only. Use artifact_creation for presentations, "
+            "spreadsheets, documents, PDFs, images, datasets, archives, and any other requested deliverable. "
+            "Use code_development for source changes in any programming language or build system. Unknown "
+            "languages and formats are valid: describe the needed capabilities and artifact contracts instead "
+            "of rejecting or coercing them to Node. Use run_command only for an explicit command-only request. "
+            "Return JSON only with fields: action, intent, confidence, answer, task_family, required_capabilities, "
+            "artifact_contracts, validation_plan, target, path, line, command, expected_artifacts, "
+            "completion_checks, retrieval_plan, risk_level, reason."
         )
 
 

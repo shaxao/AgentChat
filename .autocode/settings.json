@@ -1,0 +1,8 @@
+{
+  "mcpServers": [],
+  "permissionPolicy": {},
+  "notes": {
+    "mcpServers": "椤圭洰绾?MCP 鏈嶅姟閰嶇疆銆傜ず渚嬶細[{\"name\":\"filesystem\",\"command\":\"npx\",\"args\":[\"-y\",\"@modelcontextprotocol/server-filesystem\",\"D:/project\"],\"enabled\":true,\"timeoutSecs\":30}]",
+    "permissionPolicy": "椤圭洰绾ф潈闄愮瓥鐣ュ娉ㄣ€傚綋鍓?IDE 璁剧疆涓殑鏉冮檺绛栫暐璐熻矗涓昏鎵ц鎺у埗銆?
+  }
+}

@@ -17,6 +17,12 @@ public class ApiLog {
     private Integer inputTokens;
     private Integer cachedInputTokens;
     private Integer outputTokens;
+    private BigDecimal inputPriceSnapshot;
+    private BigDecimal cachedInputPriceSnapshot;
+    private BigDecimal outputPriceSnapshot;
+    private BigDecimal inputCost;
+    private BigDecimal cachedInputCost;
+    private BigDecimal outputCost;
     private BigDecimal cost;
     private Integer latencyMs;
     private String status;

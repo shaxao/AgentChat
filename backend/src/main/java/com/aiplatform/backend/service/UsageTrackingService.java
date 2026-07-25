@@ -17,6 +17,7 @@ import com.aiplatform.backend.mapper.ModelConfigMapper;
 import com.aiplatform.backend.mapper.SubscriptionMapper;
 import com.aiplatform.backend.mapper.SysUserMapper;
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
+import lombok.Data;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
@@ -59,15 +60,22 @@ public class UsageTrackingService {
                               String requestIp, String provider, String channelId) {
         if (userId == null) return;
         try {
-            BigDecimal cost = calculateCost(model, inputTokens, cachedInputTokens, outputTokens);
+            CostBreakdown costBreakdown = calculateCostBreakdown(model, inputTokens, cachedInputTokens, outputTokens);
+            BigDecimal cost = costBreakdown.getTotalCost();
             ModelChannel channel = findChannelForModel(model);
             ApiLog apiLog = new ApiLog();
             apiLog.setUserId(userId);
             apiLog.setModel(model != null ? model : "unknown");
             apiLog.setSceneType(sceneType != null ? sceneType : "chat");
-            apiLog.setInputTokens(inputTokens);
-            apiLog.setCachedInputTokens(cachedInputTokens);
-            apiLog.setOutputTokens(outputTokens);
+            apiLog.setInputTokens(costBreakdown.getInputTokens());
+            apiLog.setCachedInputTokens(costBreakdown.getCachedInputTokens());
+            apiLog.setOutputTokens(costBreakdown.getOutputTokens());
+            apiLog.setInputPriceSnapshot(costBreakdown.getInputPrice());
+            apiLog.setCachedInputPriceSnapshot(costBreakdown.getCachedInputPrice());
+            apiLog.setOutputPriceSnapshot(costBreakdown.getOutputPrice());
+            apiLog.setInputCost(costBreakdown.getInputCost());
+            apiLog.setCachedInputCost(costBreakdown.getCachedInputCost());
+            apiLog.setOutputCost(costBreakdown.getOutputCost());
             apiLog.setLatencyMs(latencyMs);
             apiLog.setStatus(status != null ? status : "success");
             apiLog.setErrorMsg(errorMsg);
@@ -83,7 +91,7 @@ public class UsageTrackingService {
             }
             apiLogMapper.insert(apiLog);
 
-            updateUserTokens(userId, inputTokens + outputTokens);
+            updateUserTokens(userId, costBreakdown.getInputTokens() + costBreakdown.getOutputTokens());
             updateUserCost(userId, cost);
         } catch (Exception e) {
             log.warn("[UsageTracking] failed to record api usage: {}", e.getMessage());
@@ -95,23 +103,40 @@ public class UsageTrackingService {
     }
 
     public BigDecimal calculateCost(String model, int inputTokens, int cachedInputTokens, int outputTokens) {
-        ModelConfig mc = latestEnabledModel(model);
-        if (mc == null) return BigDecimal.ZERO;
+        return calculateCostBreakdown(model, inputTokens, cachedInputTokens, outputTokens).getTotalCost();
+    }
 
-        BigDecimal inputPrice = mc.getInputPrice() != null ? mc.getInputPrice() : BigDecimal.ZERO;
-        BigDecimal cachedInputPrice = mc.getCachedInputPrice() != null ? mc.getCachedInputPrice() : inputPrice;
-        BigDecimal outputPrice = mc.getOutputPrice() != null ? mc.getOutputPrice() : BigDecimal.ZERO;
+    public CostBreakdown calculateCostBreakdown(String model, int inputTokens, int cachedInputTokens, int outputTokens) {
+        ModelConfig mc = latestEnabledModel(model);
+        BigDecimal inputPrice = mc != null && mc.getInputPrice() != null ? mc.getInputPrice() : BigDecimal.ZERO;
+        BigDecimal cachedInputPrice = mc != null && mc.getCachedInputPrice() != null ? mc.getCachedInputPrice() : inputPrice;
+        BigDecimal outputPrice = mc != null && mc.getOutputPrice() != null ? mc.getOutputPrice() : BigDecimal.ZERO;
         BigDecimal unit = BigDecimal.valueOf(1_000_000);
 
-        int cachedTokens = Math.max(0, cachedInputTokens);
-        int normalInputTokens = Math.max(0, inputTokens - cachedTokens);
+        int safeInputTokens = Math.max(0, inputTokens);
+        int safeOutputTokens = Math.max(0, outputTokens);
+        int cachedTokens = Math.min(Math.max(0, cachedInputTokens), safeInputTokens);
+        int normalInputTokens = Math.max(0, safeInputTokens - cachedTokens);
         BigDecimal inputCost = inputPrice.multiply(BigDecimal.valueOf(normalInputTokens))
                 .divide(unit, 10, RoundingMode.HALF_UP);
         BigDecimal cachedInputCost = cachedInputPrice.multiply(BigDecimal.valueOf(cachedTokens))
                 .divide(unit, 10, RoundingMode.HALF_UP);
-        BigDecimal outputCost = outputPrice.multiply(BigDecimal.valueOf(Math.max(0, outputTokens)))
+        BigDecimal outputCost = outputPrice.multiply(BigDecimal.valueOf(safeOutputTokens))
                 .divide(unit, 10, RoundingMode.HALF_UP);
-        return inputCost.add(cachedInputCost).add(outputCost);
+        CostBreakdown breakdown = new CostBreakdown();
+        breakdown.setModel(model);
+        breakdown.setInputTokens(safeInputTokens);
+        breakdown.setCachedInputTokens(cachedTokens);
+        breakdown.setBillableInputTokens(normalInputTokens);
+        breakdown.setOutputTokens(safeOutputTokens);
+        breakdown.setInputPrice(inputPrice);
+        breakdown.setCachedInputPrice(cachedInputPrice);
+        breakdown.setOutputPrice(outputPrice);
+        breakdown.setInputCost(inputCost);
+        breakdown.setCachedInputCost(cachedInputCost);
+        breakdown.setOutputCost(outputCost);
+        breakdown.setTotalCost(inputCost.add(cachedInputCost).add(outputCost));
+        return breakdown;
     }
 
     public void assertUsageAllowed(Long userId, String model, BigDecimal estimatedCost) {
@@ -138,6 +163,11 @@ public class UsageTrackingService {
         BigDecimal used = safe(sub != null ? sub.getCostUsed() : user.getCostUsed());
         BigDecimal remaining = limit.compareTo(BigDecimal.ZERO) > 0 ? limit.subtract(used).max(BigDecimal.ZERO) : cost;
 
+        if (limit.compareTo(BigDecimal.ZERO) <= 0 && policy.isWalletFallbackEnabled()) {
+            ensureWalletFallbackAllowed(user, cost, policy);
+            return BillingDecision.allow(BigDecimal.ZERO, cost);
+        }
+
         if (limit.compareTo(BigDecimal.ZERO) <= 0 || used.add(cost).compareTo(limit) <= 0) {
             return BillingDecision.allow(cost, BigDecimal.ZERO);
         }
@@ -149,20 +179,26 @@ public class UsageTrackingService {
                             + ", remaining=" + money(remaining) + ". Enable wallet fallback or increase quota.");
         }
 
-        BigDecimal fallbackLimit = safe(policy.getWalletFallbackMonthlyLimit());
-        if (fallbackLimit.compareTo(BigDecimal.ZERO) > 0 && overflow.compareTo(fallbackLimit) > 0) {
+        ensureWalletFallbackAllowed(user, overflow, policy);
+        return BillingDecision.allow(remaining, overflow);
+    }
+
+    private void ensureWalletFallbackAllowed(SysUser user, BigDecimal walletCost, BillingPolicy policy) {
+        BigDecimal cost = safe(walletCost);
+        if (cost.compareTo(BigDecimal.ZERO) <= 0) return;
+        BigDecimal fallbackLimit = safe(policy != null ? policy.getWalletFallbackMonthlyLimit() : null);
+        if (fallbackLimit.compareTo(BigDecimal.ZERO) > 0 && cost.compareTo(fallbackLimit) > 0) {
             throw new BillingException(BillingErrorCode.USER_WALLET_FALLBACK_EXHAUSTED,
-                    "Wallet fallback monthly limit exceeded: overflow=" + money(overflow)
+                    "Wallet fallback monthly limit exceeded: overflow=" + money(cost)
                             + ", limit=" + money(fallbackLimit));
         }
 
-        BigDecimal balance = safe(user.getBalance());
-        if (balance.compareTo(overflow) < 0) {
+        BigDecimal balance = safe(user != null ? user.getBalance() : null);
+        if (balance.compareTo(cost) < 0) {
             throw new BillingException(BillingErrorCode.USER_WALLET_INSUFFICIENT,
-                    "Wallet balance insufficient: required=" + money(overflow)
+                    "Wallet balance insufficient: required=" + money(cost)
                             + ", balance=" + money(balance));
         }
-        return BillingDecision.allow(remaining, overflow);
     }
 
     public void billUsage(Long userId, String model, int inputTokens, int outputTokens, String agentId) {
@@ -226,9 +262,21 @@ public class UsageTrackingService {
     public void trackFull(Long userId, String model, int inputTokens, int cachedInputTokens, int outputTokens,
                           int latencyMs, String sceneType, String agentId,
                           String requestIp, String provider, String channelId) {
-        billUsage(userId, model, inputTokens, cachedInputTokens, outputTokens, agentId, sceneType);
+        boolean billingOk = true;
+        String billingError = null;
+        try {
+            billUsage(userId, model, inputTokens, cachedInputTokens, outputTokens, agentId, sceneType);
+        } catch (Exception e) {
+            billingOk = false;
+            billingError = e.getMessage();
+            // 外部 OpenAI-compatible 网关的 usage 统计不能因为套餐额度/钱包兜底等扣费策略失败而丢日志。
+            // 请求已经成功返回给客户端时，api_log 仍必须落库，供用户钱包页和后台日志查询真实 token/费用明细。
+            log.warn("[UsageTracking] billing failed; recording usage log anyway: userId={}, model={}, scene={}, error={}",
+                    userId, model, sceneType, e.getMessage());
+        }
         trackApiUsage(userId, model, inputTokens, cachedInputTokens, outputTokens, latencyMs,
-                "success", null, sceneType, requestIp, provider, channelId);
+                billingOk ? "success" : "billing_failed", billingOk ? null : billingError,
+                sceneType, requestIp, provider, channelId);
         trackUserPreference(userId, model, sceneType, true, latencyMs, (long) (inputTokens + outputTokens));
     }
 
@@ -346,5 +394,21 @@ public class UsageTrackingService {
 
     private String money(BigDecimal value) {
         return safe(value).setScale(4, RoundingMode.HALF_UP).stripTrailingZeros().toPlainString();
+    }
+
+    @Data
+    public static class CostBreakdown {
+        private String model;
+        private int inputTokens;
+        private int cachedInputTokens;
+        private int billableInputTokens;
+        private int outputTokens;
+        private BigDecimal inputPrice = BigDecimal.ZERO;
+        private BigDecimal cachedInputPrice = BigDecimal.ZERO;
+        private BigDecimal outputPrice = BigDecimal.ZERO;
+        private BigDecimal inputCost = BigDecimal.ZERO;
+        private BigDecimal cachedInputCost = BigDecimal.ZERO;
+        private BigDecimal outputCost = BigDecimal.ZERO;
+        private BigDecimal totalCost = BigDecimal.ZERO;
     }
 }

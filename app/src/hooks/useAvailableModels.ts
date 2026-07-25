@@ -28,7 +28,7 @@ export function useAvailableModels(options: UseAvailableModelsOptions = {}) {
       })
       .catch(err => {
         if (!cancelled) {
-          console.warn('加载用户可用模型失败:', err)
+          if (import.meta.env.DEV) console.debug('用户可用模型接口不可用，已使用本地模型配置:', err)
           setServerModels(null)
         }
       })

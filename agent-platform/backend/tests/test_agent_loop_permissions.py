@@ -1,5 +1,6 @@
 import unittest
 import tempfile
+import os
 from pathlib import Path
 
 from runtime.agent_loop import AgentLoop
@@ -178,6 +179,44 @@ class SubtaskExpectsSourceTest(unittest.TestCase):
         self.assertGreater(iterations, S0_CONTRACT_MAX_ITERATIONS)
 
 
+class AgentModelSelectionTest(unittest.IsolatedAsyncioTestCase):
+    async def test_requested_model_overrides_task_context_router(self):
+        from types import SimpleNamespace
+        from unittest.mock import AsyncMock, patch
+        from core.agent_orchestrator import AgentOrchestrator
+        from core.model_router import TaskContext
+
+        orchestrator = AgentOrchestrator()
+        orchestrator._router = SimpleNamespace(select=AsyncMock())
+        fake_channel = SimpleNamespace(
+            api_key="sk-test",
+            base_url="https://example.test/v1",
+            provider="openai-compat",
+            uuid="channel-1",
+            id=1,
+            name="Test Channel",
+        )
+        fake_client = object()
+        ctx = TaskContext(agent_type="frontend", task_phase="implementation", complexity="moderate")
+
+        with patch(
+            "core.agent_orchestrator.resolve_channel_for_model",
+            return_value=(fake_channel, "provider-model"),
+        ) as resolve_model, patch(
+            "core.agent_orchestrator.create_client_from_channel",
+            return_value=fake_client,
+        ) as create_client:
+            client = await orchestrator._ensure_client(ctx, requested_model="selected-model")
+
+        self.assertIs(client, fake_client)
+        resolve_model.assert_called_once_with("selected-model")
+        create_client.assert_called_once()
+        self.assertEqual(create_client.call_args.args[0]["model"], "provider-model")
+        self.assertEqual(create_client.call_args.args[0]["billing_model"], "selected-model")
+        orchestrator._router.select.assert_not_awaited()
+        self.assertEqual(orchestrator.model_name, "selected-model")
+
+
 class AgenticGuardrailReviewTest(unittest.IsolatedAsyncioTestCase):
     async def test_agentic_guardrail_review_records_structured_events(self):
         from core.agent_orchestrator import agent_orchestrator
@@ -273,7 +312,8 @@ class TaskQueueAutoContinuationTest(unittest.TestCase):
         self.assertEqual(task["auto_continuation_count"], 1)
         self.assertEqual(task["chat_continuation_message"], "修复 parse_args 中的 input 属性")
 
-    def test_iteration_limit_stops_at_total_budget(self):
+    def test_progressing_task_continues_past_old_fixed_budget(self):
+        """A task that keeps advancing is no longer throttled at the old fixed total."""
         from core.state import _tasks
         from services.task_queue import TaskQueue
 
@@ -285,6 +325,12 @@ class TaskQueueAutoContinuationTest(unittest.TestCase):
             "needs_continuation": True,
             "auto_continuation_count": 5,
             "total_agent_iterations": 120,
+            # Fresh progress vs. the previously recorded fingerprint.
+            "last_progress_fingerprint": [2, 5, 10],
+            "plan": {"subtasks": [
+                {"status": "completed"}, {"status": "completed"}, {"status": "completed"},
+                {"status": "pending"}, {"status": "pending"},
+            ]},
             "logs": [],
         }
         queue = TaskQueue()
@@ -293,11 +339,99 @@ class TaskQueueAutoContinuationTest(unittest.TestCase):
             should_continue = queue._prepare_auto_continuation("task-auto-continue")
 
         task = _tasks["task-auto-continue"]
+        self.assertTrue(should_continue)
+        self.assertEqual(task["status"], "pending")
+        self.assertEqual(task["auto_continuation_count"], 6)
+        self.assertEqual(task["stalled_continuation_count"], 0)
+
+    def test_iteration_limit_stops_at_absolute_cap(self):
+        from core.state import _tasks
+        from services.task_queue import TaskQueue
+
+        old_cap = os.environ.get("AUTOCODE_ABSOLUTE_ITERATION_CAP")
+        os.environ["AUTOCODE_ABSOLUTE_ITERATION_CAP"] = "200"
+        _tasks["task-auto-continue"] = {
+            "id": "task-auto-continue",
+            "status": "running",
+            "execution_active": True,
+            "agent_iteration_limited": True,
+            "needs_continuation": True,
+            "auto_continuation_count": 12,
+            # Window opened at 0; consumed 210 >= explicit cap 200.
+            "total_agent_iterations": 210,
+            "auto_continuation_budget_base": 0,
+            "logs": [],
+        }
+        queue = TaskQueue()
+        from unittest.mock import patch
+        try:
+            with patch("services.task_queue.save_task"):
+                should_continue = queue._prepare_auto_continuation("task-auto-continue")
+        finally:
+            if old_cap is None:
+                os.environ.pop("AUTOCODE_ABSOLUTE_ITERATION_CAP", None)
+            else:
+                os.environ["AUTOCODE_ABSOLUTE_ITERATION_CAP"] = old_cap
+
+        task = _tasks["task-auto-continue"]
         self.assertFalse(should_continue)
         self.assertEqual(task["status"], "waiting_confirm")
         self.assertFalse(task["execution_active"])
         self.assertFalse(task["agent_iteration_limited"])
-        self.assertIn("自动续跑总预算", task["current_step"])
+        self.assertEqual(task["pending_confirmation"]["payload"]["reason"], "absolute_cap")
+        self.assertIn("安全上限", task["current_step"])
+
+    def test_stalled_task_pauses_for_confirmation(self):
+        """No progress across the stall threshold pauses for a human, even under the cap."""
+        from core.state import _tasks
+        from services.task_queue import TaskQueue
+
+        old_threshold = os.environ.get("AUTOCODE_MAX_STALLED_CONTINUATIONS")
+        old_unrestricted = os.environ.get("AUTOCODE_UNRESTRICTED_DEV_MODE")
+        os.environ["AUTOCODE_MAX_STALLED_CONTINUATIONS"] = "2"
+        os.environ["AUTOCODE_UNRESTRICTED_DEV_MODE"] = "false"
+        # Explicit threshold 2; a prior stalled segment plus another no-progress
+        # segment should trip the gate.
+        _tasks["task-auto-continue"] = {
+            "id": "task-auto-continue",
+            "status": "running",
+            "execution_active": True,
+            "agent_iteration_limited": True,
+            "needs_continuation": True,
+            "auto_continuation_count": 3,
+            "total_agent_iterations": 60,
+            "auto_continuation_budget_base": 0,
+            "stalled_continuation_count": 1,
+            # Same fingerprint as current computed state (1 completed / 4 total /
+            # 0 accumulated changed files) → no progress this segment.
+            "last_progress_fingerprint": [1, 4, 0],
+            "plan": {"subtasks": [
+                {"status": "completed"}, {"status": "pending"},
+                {"status": "pending"}, {"status": "pending"},
+            ]},
+            "logs": [],
+        }
+        queue = TaskQueue()
+        from unittest.mock import patch
+        try:
+            with patch("services.task_queue.save_task"):
+                should_continue = queue._prepare_auto_continuation("task-auto-continue")
+        finally:
+            if old_threshold is None:
+                os.environ.pop("AUTOCODE_MAX_STALLED_CONTINUATIONS", None)
+            else:
+                os.environ["AUTOCODE_MAX_STALLED_CONTINUATIONS"] = old_threshold
+            if old_unrestricted is None:
+                os.environ.pop("AUTOCODE_UNRESTRICTED_DEV_MODE", None)
+            else:
+                os.environ["AUTOCODE_UNRESTRICTED_DEV_MODE"] = old_unrestricted
+
+        task = _tasks["task-auto-continue"]
+        self.assertFalse(should_continue)
+        self.assertEqual(task["status"], "waiting_confirm")
+        self.assertEqual(task["pending_confirmation"]["payload"]["reason"], "stalled")
+        self.assertGreaterEqual(task["stalled_continuation_count"], 2)
+        self.assertIn("未产生新进展", task["current_step"])
 
 
 class TaskQueuePlanningModeTest(unittest.IsolatedAsyncioTestCase):

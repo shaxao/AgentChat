@@ -66,6 +66,7 @@ class LocalProjectGrantStore:
         user_id: str,
         server_base: str,
         project_root: str,
+        grant_id: str = "",
         task_id: str = "",
         workspace_id: str = "",
         runner_version: str = "",
@@ -92,6 +93,13 @@ class LocalProjectGrantStore:
                 ):
                     grant = item
                     break
+            requested_grant_id = (grant_id or "").strip()
+            if grant is None and requested_grant_id:
+                existing = grants.get(requested_grant_id)
+                if not existing or str(existing.get("user_id") or "") in {"", user_id}:
+                    grant = existing or {}
+                    grant.setdefault("grant_id", requested_grant_id)
+                    grant.setdefault("created_at", _iso(now))
             if grant is None:
                 grant = {
                     "grant_id": f"lpg-{secrets.token_hex(12)}",

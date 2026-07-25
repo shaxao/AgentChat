@@ -3,14 +3,20 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>AutoCode Local Connector</title>
+    <title>AutoCode IDE</title>
   </head>
   <body>
-    <main id="app">
-      <h1>AutoCode Local Connector</h1>
-      <p>本地连接器已安装。请回到网页点击“一键连接本地项目”。</p>
-      <p class="muted">连接器只会在你授权的项目目录内读写文件和运行命令。</p>
-    </main>
+    <div id="startup-splash" class="startup-splash" aria-label="AutoCode IDE 正在启动">
+      <canvas id="startup-scene"></canvas>
+      <div class="startup-vignette"></div>
+      <div class="startup-copy">
+        <div class="startup-title">AutoCode IDE</div>
+        <div class="startup-subtitle">Neural Workbench</div>
+        <div class="startup-progress"><span id="startup-progress-bar"></span></div>
+        <div class="startup-status" id="startup-status">初始化本地工作台 · 00%</div>
+      </div>
+    </div>
+    <div id="app"></div>
     <script type="module" src="/src/main.ts"></script>
   </body>
 </html>

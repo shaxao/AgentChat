@@ -44,6 +44,31 @@ RUN apt-get remove -y \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/* /root/.cargo /root/.rustup
 
+# ─── LSP 语言服务器（代码智能）──────────────────────────────
+# 在 backend 主机侧运行，供 agent 查跳定义/引用/符号并在编辑后回喂
+# 编译/类型错误。全部优雅降级：缺二进制时对应语言的 LSP 自动跳过。
+# 用 INSTALL_LSP=0 构建可跳过，得到更小的镜像（LSP 功能随之关闭）。
+ARG INSTALL_LSP=1
+# Node 20（pyright + typescript-language-server）与 Go（gopls）
+ENV PATH="/usr/local/go/bin:/root/go/bin:${PATH}"
+RUN if [ "$INSTALL_LSP" = "1" ]; then set -eux; \
+    apt-get update && apt-get install -y --no-install-recommends curl ca-certificates; \
+    # Node 20 (NodeSource)
+    curl -fsSL https://deb.nodesource.com/setup_20.x | bash -; \
+    apt-get install -y --no-install-recommends nodejs; \
+    npm config set registry https://registry.npmmirror.com; \
+    npm install -g pyright typescript typescript-language-server; \
+    # Go + gopls（官方 tarball；GOPROXY 用国内镜像加速）
+    curl -fsSL https://mirrors.aliyun.com/golang/go1.22.5.linux-amd64.tar.gz \
+      | tar -C /usr/local -xzf -; \
+    GOPROXY=https://goproxy.cn,direct /usr/local/go/bin/go install golang.org/x/tools/gopls@latest; \
+    # 保留运行时需要的 node/go，仅清理 apt 缓存
+    apt-get clean && rm -rf /var/lib/apt/lists/*; \
+    pyright-langserver --version || true; \
+    typescript-language-server --version || true; \
+    gopls version || true; \
+    fi
+
 # ─── 源码 ────────────────────────────────────────────────
 COPY . .
 

@@ -1,0 +1,8 @@
+{
+  "mcpServers": [],
+  "permissionPolicy": {},
+  "notes": {
+    "mcpServers": "项目级 MCP 服务配置。示例：[{\"name\":\"filesystem\",\"command\":\"npx\",\"args\":[\"-y\",\"@modelcontextprotocol/server-filesystem\",\"D:/project\"],\"enabled\":true,\"timeoutSecs\":30}]",
+    "permissionPolicy": "项目级权限策略备注。当前 IDE 设置中的权限策略负责主要执行控制。"
+  }
+}

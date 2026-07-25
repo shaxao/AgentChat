@@ -26,7 +26,7 @@ import { cn } from '@/lib/utils'
 
 type Tab = 'login' | 'register' | 'forgot'
 
-const DEMO_MODE = import.meta.env.VITE_DEMO_MODE !== 'false'
+const DEMO_MODE = import.meta.env.VITE_DEMO_MODE === 'true'
 
 // 演示账号（后端未启动时使用）
 const DEMO_ACCOUNTS = [

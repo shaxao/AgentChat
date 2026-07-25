@@ -37,6 +37,7 @@ import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.time.Duration;
+import java.time.Instant;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
@@ -211,6 +212,9 @@ public class AiService {
 
     @Value("${app.ai.timeout:120}")
     private int timeoutSeconds;
+
+    @Value("${app.ai.gateway-stream-timeout:600}")
+    private int gatewayStreamTimeoutSeconds;
 
     /**
      * 流式调用 AI，每收到一个 token 就回调 onToken，结束后回调 onDone
@@ -403,8 +407,8 @@ public class AiService {
             throw new RuntimeException("无法确定调用模型，请检查渠道配置");
         }
 
-        // 通过适配器处理供应商差异
-        ProviderAdapter adapter = AdapterFactory.getProviderAdapter(channel.provider);
+        // 通过适配器处理供应商差异（按渠道 apiFormat 优先，再回退 provider）
+        ProviderAdapter adapter = AdapterFactory.getProviderAdapter(channel.provider, channel.apiFormat);
         ObjectNode body = buildRequestBody(actualModel, systemPrompt, history, userMessage, imageUrls, temperature, maxTokens, true, thinking, thinkingBudget);
         body = adapter.transformRequest(body, channel.provider);
         String url = adapter.streamUrl(channel.baseUrl, actualModel, channel.apiKey);
@@ -565,7 +569,7 @@ public class AiService {
         }
 
         // 通过适配器处理供应商差异
-        ProviderAdapter adapter = AdapterFactory.getProviderAdapter(channel.provider);
+        ProviderAdapter adapter = AdapterFactory.getProviderAdapter(channel.provider, channel.apiFormat);
         ObjectNode body = buildRequestBody(actualModel, systemPrompt, history, userMessage, temperature, maxTokens, false, thinking, thinkingBudget);
         body = adapter.transformRequest(body, channel.provider);
         String url = adapter.chatUrl(channel.baseUrl, actualModel, channel.apiKey);
@@ -672,9 +676,61 @@ public class AiService {
                                       Double temperature, Integer maxTokens,
                                       List<ToolDefinition> tools,
                                       Boolean thinking, Integer thinkingBudget) {
-        List<ChannelConfig> candidates = resolveAllChannels(model, "chat");
+        return chatCompletionRaw(model, systemPrompt, messages, temperature, maxTokens,
+                tools, thinking, thinkingBudget, true);
+    }
+
+    public JsonNode chatCompletionRaw(String model, String systemPrompt,
+                                      List<Map<String, Object>> messages,
+                                      Double temperature, Integer maxTokens,
+                                      List<ToolDefinition> tools,
+                                      Boolean thinking, Integer thinkingBudget,
+                                      JsonNode requestOptions) {
+        return chatCompletionRaw(model, systemPrompt, messages, temperature, maxTokens,
+                tools, thinking, thinkingBudget, true, requestOptions);
+    }
+
+    /**
+     * 单轮非流式补全（不在 Java 侧执行工具），供入站网关（/v1/messages、/v1/responses）复用。
+     * <p>
+     * 与 7 参版本的唯一区别是 {@code enhancePrompt}：网关模式传 false，
+     * 保持外部客户端（Claude Code / Cline 等）system prompt 原样透传，
+     * 不注入平台内置回复格式规范。
+     *
+     * @param enhancePrompt 是否附加平台内置格式规范到 system prompt
+     */
+    public JsonNode chatCompletionRaw(String model, String systemPrompt,
+                                      List<Map<String, Object>> messages,
+                                      Double temperature, Integer maxTokens,
+                                      List<ToolDefinition> tools,
+                                      Boolean thinking, Integer thinkingBudget,
+                                      boolean enhancePrompt) {
+        return chatCompletionRaw(model, systemPrompt, messages, temperature, maxTokens,
+                tools, thinking, thinkingBudget, enhancePrompt, null);
+    }
+
+    public JsonNode chatCompletionRaw(String model, String systemPrompt,
+                                      List<Map<String, Object>> messages,
+                                      Double temperature, Integer maxTokens,
+                                      List<ToolDefinition> tools,
+                                      Boolean thinking, Integer thinkingBudget,
+                                      boolean enhancePrompt,
+                                      JsonNode requestOptions) {
+        return chatCompletionRaw(model, systemPrompt, messages, temperature, maxTokens,
+                tools, thinking, thinkingBudget, enhancePrompt, requestOptions, false);
+    }
+
+    public JsonNode chatCompletionRaw(String model, String systemPrompt,
+                                      List<Map<String, Object>> messages,
+                                      Double temperature, Integer maxTokens,
+                                      List<ToolDefinition> tools,
+                                      Boolean thinking, Integer thinkingBudget,
+                                      boolean enhancePrompt,
+                                      JsonNode requestOptions,
+                                      boolean strictModelRouting) {
+        List<ChannelConfig> candidates = resolveAllChannels(model, "chat", strictModelRouting);
         if (candidates.isEmpty()) {
-            throw new RuntimeException("无可用的 AI 渠道，请检查渠道配置");
+            throw noAvailableChannel(model, strictModelRouting);
         }
 
         Exception lastEx = null;
@@ -684,7 +740,7 @@ public class AiService {
             try {
                 ObjectNode body = buildRequestBodyWithTools(
                         actualModel, systemPrompt, messages,
-                        temperature, maxTokens, tools, thinking, thinkingBudget);
+                        temperature, maxTokens, tools, thinking, thinkingBudget, enhancePrompt, requestOptions);
                 body.put("stream", false);
                 body.remove("stream_options");
 
@@ -725,6 +781,265 @@ public class AiService {
     }
 
     /**
+     * 单轮流式补全（不在 Java 侧执行工具），供入站网关（/v1/messages、/v1/responses）复用。
+     * <p>
+     * 与 Agent 模式的 {@link #streamChatWithTools} 的关键区别：本方法只调用一次 LLM，
+     * 不做 ReAct 循环、不执行工具。文本内容通过 {@code onToken} 逐 token 推送；工具调用
+     * （tool_calls）与用量在返回的合成响应中一次性给出，由网关按目标协议（Anthropic
+     * content block / OpenAI Responses item）转换后下发给外部客户端——工具执行由客户端负责。
+     *
+     * @param onToken       文本增量回调（逐 token）
+     * @param enhancePrompt 是否附加平台内置格式规范（网关传 false）
+     * @return 合成的 OpenAI 格式响应（含 choices[0].message.content / tool_calls，usage，finish_reason）
+     */
+    public JsonNode streamChatCompletionRaw(String model, String systemPrompt,
+                                            List<Map<String, Object>> messages,
+                                            Double temperature, Integer maxTokens,
+                                            List<ToolDefinition> tools,
+                                            Boolean thinking, Integer thinkingBudget,
+                                            boolean enhancePrompt,
+                                            Consumer<String> onToken) {
+        return streamChatCompletionRaw(model, systemPrompt, messages, temperature, maxTokens,
+                tools, thinking, thinkingBudget, enhancePrompt, null, onToken);
+    }
+
+    public JsonNode streamChatCompletionRaw(String model, String systemPrompt,
+                                            List<Map<String, Object>> messages,
+                                            Double temperature, Integer maxTokens,
+                                            List<ToolDefinition> tools,
+                                            Boolean thinking, Integer thinkingBudget,
+                                            boolean enhancePrompt,
+                                            JsonNode requestOptions,
+                                            Consumer<String> onToken) {
+        return streamChatCompletionRaw(model, systemPrompt, messages, temperature, maxTokens,
+                tools, thinking, thinkingBudget, enhancePrompt, requestOptions, false, onToken);
+    }
+
+    public JsonNode streamChatCompletionRaw(String model, String systemPrompt,
+                                            List<Map<String, Object>> messages,
+                                            Double temperature, Integer maxTokens,
+                                            List<ToolDefinition> tools,
+                                            Boolean thinking, Integer thinkingBudget,
+                                            boolean enhancePrompt,
+                                            JsonNode requestOptions,
+                                            boolean strictModelRouting,
+                                            Consumer<String> onToken) {
+        List<ChannelConfig> candidates = resolveAllChannels(model, "chat", strictModelRouting);
+        if (candidates.isEmpty()) {
+            throw noAvailableChannel(model, strictModelRouting);
+        }
+
+        int effectiveMaxTokens = resolveEffectiveMaxTokens(model, maxTokens);
+        Exception lastEx = null;
+        for (int attempt = 0; attempt < candidates.size(); attempt++) {
+            ChannelConfig channel = candidates.get(attempt);
+            String actualModel = channel.model;
+            try {
+                ObjectNode body = buildRequestBodyWithTools(
+                        actualModel, systemPrompt, messages,
+                        temperature, effectiveMaxTokens, tools, thinking, thinkingBudget, enhancePrompt, requestOptions);
+                body.put("stream", true);
+                ObjectNode streamOptions = objectMapper.createObjectNode();
+                streamOptions.put("include_usage", true);
+                body.set("stream_options", streamOptions);
+
+                JsonNode response = callLlmApiStreaming(channel, body, gatewayStreamTimeoutSeconds,
+                        onToken != null ? onToken : t -> {});
+                usedChannelHolder.set(new UsedChannel(channel.channelId, channel.provider));
+                JsonNode choice = response.path("choices").path(0);
+                JsonNode message = choice.path("message");
+                String content = message.path("content").asText("");
+                JsonNode toolCalls = message.path("tool_calls");
+                boolean hasToolCalls = toolCalls.isArray() && !toolCalls.isEmpty();
+                if (!content.isBlank() || hasToolCalls) {
+                    return response;
+                }
+                throw new RuntimeException("AI 服务返回空消息: model=" + actualModel
+                        + ", finish=" + choice.path("finish_reason").asText(""));
+            } catch (Exception e) {
+                lastEx = e;
+                String errMsg = e.getMessage() != null ? e.getMessage() : "";
+                int statusCode = extractStatusCode(errMsg);
+                boolean retriable = statusCode <= 0 || isRetriableStatusCode(statusCode)
+                        || errMsg.contains("空消息")
+                        || errMsg.toLowerCase().contains("empty")
+                        || errMsg.toLowerCase().contains("rate limit")
+                        || errMsg.toLowerCase().contains("busy")
+                        || errMsg.toLowerCase().contains("overloaded");
+                if (retriable && attempt < candidates.size() - 1) {
+                    log.warn("[AiService] gateway streaming completion failed on model={}, channel={}, retrying next. error={}",
+                            actualModel, channel.channelId, errMsg);
+                    continue;
+                }
+                break;
+            }
+        }
+        if (lastEx instanceof RuntimeException) {
+            throw (RuntimeException) lastEx;
+        }
+        throw new RuntimeException("AI 服务暂时不可用: gateway streaming completion failed", lastEx);
+    }
+
+    /**
+     * 外部 OpenAI-compatible 网关专用渠道解析。
+     * <p>
+     * 与站内聊天的宽松 fallback 不同：当请求明确指定 model 时，只返回声明支持该模型的渠道，
+     * 避免 /v1/responses 或 /v1/chat/completions 串到无关模型。
+     */
+    public List<GatewayChannel> resolveGatewayChannels(String model, Set<String> allowedApiFormats) {
+        Set<String> normalizedAllowed = new HashSet<>();
+        if (allowedApiFormats != null) {
+            for (String format : allowedApiFormats) {
+                String normalized = normalizeGatewayApiFormat(format);
+                if (!normalized.isBlank()) normalizedAllowed.add(normalized);
+            }
+        }
+        return resolveAllChannels(model, "chat", true).stream()
+                .filter(channel -> normalizedAllowed.isEmpty()
+                        || normalizedAllowed.contains(normalizeGatewayApiFormat(channel.apiFormat)))
+                .map(this::toGatewayChannel)
+                .toList();
+    }
+
+    public JsonNode chatCompletionRawOnGatewayChannel(GatewayChannel gatewayChannel,
+                                                      String systemPrompt,
+                                                      List<Map<String, Object>> messages,
+                                                      Double temperature, Integer maxTokens,
+                                                      List<ToolDefinition> tools,
+                                                      Boolean thinking, Integer thinkingBudget,
+                                                      JsonNode requestOptions) {
+        ChannelConfig channel = toChannelConfig(gatewayChannel);
+        int effectiveMaxTokens = resolveEffectiveMaxTokens(channel.model(), maxTokens);
+        try {
+            ObjectNode body = buildRequestBodyWithTools(
+                    channel.model(), systemPrompt, messages,
+                    temperature, effectiveMaxTokens, tools, thinking, thinkingBudget, false, requestOptions);
+            body.put("stream", false);
+            body.remove("stream_options");
+            JsonNode response = callLlmApi(channel, body, timeoutSeconds);
+            ensureGatewayResponseHasOutput(response, channel.model());
+            usedChannelHolder.set(new UsedChannel(channel.channelId, channel.provider));
+            return response;
+        } catch (RuntimeException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new RuntimeException("AI 服务暂时不可用: gateway chat completion failed", e);
+        }
+    }
+
+    public JsonNode streamChatCompletionRawOnGatewayChannel(GatewayChannel gatewayChannel,
+                                                            String systemPrompt,
+                                                            List<Map<String, Object>> messages,
+                                                            Double temperature, Integer maxTokens,
+                                                            List<ToolDefinition> tools,
+                                                            Boolean thinking, Integer thinkingBudget,
+                                                            JsonNode requestOptions,
+                                                            Consumer<String> onToken) {
+        ChannelConfig channel = toChannelConfig(gatewayChannel);
+        int effectiveMaxTokens = resolveEffectiveMaxTokens(channel.model(), maxTokens);
+        try {
+            ObjectNode body = buildRequestBodyWithTools(
+                    channel.model(), systemPrompt, messages,
+                    temperature, effectiveMaxTokens, tools, thinking, thinkingBudget, false, requestOptions);
+            body.put("stream", true);
+            ObjectNode streamOptions = objectMapper.createObjectNode();
+            streamOptions.put("include_usage", true);
+            body.set("stream_options", streamOptions);
+            JsonNode response = callLlmApiStreaming(channel, body, gatewayStreamTimeoutSeconds,
+                    onToken != null ? onToken : t -> {});
+            ensureGatewayResponseHasOutput(response, channel.model());
+            usedChannelHolder.set(new UsedChannel(channel.channelId, channel.provider));
+            return response;
+        } catch (RuntimeException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new RuntimeException("AI 服务暂时不可用: gateway streaming completion failed", e);
+        }
+    }
+
+    public JsonNode responsesCompletionRawOnGatewayChannel(GatewayChannel gatewayChannel,
+                                                           JsonNode responsesRequest,
+                                                           int requestTimeoutSeconds) throws Exception {
+        ChannelConfig channel = toChannelConfig(gatewayChannel);
+        ObjectNode body = responsesRequestForGateway(responsesRequest, channel.model(), false);
+        return callResponsesApi(channel, body, requestTimeoutSeconds);
+    }
+
+    public GatewayResponsesStreamResult streamResponsesRawOnGatewayChannel(GatewayChannel gatewayChannel,
+                                                                           JsonNode responsesRequest,
+                                                                           int requestTimeoutSeconds,
+                                                                           GatewayResponsesEventConsumer eventConsumer) throws Exception {
+        ChannelConfig channel = toChannelConfig(gatewayChannel);
+        ObjectNode body = responsesRequestForGateway(responsesRequest, channel.model(), true);
+        ProviderAdapter adapter = AdapterFactory.getProviderAdapter(channel.provider, "responses");
+        String url = adapter.streamUrl(channel.baseUrl, channel.model, channel.apiKey);
+        String bodyJson = objectMapper.writeValueAsString(body);
+
+        HttpClient client = HttpClient.newBuilder()
+                .connectTimeout(Duration.ofSeconds(30))
+                .build();
+        HttpRequest.Builder reqBuilder = HttpRequest.newBuilder()
+                .uri(URI.create(url))
+                .timeout(Duration.ofSeconds(requestTimeoutSeconds))
+                .header("Content-Type", "application/json")
+                .header("Accept", "text/event-stream")
+                .POST(HttpRequest.BodyPublishers.ofString(bodyJson));
+        adapter.authHeaders(channel.apiKey).forEach((k, v) -> reqBuilder.header(k, v));
+
+        HttpResponse<java.io.InputStream> response = client.send(reqBuilder.build(),
+                HttpResponse.BodyHandlers.ofInputStream());
+        if (response.statusCode() != 200) {
+            String errBody = new String(response.body().readAllBytes(), java.nio.charset.StandardCharsets.UTF_8);
+            throw providerHttpError(channel, response.statusCode(), errBody);
+        }
+
+        GatewayResponsesStreamState state = new GatewayResponsesStreamState();
+        try (BufferedReader reader = new BufferedReader(new InputStreamReader(response.body(), java.nio.charset.StandardCharsets.UTF_8))) {
+            String eventName = null;
+            StringBuilder data = new StringBuilder();
+            String line;
+            while ((line = reader.readLine()) != null) {
+                if (line.isEmpty()) {
+                    flushResponsesSseFrame(eventName, data, state, eventConsumer);
+                    eventName = null;
+                    data.setLength(0);
+                    continue;
+                }
+                if (line.startsWith(":")) {
+                    continue;
+                }
+                if (line.startsWith("event:")) {
+                    eventName = line.substring("event:".length()).trim();
+                    continue;
+                }
+                if (line.startsWith("data:")) {
+                    if (data.length() > 0) data.append('\n');
+                    data.append(line.substring("data:".length()).trim());
+                }
+            }
+            flushResponsesSseFrame(eventName, data, state, eventConsumer);
+        }
+
+        if (!state.failed && !state.sawTerminal) {
+            ObjectNode incomplete = syntheticIncompleteResponsesEvent(state, channel);
+            eventConsumer.accept(new GatewayResponsesEvent("response.incomplete", incomplete,
+                    objectMapper.writeValueAsString(incomplete)));
+        }
+
+        if (!state.failed && !state.sawDone && state.finalResponse != null) {
+            ObjectNode done = objectMapper.createObjectNode();
+            done.put("type", "response.done");
+            done.set("response", state.finalResponse);
+            eventConsumer.accept(new GatewayResponsesEvent("response.done", done, objectMapper.writeValueAsString(done)));
+            state.sawDone = true;
+            state.sawTerminal = true;
+        }
+        usedChannelHolder.set(new UsedChannel(channel.channelId, channel.provider));
+        return new GatewayResponsesStreamResult(state.finalResponse, state.failed, state.sawTerminal,
+                state.incomplete, state.sawOutputOrTool);
+    }
+
+    /**
      * Vision 路由：使用 vision 模型描述图片，返回纯文本描述。
      * 用于非 vision 模型（如纯 tool 模型）接收图片时，委托 vision 模型识别后再传给当前模型。
      *
@@ -743,8 +1058,8 @@ public class AiService {
             throw new RuntimeException("无法确定调用模型，请检查渠道配置");
         }
 
-        // 通过适配器处理供应商差异
-        ProviderAdapter adapter = AdapterFactory.getProviderAdapter(channel.provider);
+        // 通过适配器处理供应商差异（按渠道出站格式选择）
+        ProviderAdapter adapter = AdapterFactory.getProviderAdapter(channel.provider, channel.apiFormat);
         // 使用 Vision 格式的请求体
         ObjectNode body = buildRequestBody(actualModel, null, null, prompt, imageUrls, 0.3, 1024, false);
         body = adapter.transformRequest(body, channel.provider);
@@ -828,7 +1143,7 @@ public class AiService {
 
         this.streamChatWithTools(model, systemPrompt, messages, temperature, maxTokens,
                 tools, toolExecutor, onToken, onToolCall, onToolResult, onDone, null,
-                thinking, thinkingBudget);
+                thinking, thinkingBudget, null);
     }
 
     /**
@@ -845,6 +1160,23 @@ public class AiService {
                                     StreamDoneCallback onDone,
                                     String sessionId,
                                     Boolean thinking, Integer thinkingBudget) {
+        this.streamChatWithTools(model, systemPrompt, messages, temperature, maxTokens,
+                tools, toolExecutor, onToken, onToolCall, onToolResult, onDone, sessionId,
+                thinking, thinkingBudget, null);
+    }
+
+    public void streamChatWithTools(String model, String systemPrompt,
+                                    List<Map<String, Object>> messages,
+                                    Double temperature, Integer maxTokens,
+                                    List<ToolDefinition> tools,
+                                    ToolExecutor toolExecutor,
+                                    Consumer<String> onToken,
+                                    Consumer<ToolCallRecord> onToolCall,
+                                    Consumer<ToolCallRecord> onToolResult,
+                                    StreamDoneCallback onDone,
+                                    String sessionId,
+                                    Boolean thinking, Integer thinkingBudget,
+                                    AgentRuntimeOptions runtimeOptions) {
 
         ChannelConfig channel = resolveChannel(model);
         // 使用渠道配置的真实模型名（channel.model），而非 model_id
@@ -858,7 +1190,8 @@ public class AiService {
         // 用户未显式传 maxTokens → 从 ModelConfig.contextLength 动态计算
         int effectiveMaxTokens = resolveEffectiveMaxTokens(model, maxTokens);
 
-        int maxTurns = 25; // ReAct 最大轮次，防止无限循环（台账场景 N 个商品需约 3N+2 轮）
+        int maxTurns = clamp(runtimeOptions != null ? runtimeOptions.maxTurns() : null, 1, 50, 25);
+        int llmTimeoutSeconds = clamp(runtimeOptions != null ? runtimeOptions.llmTimeoutSeconds() : null, 30, 1800, 600);
         long start = System.currentTimeMillis();
         int totalInputTokens = 0;
         int totalOutputTokens = 0;
@@ -924,7 +1257,7 @@ public class AiService {
 
                 // 2. 流式调用 LLM（内容逐 token 推送前端，tool_calls 流式累积）
                 //    Agent 模式用10分钟超时，工具执行可能耗时长
-                JsonNode response = callLlmApiStreaming(currentChannel, body, 600, onToken);
+                JsonNode response = callLlmApiStreaming(currentChannel, body, llmTimeoutSeconds, onToken);
 
                 // 3. 解析响应
                 JsonNode choices = response.path("choices");
@@ -986,7 +1319,7 @@ public class AiService {
                                 ptc.arguments.length() > 100 ? ptc.arguments.substring(0, 100) + "..." : ptc.arguments);
 
                         // 通知前端：开始调用工具
-                        onToolCall.accept(new ToolCallRecord(ptc.toolCallId, ptc.toolName, truncateForSse(ptc.arguments), null));
+                        onToolCall.accept(new ToolCallRecord(ptc.toolCallId, ptc.toolName, ptc.arguments, null));
 
                         // 执行工具
                         String result;
@@ -1028,6 +1361,9 @@ public class AiService {
                 if (!hasToolCalls && (content == null || content.isEmpty())) {
                     log.warn("[Agent] LLM 未返回 tool_calls 也未返回内容，模型可能不支持 function calling: model={}, channel={}",
                             actualModel, currentChannel.baseUrl);
+                    content = "Agent failed to continue because the selected model returned neither text nor tool calls. "
+                            + "This usually means the model/channel does not support tool calling or returned an invalid tool response. "
+                            + "Please switch to a tool-capable model or retry with another channel.";
                     onToken.accept("当前模型（" + actualModel + "）可能不支持工具调用（Function Calling），请尝试切换到支持工具调用的模型（如 gpt-4o、gpt-4o-mini、claude-3.5-sonnet 等）。");
                 }
 
@@ -1080,8 +1416,7 @@ public class AiService {
                             args.length() > 100 ? args.substring(0, 100) + "..." : args);
 
                     // 通知前端：开始调用工具（OOM 防护：SSE 层截断到 3K，工具执行仍用完整参数）
-                    onToolCall.accept(new ToolCallRecord(toolCallId, funcName,
-                            truncateForSse(args), null));
+                    onToolCall.accept(new ToolCallRecord(toolCallId, funcName, args, null));
 
                     // 执行工具
                     String result;
@@ -1436,7 +1771,7 @@ public class AiService {
                     String ml = mt.toLowerCase();
                     boolean isVision = visionKeywords.stream().anyMatch(ml::contains);
                     if (isVision) {
-                        results.add(new ChannelConfig(ch.getId(), ch.getApiKey(), normalizeBaseUrl(ch.getBaseUrl()), mt, ch.getProvider()));
+                        results.add(new ChannelConfig(ch.getId(), ch.getApiKey(), normalizeBaseUrl(ch.getBaseUrl()), mt, ch.getProvider(), ch.getApiFormat()));
                     }
                 }
             }
@@ -1476,6 +1811,30 @@ public class AiService {
         return Arrays.asList(models.split(","));
     }
 
+    private boolean channelSupportsModel(String models, String model) {
+        if (models == null || models.isBlank() || model == null || model.isBlank()) return false;
+        for (String item : parseModelsField(models)) {
+            if (model.equalsIgnoreCase(item.trim())) return true;
+        }
+        return false;
+    }
+
+    private QueryWrapper<ModelChannel> activeChannelQuery(String channelType) {
+        QueryWrapper<ModelChannel> query = new QueryWrapper<ModelChannel>()
+                .in("status", Arrays.asList("active", "enabled"))
+                .eq("deleted", 0);
+        if (channelType != null && !channelType.isBlank()) {
+            if ("chat".equalsIgnoreCase(channelType)) {
+                query.and(w -> w.isNull("channel_type")
+                        .or().eq("channel_type", "")
+                        .or().eq("channel_type", "chat"));
+            } else {
+                query.eq("channel_type", channelType);
+            }
+        }
+        return query.orderByAsc("priority");
+    }
+
     /**
      * 构建 Agent 模式的请求体（非流式 + tools）
      */
@@ -1484,6 +1843,33 @@ public class AiService {
                                                  Double temperature, Integer maxTokens,
                                                  List<ToolDefinition> tools,
                                                  Boolean thinking, Integer thinkingBudget) {
+        return buildRequestBodyWithTools(model, systemPrompt, messages, temperature, maxTokens,
+                tools, thinking, thinkingBudget, true);
+    }
+
+    /**
+     * 构建 Agent 模式请求体（可控制是否附加项目内置格式规范）。
+     * <p>
+     * 网关透传场景（入站 /v1/messages、/v1/chat/completions 等）应传 {@code enhancePrompt=false}，
+     * 保持外部客户端（如 IDE 工具）的原始 system prompt 不被平台格式规范污染。
+     */
+    private ObjectNode buildRequestBodyWithTools(String model, String systemPrompt,
+                                                 List<Map<String, Object>> messages,
+                                                 Double temperature, Integer maxTokens,
+                                                 List<ToolDefinition> tools,
+                                                 Boolean thinking, Integer thinkingBudget,
+                                                 boolean enhancePrompt) {
+        return buildRequestBodyWithTools(model, systemPrompt, messages, temperature, maxTokens,
+                tools, thinking, thinkingBudget, enhancePrompt, null);
+    }
+
+    private ObjectNode buildRequestBodyWithTools(String model, String systemPrompt,
+                                                 List<Map<String, Object>> messages,
+                                                 Double temperature, Integer maxTokens,
+                                                 List<ToolDefinition> tools,
+                                                 Boolean thinking, Integer thinkingBudget,
+                                                 boolean enhancePrompt,
+                                                 JsonNode requestOptions) {
         ObjectNode body = objectMapper.createObjectNode();
         body.put("model", model);
         body.put("temperature", temperature != null ? temperature : 0.7);
@@ -1504,22 +1890,34 @@ public class AiService {
         // messages（支持 Object 类型值，兼容 tool role）
         ArrayNode messagesArray = body.putArray("messages");
 
-        // 1. system prompt（自动附加项目格式规范）
+        // 1. system prompt（enhancePrompt=true 时附加项目格式规范；网关透传场景传 false 保持原样）
         if (systemPrompt != null && !systemPrompt.isBlank()) {
-            messagesArray.addObject().put("role", "system").put("content", enhanceSystemPrompt(systemPrompt));
+            String sys = enhancePrompt ? enhanceSystemPrompt(systemPrompt) : systemPrompt;
+            messagesArray.addObject().put("role", "system").put("content", sys);
         }
 
         // 2. 历史消息
         if (messages != null) {
             for (Map<String, Object> msg : messages) {
                 ObjectNode msgNode = messagesArray.addObject();
-                msgNode.put("role", (String) msg.get("role"));
+                String role = stringValue(msg.get("role"));
+                if (role == null || role.isBlank()) role = "user";
 
                 Object contentObj = msg.get("content");
+                String toolCallId = firstNonBlankObject(msg.get("tool_call_id"), msg.get("call_id"));
+                if ("tool".equals(role) && (toolCallId == null || toolCallId.isBlank())) {
+                    log.warn("[AiService] gateway message contains role=tool without tool_call_id; downgrading to user context");
+                    role = "user";
+                    contentObj = "Tool result:\n" + contentToSafeText(contentObj);
+                }
+
+                msgNode.put("role", role);
                 if (contentObj instanceof String s) {
                     msgNode.put("content", s);
                 } else if (contentObj != null) {
                     msgNode.set("content", objectMapper.valueToTree(contentObj));
+                } else {
+                    msgNode.put("content", "");
                 }
 
                 // tool_calls（assistant 消息可能携带）
@@ -1529,9 +1927,8 @@ public class AiService {
                 }
 
                 // tool_call_id（tool 消息必须携带）
-                Object toolCallId = msg.get("tool_call_id");
-                if (toolCallId != null) {
-                    msgNode.put("tool_call_id", (String) toolCallId);
+                if ("tool".equals(role) && toolCallId != null && !toolCallId.isBlank()) {
+                    msgNode.put("tool_call_id", toolCallId);
                 }
             }
         }
@@ -1561,8 +1958,99 @@ public class AiService {
             log.warn("[Agent] 警告：tools 为空！LLM 将无法调用任何工具。请检查 AgentConfig.tools() 是否返回了工具列表。");
         }
 
+        applyGatewayRequestOptions(body, requestOptions, tools != null && !tools.isEmpty());
         applyPromptCacheKey(body);
         return body;
+    }
+
+    private void applyGatewayRequestOptions(ObjectNode body, JsonNode requestOptions, boolean hasTools) {
+        if (body == null || requestOptions == null || requestOptions.isMissingNode() || requestOptions.isNull()) {
+            return;
+        }
+
+        copyJsonField(requestOptions, body, "top_p");
+        copyJsonField(requestOptions, body, "stop");
+        copyJsonField(requestOptions, body, "frequency_penalty");
+        copyJsonField(requestOptions, body, "presence_penalty");
+        copyJsonField(requestOptions, body, "seed");
+        copyJsonField(requestOptions, body, "user");
+        copyJsonField(requestOptions, body, "logit_bias");
+        copyJsonField(requestOptions, body, "response_format");
+        if (!body.has("response_format") && requestOptions.path("text").path("format").isObject()) {
+            body.set("response_format", requestOptions.path("text").path("format").deepCopy());
+        }
+        if (requestOptions.has("reasoning_effort")) {
+            body.set("reasoning_effort", requestOptions.get("reasoning_effort").deepCopy());
+        }
+
+        if (hasTools) {
+            if (requestOptions.has("tool_choice")) {
+                body.set("tool_choice", requestOptions.get("tool_choice").deepCopy());
+            }
+            copyJsonField(requestOptions, body, "parallel_tool_calls");
+        } else {
+            body.remove("tool_choice");
+            body.remove("parallel_tool_calls");
+        }
+
+        if (!body.path("_thinking").asBoolean(false) && requestOptions.path("reasoning").isObject()) {
+            String effort = requestOptions.path("reasoning").path("effort").asText("");
+            if (!effort.isBlank()) {
+                body.put("_thinking", true);
+                body.put("_thinking_budget", reasoningBudgetForEffort(effort));
+            }
+        }
+    }
+
+    private void copyJsonField(JsonNode source, ObjectNode target, String field) {
+        if (source.has(field) && !source.get(field).isNull()) {
+            target.set(field, source.get(field).deepCopy());
+        }
+    }
+
+    private String firstNonBlankObject(Object... values) {
+        if (values == null) return "";
+        for (Object value : values) {
+            String text = stringValue(value);
+            if (text != null && !text.isBlank()) return text;
+        }
+        return "";
+    }
+
+    private String stringValue(Object value) {
+        return value == null ? null : String.valueOf(value);
+    }
+
+    private String contentToSafeText(Object contentObj) {
+        if (contentObj == null) return "";
+        if (contentObj instanceof String s) return s;
+        JsonNode node = objectMapper.valueToTree(contentObj);
+        if (node == null || node.isNull() || node.isMissingNode()) return "";
+        if (node.isTextual()) return node.asText("");
+        if (node.isArray()) {
+            StringBuilder sb = new StringBuilder();
+            for (JsonNode item : node) {
+                if (item.has("text")) {
+                    sb.append(item.path("text").asText(""));
+                } else if (item.has("content")) {
+                    sb.append(item.path("content").asText(""));
+                } else if (item.isTextual()) {
+                    sb.append(item.asText(""));
+                }
+            }
+            if (sb.length() > 0) return sb.toString();
+        }
+        return node.toString();
+    }
+
+    private int reasoningBudgetForEffort(String effort) {
+        if (effort == null) return 8192;
+        return switch (effort.trim().toLowerCase(Locale.ROOT)) {
+            case "minimal" -> 1024;
+            case "low" -> 2048;
+            case "high" -> 16000;
+            default -> 8192;
+        };
     }
 
     /**
@@ -1574,8 +2062,8 @@ public class AiService {
 
     /** Agent 模式专用：支持自定义超时（Agent 工具执行可能耗时很长） */
     private JsonNode callLlmApi(ChannelConfig channel, ObjectNode body, int requestTimeoutSeconds) throws Exception {
-        // 通过适配器处理供应商差异
-        ProviderAdapter adapter = AdapterFactory.getProviderAdapter(channel.provider);
+        // 通过适配器处理供应商差异（渠道 apiFormat 优先）
+        ProviderAdapter adapter = AdapterFactory.getProviderAdapter(channel.provider, channel.apiFormat);
         String actualModel = body.path("model").asText(channel.model);
         body = adapter.transformRequest(body, channel.provider);
         String url = adapter.chatUrl(channel.baseUrl, actualModel, channel.apiKey);
@@ -1763,6 +2251,284 @@ public class AiService {
                 (lastException != null ? lastException.getMessage() : "未知错误"), lastException);
     }
 
+    private JsonNode callResponsesApi(ChannelConfig channel, ObjectNode body, int requestTimeoutSeconds) throws Exception {
+        ProviderAdapter adapter = AdapterFactory.getProviderAdapter(channel.provider, "responses");
+        String url = adapter.chatUrl(channel.baseUrl, channel.model, channel.apiKey);
+        String bodyJson = objectMapper.writeValueAsString(body);
+
+        HttpClient client = HttpClient.newBuilder()
+                .connectTimeout(Duration.ofSeconds(30))
+                .build();
+        HttpRequest.Builder reqBuilder = HttpRequest.newBuilder()
+                .uri(URI.create(url))
+                .timeout(Duration.ofSeconds(requestTimeoutSeconds))
+                .header("Content-Type", "application/json")
+                .header("Accept", "application/json")
+                .POST(HttpRequest.BodyPublishers.ofString(bodyJson));
+        adapter.authHeaders(channel.apiKey).forEach((k, v) -> reqBuilder.header(k, v));
+
+        HttpResponse<String> response = client.send(reqBuilder.build(), HttpResponse.BodyHandlers.ofString());
+        if (response.statusCode() != 200) {
+            throw providerHttpError(channel, response.statusCode(), response.body());
+        }
+
+        JsonNode json = objectMapper.readTree(response.body());
+        JsonNode errorNode = json.get("error");
+        if (isPresentResponseError(errorNode) || isFailedResponsesStatus(json)) {
+            String message = errorNode != null && !errorNode.isNull() && !errorNode.isMissingNode()
+                    ? errorNode.path("message").asText(errorNode.asText("AI Provider returned error"))
+                    : "AI Provider returned error";
+            throw new RuntimeException("AI Provider returned error: " + message);
+        }
+        usedChannelHolder.set(new UsedChannel(channel.channelId, channel.provider));
+        return json;
+    }
+
+    private RuntimeException providerHttpError(ChannelConfig channel, int statusCode, String body) {
+        String errMsg = extractErrorMessage(body != null ? body : "");
+        if ((statusCode == 401 || statusCode == 403) && channel.channelId != null) {
+            disableChannel(channel.channelId, "HTTP " + statusCode + " - " + errMsg);
+        }
+        if (statusCode >= 500 && statusCode < 600 && channel.channelId != null) {
+            disableChannel(channel.channelId, "HTTP " + statusCode + " - " + errMsg);
+        }
+        return new RuntimeException("AI Provider returned " + statusCode + ": " + errMsg);
+    }
+
+    private boolean isPresentResponseError(JsonNode errorNode) {
+        if (errorNode == null || errorNode.isMissingNode() || errorNode.isNull()) {
+            return false;
+        }
+        if (errorNode.isTextual()) {
+            return !errorNode.asText("").isBlank();
+        }
+        if (errorNode.isObject() || errorNode.isArray()) {
+            return !errorNode.isEmpty();
+        }
+        return true;
+    }
+
+    private boolean isFailedResponsesStatus(JsonNode json) {
+        if (json == null || json.isMissingNode() || json.isNull()) {
+            return false;
+        }
+        String status = json.path("status").asText("");
+        return "failed".equals(status) || "error".equals(status);
+    }
+
+    private ObjectNode responsesRequestForGateway(JsonNode responsesRequest, String model, boolean stream) {
+        ObjectNode body = responsesRequest != null && responsesRequest.isObject()
+                ? ((ObjectNode) responsesRequest).deepCopy()
+                : objectMapper.createObjectNode();
+        body.put("model", model != null ? model : "");
+        body.put("stream", stream);
+        body.remove("stream_options");
+        return body;
+    }
+
+    private String normalizeGatewayApiFormat(String apiFormat) {
+        if (apiFormat == null || apiFormat.isBlank()) {
+            return "chat_completions";
+        }
+        String normalized = apiFormat.trim().toLowerCase(Locale.ROOT)
+                .replace('-', '_')
+                .replace('/', '_');
+        return switch (normalized) {
+            case "chat", "chat_completion", "chat_completions", "openai_chat_completions" -> "chat_completions";
+            case "response", "responses", "openai_responses" -> "responses";
+            case "message", "messages", "anthropic_messages" -> "messages";
+            default -> normalized;
+        };
+    }
+
+    private GatewayChannel toGatewayChannel(ChannelConfig channel) {
+        if (channel == null) return null;
+        return new GatewayChannel(channel.channelId, channel.apiKey, channel.baseUrl, channel.model,
+                channel.provider, normalizeGatewayApiFormat(channel.apiFormat));
+    }
+
+    private ChannelConfig toChannelConfig(GatewayChannel channel) {
+        if (channel == null) {
+            throw new IllegalArgumentException("gateway channel is required");
+        }
+        return new ChannelConfig(channel.channelId(), channel.apiKey(), normalizeBaseUrl(channel.baseUrl()),
+                channel.model(), channel.provider(), normalizeGatewayApiFormat(channel.apiFormat()));
+    }
+
+    private void flushResponsesSseFrame(String eventName,
+                                        StringBuilder data,
+                                        GatewayResponsesStreamState state,
+                                        GatewayResponsesEventConsumer eventConsumer) throws Exception {
+        if (data == null || data.length() == 0) return;
+        String raw = data.toString();
+        if ("[DONE]".equals(raw)) {
+            // Chat Completions style sentinels are occasionally emitted by
+            // OpenAI-compatible proxies even on /responses. Do not forward it
+            // as the Responses terminal event; we still guarantee a standard
+            // response.completed/incomplete + response.done below.
+            state.providerDone = true;
+            return;
+        }
+        JsonNode json;
+        try {
+            json = objectMapper.readTree(raw);
+        } catch (Exception e) {
+            eventConsumer.accept(new GatewayResponsesEvent(eventName, null, raw));
+            return;
+        }
+
+        String type = json.path("type").asText("");
+        String effectiveEvent = eventName != null && !eventName.isBlank() ? eventName : type;
+        String effectiveType = !type.isBlank() ? type : effectiveEvent;
+        rememberResponsesStreamState(state, effectiveType, json);
+        if ("response.completed".equals(effectiveType) || "response.incomplete".equals(effectiveType) || "response.done".equals(effectiveType)) {
+            JsonNode response = json.path("response");
+            if (!response.isMissingNode() && !response.isNull()) {
+                state.finalResponse = response;
+            }
+            state.sawTerminal = true;
+            if ("response.incomplete".equals(effectiveType)) {
+                state.incomplete = true;
+            }
+            if ("response.done".equals(effectiveType)) {
+                state.sawDone = true;
+            }
+        } else if ("response.failed".equals(effectiveType) || "error".equals(effectiveType)
+                || "response.error".equals(effectiveType)) {
+            state.failed = true;
+            state.sawTerminal = true;
+        }
+        eventConsumer.accept(new GatewayResponsesEvent(effectiveEvent, json, raw));
+    }
+
+    private void rememberResponsesStreamState(GatewayResponsesStreamState state, String type, JsonNode json) {
+        if (state == null || json == null || json.isMissingNode() || json.isNull()) return;
+        JsonNode response = json.path("response");
+        if (response.isObject()) {
+            String id = response.path("id").asText("");
+            if (!id.isBlank()) state.responseId = id;
+            String model = response.path("model").asText("");
+            if (!model.isBlank()) state.model = model;
+            long created = response.path("created_at").asLong(0);
+            if (created > 0) state.createdAt = created;
+            JsonNode usage = response.path("usage");
+            if (usage.isObject()) state.usage = usage;
+            rememberFinalResponsesOutput(state, response);
+        }
+        if ("response.output_text.delta".equals(type)) {
+            String delta = json.path("delta").asText("");
+            if (!delta.isEmpty()) {
+                state.outputText.append(delta);
+                state.sawOutputOrTool = true;
+            }
+        } else if ("response.output_text.done".equals(type)) {
+            String text = json.path("text").asText(null);
+            if (text != null) {
+                state.outputText.setLength(0);
+                state.outputText.append(text);
+                state.sawOutputOrTool = true;
+            }
+        } else if ("response.output_item.added".equals(type) || "response.output_item.done".equals(type)) {
+            JsonNode item = json.path("item");
+            String itemType = item.path("type").asText("");
+            if ("function_call".equals(itemType) || "message".equals(itemType)) {
+                state.sawOutputOrTool = true;
+            }
+            if ("response.output_item.done".equals(type) && "message".equals(itemType)) {
+                String text = responsesMessageItemText(item);
+                if (!text.isBlank()) {
+                    state.outputText.setLength(0);
+                    state.outputText.append(text);
+                }
+            }
+        }
+    }
+
+    private String responsesMessageItemText(JsonNode item) {
+        if (item == null || item.isMissingNode() || item.isNull()) return "";
+        StringBuilder text = new StringBuilder();
+        JsonNode content = item.path("content");
+        if (content.isArray()) {
+            for (JsonNode block : content) {
+                if ("output_text".equals(block.path("type").asText("")) || block.has("text")) {
+                    text.append(block.path("text").asText(""));
+                }
+            }
+        }
+        return text.toString();
+    }
+
+    private void rememberFinalResponsesOutput(GatewayResponsesStreamState state, JsonNode response) {
+        if (state == null || response == null || response.isMissingNode() || response.isNull()) return;
+        String outputText = response.path("output_text").asText("");
+        if (!outputText.isBlank()) {
+            state.outputText.setLength(0);
+            state.outputText.append(outputText);
+            state.sawOutputOrTool = true;
+            return;
+        }
+        JsonNode output = response.path("output");
+        if (!output.isArray()) return;
+        for (JsonNode item : output) {
+            String type = item.path("type").asText("");
+            if ("function_call".equals(type)) {
+                state.sawOutputOrTool = true;
+                return;
+            }
+            if ("message".equals(type)) {
+                String text = responsesMessageItemText(item);
+                if (!text.isBlank()) {
+                    state.outputText.setLength(0);
+                    state.outputText.append(text);
+                    state.sawOutputOrTool = true;
+                    return;
+                }
+            }
+        }
+    }
+
+    private ObjectNode syntheticIncompleteResponsesEvent(GatewayResponsesStreamState state, ChannelConfig channel) {
+        ObjectNode event = objectMapper.createObjectNode();
+        event.put("type", "response.incomplete");
+        ObjectNode response = objectMapper.createObjectNode();
+        response.put("id", state.responseId != null && !state.responseId.isBlank()
+                ? state.responseId
+                : "resp_" + UUID.randomUUID().toString().replace("-", ""));
+        response.put("object", "response");
+        response.put("created_at", state.createdAt > 0 ? state.createdAt : Instant.now().getEpochSecond());
+        response.put("status", "incomplete");
+        response.put("model", state.model != null && !state.model.isBlank() ? state.model : channel.model());
+        response.set("incomplete_details", objectMapper.createObjectNode().put("reason", "max_output_tokens"));
+        response.put("output_text", state.outputText.toString());
+        response.putArray("output");
+        ObjectNode usage = response.putObject("usage");
+        if (state.usage != null && state.usage.isObject()) {
+            usage.setAll((ObjectNode) state.usage);
+        } else {
+            usage.put("input_tokens", 0);
+            usage.put("output_tokens", 0);
+            usage.put("total_tokens", 0);
+        }
+        event.set("response", response);
+        state.finalResponse = response;
+        state.incomplete = true;
+        state.sawTerminal = true;
+        return event;
+    }
+
+    private void ensureGatewayResponseHasOutput(JsonNode response, String model) {
+        JsonNode choice = response.path("choices").path(0);
+        JsonNode message = choice.path("message");
+        String content = message.path("content").asText("");
+        JsonNode toolCalls = message.path("tool_calls");
+        boolean hasToolCalls = toolCalls.isArray() && !toolCalls.isEmpty();
+        if (!content.isBlank() || hasToolCalls) {
+            return;
+        }
+        throw new RuntimeException("AI 服务返回空消息: model=" + model
+                + ", finish=" + choice.path("finish_reason").asText(""));
+    }
+
     /**
      * Agent 模式流式调用 LLM API — 流式读取 SSE 响应，逐 token 推送到前端，
      * 同时累积 tool_calls 和 reasoning_content，最终构建与非流式响应相同格式的 JsonNode 返回。
@@ -1784,7 +2550,7 @@ public class AiService {
      */
     private JsonNode callLlmApiStreaming(ChannelConfig channel, ObjectNode body,
                                           int requestTimeoutSeconds, Consumer<String> onToken) throws Exception {
-        ProviderAdapter adapter = AdapterFactory.getProviderAdapter(channel.provider);
+        ProviderAdapter adapter = AdapterFactory.getProviderAdapter(channel.provider, channel.apiFormat);
         String actualModel = body.path("model").asText(channel.model);
         body = adapter.transformRequest(body, channel.provider);
         String url = adapter.streamUrl(channel.baseUrl, actualModel, channel.apiKey);
@@ -1857,6 +2623,12 @@ public class AiService {
                             onToken.accept(tokenText); // 🚀 逐 token 实时推送前端！
                         }
                     }
+                }
+
+                if (ctx.finishReason == null && !adapter.isStreamDone(ctx)) {
+                    ctx.finishReason = "length";
+                    log.warn("[Agent] 流式 LLM 响应在未收到 finish_reason/[DONE] 前结束，按 length 截断处理: provider={}, model={}",
+                            channel.provider, actualModel);
                 }
 
                 int latency = (int) (System.currentTimeMillis() - streamStart);
@@ -2008,7 +2780,7 @@ public class AiService {
                 ObjectNode imageNode = contentArray.addObject();
                 imageNode.put("type", "image_url");
                 ObjectNode imageUrlNode = imageNode.putObject("image_url");
-                imageUrlNode.put("url", url);
+                imageUrlNode.put("url", toProviderImageReference(url));
             }
             messages.addObject().put("role", "user").set("content", contentArray);
         } else {
@@ -2016,6 +2788,73 @@ public class AiService {
         }
         applyPromptCacheKey(body);
         return body;
+    }
+
+    private String toProviderImageReference(String ref) {
+        if (ref == null || ref.isBlank()) return ref;
+        String trimmed = ref.trim();
+        String lower = trimmed.toLowerCase(Locale.ROOT);
+        if (lower.startsWith("data:image/")) return trimmed;
+        if (!lower.startsWith("http://") && !lower.startsWith("https://")) return trimmed;
+
+        try {
+            HttpClient client = HttpClient.newBuilder()
+                    .connectTimeout(Duration.ofSeconds(10))
+                    .build();
+            HttpRequest request = HttpRequest.newBuilder()
+                    .uri(URI.create(trimmed))
+                    .timeout(Duration.ofSeconds(20))
+                    .GET()
+                    .build();
+            HttpResponse<byte[]> response = client.send(request, HttpResponse.BodyHandlers.ofByteArray());
+            if (response.statusCode() != 200) {
+                log.warn("[Vision] 图片 URL 下载失败: HTTP {}, url={}", response.statusCode(), abbreviateUrl(trimmed));
+                return trimmed;
+            }
+
+            String contentType = response.headers().firstValue("Content-Type").orElse("");
+            String mimeType = normalizeImageMimeType(contentType, trimmed);
+            if (mimeType == null) {
+                log.warn("[Vision] 跳过非图片 URL: contentType={}, url={}", contentType, abbreviateUrl(trimmed));
+                return trimmed;
+            }
+
+            byte[] body = response.body();
+            if (body == null || body.length == 0) {
+                log.warn("[Vision] 图片 URL 返回空内容: url={}", abbreviateUrl(trimmed));
+                return trimmed;
+            }
+            if (body.length > 20 * 1024 * 1024) {
+                log.warn("[Vision] 图片过大，继续使用原 URL: size={}MB, url={}", body.length / 1024 / 1024, abbreviateUrl(trimmed));
+                return trimmed;
+            }
+
+            String base64 = Base64.getEncoder().encodeToString(body);
+            return "data:" + mimeType + ";base64," + base64;
+        } catch (Exception e) {
+            log.warn("[Vision] 图片 URL 转 data URI 失败: {}, url={}", e.getMessage(), abbreviateUrl(trimmed));
+            return trimmed;
+        }
+    }
+
+    private String normalizeImageMimeType(String contentType, String url) {
+        String ct = contentType == null ? "" : contentType.split(";", 2)[0].trim().toLowerCase(Locale.ROOT);
+        if (ct.equals("image/jpeg") || ct.equals("image/png") || ct.equals("image/gif") || ct.equals("image/webp")) {
+            return ct;
+        }
+        String path = url == null ? "" : url.toLowerCase(Locale.ROOT);
+        int queryIdx = path.indexOf('?');
+        if (queryIdx >= 0) path = path.substring(0, queryIdx);
+        if (path.endsWith(".jpg") || path.endsWith(".jpeg")) return "image/jpeg";
+        if (path.endsWith(".png")) return "image/png";
+        if (path.endsWith(".gif")) return "image/gif";
+        if (path.endsWith(".webp")) return "image/webp";
+        return null;
+    }
+
+    private String abbreviateUrl(String url) {
+        if (url == null) return "";
+        return url.length() <= 160 ? url : url.substring(0, 160) + "...";
     }
 
     private void applyPromptCacheKey(ObjectNode body) {
@@ -2040,24 +2879,20 @@ public class AiService {
     public ChannelConfig resolveChannelByType(String model, String channelType) {
         // 先找指定类型的渠道
         List<ModelChannel> typed = channelMapper.selectList(
-                new QueryWrapper<ModelChannel>()
-                        .eq("status", "active")
-                        .eq("deleted", 0)
-                        .eq("channel_type", channelType)
-                        .orderByAsc("priority"));
+                activeChannelQuery(channelType));
 
         // 如果没有专用渠道，回退到 chat 渠道
         List<ModelChannel> channels = typed.isEmpty()
-                ? channelMapper.selectList(new QueryWrapper<ModelChannel>().eq("status", "active").eq("deleted", 0).orderByAsc("priority"))
+                ? channelMapper.selectList(activeChannelQuery(null))
                 : typed;
 
         if (model != null && !model.isBlank()) {
             for (ModelChannel ch : channels) {
-                if (isValidApiKey(ch.getApiKey()) && ch.getModels() != null && ch.getModels().contains(model)) {
+                if (isValidApiKey(ch.getApiKey()) && channelSupportsModel(ch.getModels(), model)) {
                     checkRateLimit(ch);
                     // 使用匹配到的模型名作为实际 API 模型名
                     return new ChannelConfig(ch.getId(), ch.getApiKey(), normalizeBaseUrl(ch.getBaseUrl()),
-                            model, ch.getProvider());
+                            model, ch.getProvider(), ch.getApiFormat());
                 }
             }
         }
@@ -2069,7 +2904,7 @@ public class AiService {
                 checkRateLimit(ch);
                 log.info("[AiService] 模型 {} 在活跃渠道中未找到，回退使用渠道 {} 的实际模型: {}", model, ch.getName(), actualModel);
                 return new ChannelConfig(ch.getId(), ch.getApiKey(), normalizeBaseUrl(ch.getBaseUrl()),
-                        actualModel, ch.getProvider());
+                        actualModel, ch.getProvider(), ch.getApiFormat());
             }
         }
         if (defaultApiKey == null || defaultApiKey.isBlank()) {
@@ -2077,7 +2912,7 @@ public class AiService {
         }
         // 最终回退：使用 defaultModel 而非原始 model
         log.info("[AiService] 模型 {} 无可用渠道，最终回退使用默认模型: {}", model, defaultModel);
-        return new ChannelConfig(null, defaultApiKey, defaultBaseUrl, defaultModel, "OpenAI");
+        return new ChannelConfig(null, defaultApiKey, defaultBaseUrl, defaultModel, "OpenAI", "chat_completions");
     }
 
     /**
@@ -2085,19 +2920,19 @@ public class AiService {
      * 返回渠道列表，每个渠道都带有其自身支持的实际模型名
      */
     private List<ChannelConfig> resolveAllChannels(String model, String channelType) {
+        return resolveAllChannels(model, channelType, false);
+    }
+
+    private List<ChannelConfig> resolveAllChannels(String model, String channelType, boolean strictModelRouting) {
         List<ChannelConfig> result = new ArrayList<>();
 
         // 先找指定类型的渠道
         List<ModelChannel> typed = channelMapper.selectList(
-                new QueryWrapper<ModelChannel>()
-                        .eq("status", "active")
-                        .eq("deleted", 0)
-                        .eq("channel_type", channelType)
-                        .orderByAsc("priority"));
+                activeChannelQuery(channelType));
 
         // 如果没有专用渠道，回退到 chat 渠道
         List<ModelChannel> channels = typed.isEmpty()
-                ? channelMapper.selectList(new QueryWrapper<ModelChannel>().eq("status", "active").eq("deleted", 0).orderByAsc("priority"))
+                ? channelMapper.selectList(activeChannelQuery(null))
                 : typed;
 
         Set<Long> seenIds = new HashSet<>();
@@ -2106,15 +2941,20 @@ public class AiService {
             // 第一优先：精确匹配模型的渠道
             // 注意：ChannelConfig 第4个参数是实际发给 API 的模型名
             for (ModelChannel ch : channels) {
-                if (isValidApiKey(ch.getApiKey()) && ch.getModels() != null && ch.getModels().contains(model)) {
+                if (isValidApiKey(ch.getApiKey()) && channelSupportsModel(ch.getModels(), model)) {
                     if (seenIds.add(ch.getId())) {
                         try { checkRateLimit(ch); } catch (Exception e) { continue; }
                         // 匹配成功：用用户指定的模型名（它一定被该渠道支持）
                         result.add(new ChannelConfig(ch.getId(), ch.getApiKey(), normalizeBaseUrl(ch.getBaseUrl()),
-                                model, ch.getProvider()));
+                                model, ch.getProvider(), ch.getApiFormat()));
                     }
                 }
             }
+        }
+        // 外部 OpenAI-compatible 网关要求严格模型路由：请求带明确 model 时，
+        // 只允许在支持该模型的渠道之间重试，禁止串到其它模型（如 5.4-mini → deepseek-v4-flash）。
+        if (strictModelRouting && model != null && !model.isBlank()) {
+            return result;
         }
         // 第二优先：其他可用渠道（使用渠道自身配置的实际模型名）
         for (ModelChannel ch : channels) {
@@ -2123,7 +2963,7 @@ public class AiService {
                 // 使用渠道自身 models 字段的第一个模型作为实际 API 模型名
                 String actualModel = parseFirstModel(ch.getModels());
                 result.add(new ChannelConfig(ch.getId(), ch.getApiKey(), normalizeBaseUrl(ch.getBaseUrl()),
-                        actualModel, ch.getProvider()));
+                        actualModel, ch.getProvider(), ch.getApiFormat()));
             }
         }
         // 最终兜底：默认 API（用默认渠道的第一个模型名）
@@ -2131,13 +2971,20 @@ public class AiService {
             String fallbackModel = defaultModel;
             // 尝试从数据库中取一个可用渠道的实际模型名
             List<ModelChannel> activeChannels = channelMapper.selectList(
-                    new QueryWrapper<ModelChannel>().eq("status", "active").eq("deleted", 0).last("LIMIT 1"));
+                    activeChannelQuery(null).last("LIMIT 1"));
             if (!activeChannels.isEmpty()) {
                 fallbackModel = parseFirstModel(activeChannels.get(0).getModels());
             }
-            result.add(new ChannelConfig(null, defaultApiKey, defaultBaseUrl, fallbackModel, "OpenAI"));
+            result.add(new ChannelConfig(null, defaultApiKey, defaultBaseUrl, fallbackModel, "OpenAI", "chat_completions"));
         }
         return result;
+    }
+
+    private RuntimeException noAvailableChannel(String model, boolean strictModelRouting) {
+        if (strictModelRouting && model != null && !model.isBlank()) {
+            return new RuntimeException("指定模型无可用渠道或渠道不支持该模型: " + model);
+        }
+        return new RuntimeException("无可用的 AI 渠道，请检查渠道配置");
     }
 
     /**
@@ -2173,12 +3020,30 @@ public class AiService {
     }
 
     /**
-     * 从 models 字段（逗号分隔字符串）解析第一个模型名作为实际 API 模型名
+     * 从 models 字段解析第一个模型名作为实际 API 模型名。
+     * 兼容逗号/分号分隔字符串，以及管理端保存的 JSON 数组格式。
      */
     private String parseFirstModel(String modelsStr) {
         if (modelsStr == null || modelsStr.isBlank()) return defaultModel;
-        String[] parts = modelsStr.split(",");
-        return parts[0].trim();
+        String trimmed = modelsStr.trim();
+        try {
+            JsonNode node = objectMapper.readTree(trimmed);
+            if (node.isArray()) {
+                for (JsonNode item : node) {
+                    String id = item.isTextual()
+                            ? item.asText("")
+                            : item.path("model_id").asText(item.path("id").asText(item.path("modelId").asText("")));
+                    if (!id.isBlank()) return id;
+                }
+            }
+        } catch (Exception ignored) {
+            // fallback to comma/semicolon-separated format
+        }
+        for (String part : trimmed.split("[,;]")) {
+            String id = part.trim();
+            if (!id.isBlank()) return id;
+        }
+        return defaultModel;
     }
 
     /**
@@ -2208,6 +3073,7 @@ public class AiService {
             ModelChannel ch = channelMapper.selectById(channelId);
             if (ch != null && !"disabled".equals(ch.getStatus()) && !"error".equals(ch.getStatus())) {
                 ch.setStatus("error");
+                ch.setStatusMessage(reason != null && !reason.isBlank() ? reason : "请求失败，渠道已自动禁用");
                 channelMapper.updateById(ch);
                 log.warn("[Channel] 自动禁用渠道: id={}, name={}, reason={}", channelId, ch.getName(), reason);
                 // 清除限流器缓存
@@ -2289,7 +3155,7 @@ public class AiService {
                 : defaultModel;
         ChannelConfig channelConfig = new ChannelConfig(
                 ch.getId(), ch.getApiKey(), normalizeBaseUrl(ch.getBaseUrl()),
-                model, ch.getProvider());
+                model, ch.getProvider(), ch.getApiFormat());
         checkRateLimit(ch);
         log.info("[TTS Preview] 使用指定渠道: identifier={}, id={}, name={}, provider={}, baseUrl={}, model={}, voice={}",
                 channelIdentifier, ch.getId(), ch.getName(), ch.getProvider(), channelConfig.baseUrl(), model, voice);
@@ -2713,6 +3579,13 @@ public class AiService {
         }
     }
 
+    public record AgentRuntimeOptions(Integer maxTurns, Integer llmTimeoutSeconds) {}
+
+    private int clamp(Integer value, int min, int max, int fallback) {
+        if (value == null) return fallback;
+        return Math.max(min, Math.min(max, value));
+    }
+
     public record AiResult(String content, int inputTokens, int outputTokens, int latencyMs, String model,
                            String thinkingContent, int cachedInputTokens) {
         public AiResult(String content, int inputTokens, int outputTokens, int latencyMs, String model,
@@ -2727,7 +3600,39 @@ public class AiService {
 
     public record UsedChannel(Long channelId, String provider) {}
 
-    private record ChannelConfig(Long channelId, String apiKey, String baseUrl, String model, String provider) {}
+    public record GatewayChannel(Long channelId, String apiKey, String baseUrl, String model, String provider, String apiFormat) {}
+
+    public record GatewayResponsesEvent(String eventName, JsonNode json, String rawData) {}
+
+    @FunctionalInterface
+    public interface GatewayResponsesEventConsumer {
+        void accept(GatewayResponsesEvent event) throws Exception;
+    }
+
+    public record GatewayResponsesStreamResult(JsonNode finalResponse, boolean failed, boolean sawTerminal,
+                                               boolean incomplete, boolean sawOutputOrTool) {}
+
+    private static class GatewayResponsesStreamState {
+        JsonNode finalResponse;
+        JsonNode usage;
+        String responseId;
+        String model;
+        long createdAt;
+        final StringBuilder outputText = new StringBuilder();
+        boolean failed;
+        boolean sawTerminal;
+        boolean sawDone;
+        boolean providerDone;
+        boolean incomplete;
+        boolean sawOutputOrTool;
+    }
+
+    private record ChannelConfig(Long channelId, String apiKey, String baseUrl, String model, String provider, String apiFormat) {
+        /** 向后兼容构造：apiFormat 默认 chat_completions */
+        ChannelConfig(Long channelId, String apiKey, String baseUrl, String model, String provider) {
+            this(channelId, apiKey, baseUrl, model, provider, "chat_completions");
+        }
+    }
 
     /**
      * 清除指定渠道的令牌桶缓存（当渠道 rate_limit 被修改时调用，确保新值立即生效）
@@ -2854,7 +3759,8 @@ public class AiService {
                 ch.getApiKey(),
                 normalizeBaseUrl(ch.getBaseUrl()),
                 actualModel,
-                ch.getProvider()
+                ch.getProvider(),
+                ch.getApiFormat()
             ));
         }
         log.info("[AiService] 图片生成候选渠道 {} 个", candidates.size());

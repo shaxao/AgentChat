@@ -13,6 +13,7 @@ SYSTEM_CONTEXT_PATH = ".autocode/SYSTEM_CONTEXT.json"
 DEFAULT_SYSTEM_CONTEXT_SOURCES: tuple[str, ...] = (
     ".autocode/PROJECT_PROFILE.md",
     ".autocode/PROJECT_MAP.md",
+    ".autocode/SURFACE_MAP.md",
     ".autocode/COMMANDS.md",
     ".autocode/PLAN.md",
     ".autocode/MEMORY.md",
@@ -31,6 +32,7 @@ DEFAULT_SYSTEM_CONTEXT_SOURCES: tuple[str, ...] = (
 SOURCE_PRIORITIES: dict[str, int] = {
     ".autocode/PROJECT_PROFILE.md": 10,
     ".autocode/PROJECT_MAP.md": 20,
+    ".autocode/SURFACE_MAP.md": 25,
     ".autocode/COMMANDS.md": 30,
     ".autocode/MEMORY.md": 40,
     ".autocode/SESSION_SUMMARY.md": 50,

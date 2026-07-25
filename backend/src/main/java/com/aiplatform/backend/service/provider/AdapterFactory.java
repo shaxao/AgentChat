@@ -93,6 +93,21 @@ public class AdapterFactory {
         return ProviderAdapterFactory.getAdapter(provider);
     }
 
+    /**
+     * 按出站接口格式 + 供应商获取 ProviderAdapter 实例。
+     * <p>
+     * apiFormat（渠道级 {@code model_channel.api_format}）优先于 provider：
+     * {@code responses} → OpenAI Responses 适配器，{@code messages} → Anthropic 适配器，
+     * {@code chat_completions} 或空 → 按 provider 选择。
+     *
+     * @param provider  供应商名称
+     * @param apiFormat 出站接口格式：chat_completions / responses / messages
+     * @return ProviderAdapter 实例
+     */
+    public static ProviderAdapter getProviderAdapter(String provider, String apiFormat) {
+        return ProviderAdapterFactory.getAdapter(provider, apiFormat);
+    }
+
     // ==================== 语音识别 ====================
 
     /**

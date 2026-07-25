@@ -76,6 +76,8 @@ CREATE TABLE IF NOT EXISTS model_channel (
     tts_voices   VARCHAR(2000) DEFAULT NULL COMMENT 'TTS 音色配置 JSON 数组，仅 channel_type=tts 时有效',
     translate_langs VARCHAR(2000) DEFAULT NULL COMMENT '翻译支持语言配置 JSON 数组，仅 channel_type=translate 时有效',
     status      VARCHAR(20)  NOT NULL DEFAULT 'active' COMMENT 'active/error/disabled',
+    status_message VARCHAR(1000) DEFAULT NULL COMMENT '最近一次连接测试结果或异常原因',
+    api_format  VARCHAR(30)  NOT NULL DEFAULT 'chat_completions' COMMENT '出站接口格式：chat_completions/responses/messages',
     priority    INT          NOT NULL DEFAULT 1,
     rate_limit  INT          NOT NULL DEFAULT 60,
     created_at  DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -95,6 +97,7 @@ CREATE TABLE IF NOT EXISTS model_config (
     cached_input_price DECIMAL(10,4) NOT NULL DEFAULT 0,
     output_price    DECIMAL(10,4) NOT NULL DEFAULT 0,
     capabilities    VARCHAR(200) COMMENT 'comma-separated: text,vision,code,reasoning,audio,image',
+    aliases         VARCHAR(500) COMMENT '模型别名，逗号分隔，供外部 API 模型名映射',
     enabled         BOOLEAN      NOT NULL DEFAULT TRUE,
     -- 路由所需字段
     code_quality    DECIMAL(3,2) DEFAULT 0.80 COMMENT '代码质量评分 (0~1)',
@@ -205,6 +208,12 @@ CREATE TABLE IF NOT EXISTS api_log (
     input_tokens    INT          DEFAULT 0,
     cached_input_tokens INT      DEFAULT 0,
     output_tokens   INT          DEFAULT 0,
+    input_price_snapshot DECIMAL(12,6) NULL DEFAULT NULL COMMENT '请求时输入价格快照，¥/1M tokens',
+    cached_input_price_snapshot DECIMAL(12,6) NULL DEFAULT NULL COMMENT '请求时缓存输入价格快照，¥/1M tokens',
+    output_price_snapshot DECIMAL(12,6) NULL DEFAULT NULL COMMENT '请求时输出价格快照，¥/1M tokens',
+    input_cost      DECIMAL(12,8) NULL DEFAULT NULL COMMENT '普通输入费用，¥',
+    cached_input_cost DECIMAL(12,8) NULL DEFAULT NULL COMMENT '缓存输入费用，¥',
+    output_cost     DECIMAL(12,8) NULL DEFAULT NULL COMMENT '输出费用，¥',
     cost            DECIMAL(12,8) DEFAULT 0,
     latency_ms      INT          DEFAULT 0,
     status          VARCHAR(20)  NOT NULL DEFAULT 'success',
@@ -1082,6 +1091,33 @@ CREATE TABLE IF NOT EXISTS harness_trace (
     KEY idx_harness_trace_task (task_id),
     KEY idx_harness_trace_status (status)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='Harness execution trace';
+
+CREATE TABLE IF NOT EXISTS harness_trace_event (
+    id             BIGINT AUTO_INCREMENT PRIMARY KEY,
+    trace_id       BIGINT       NOT NULL,
+    surface        VARCHAR(50)  NOT NULL,
+    seq            INT          NOT NULL,
+    event_type     VARCHAR(50)  NOT NULL,
+    event_name     VARCHAR(100) NOT NULL,
+    severity       VARCHAR(20)  NOT NULL DEFAULT 'info',
+    status         VARCHAR(20)  NOT NULL DEFAULT 'ok',
+    agent_id       VARCHAR(100),
+    model          VARCHAR(100),
+    provider       VARCHAR(50),
+    channel_id     VARCHAR(100),
+    turn_index     INT,
+    tool_name      VARCHAR(120),
+    tool_call_id   VARCHAR(120),
+    duration_ms    INT,
+    input_chars    INT,
+    output_chars   INT,
+    payload_json   LONGTEXT,
+    created_at     DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    KEY idx_harness_trace_event_trace_seq (trace_id, seq),
+    KEY idx_harness_trace_event_surface_created (surface, created_at),
+    KEY idx_harness_trace_event_tool (tool_name, created_at),
+    KEY idx_harness_trace_event_status (status, created_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='Structured Harness trace event';
 
 CREATE TABLE IF NOT EXISTS harness_failure_case (
     id             BIGINT AUTO_INCREMENT PRIMARY KEY,

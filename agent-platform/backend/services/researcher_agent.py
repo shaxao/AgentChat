@@ -260,7 +260,15 @@ class ResearcherAgent:
                 "confidence": 0.5,
             },
         }
-        return defaults.get(project_type, defaults["nextjs"])
+        return defaults.get(project_type, {
+            "tech_stack": {},
+            "key_libraries": [],
+            "best_practices": ["Follow the detected manifests, formats, and project conventions"],
+            "pitfalls": ["Do not assume a Node or web project without evidence"],
+            "project_structure": "Use project reconnaissance and the active execution plan",
+            "reference_projects": [],
+            "confidence": 0.2,
+        })
 
 
 RESEATCHER_SYSTEM_PROMPT = """你是一个高级技术调研专家 (Senior Research Engineer)。

@@ -10,6 +10,7 @@ import com.aiplatform.backend.dto.MemoryDTO;
 import com.aiplatform.backend.dto.Result;
 import com.aiplatform.backend.entity.ApiLog;
 import com.aiplatform.backend.entity.ChatConversation;
+import com.aiplatform.backend.entity.HarnessTrace;
 import com.aiplatform.backend.entity.ModelConfig;
 import com.aiplatform.backend.entity.ModelChannel;
 import com.aiplatform.backend.entity.MemoryWorkFile;
@@ -24,15 +25,18 @@ import com.aiplatform.backend.service.AgentService;
 import com.aiplatform.backend.service.AiService;
 import com.aiplatform.backend.service.CacheLedgerClient;
 import com.aiplatform.backend.service.ChatService;
+import com.aiplatform.backend.service.ChatAgentRuntimeService;
 import com.aiplatform.backend.service.IconStorageService;
 import com.aiplatform.backend.service.HarnessEvolutionService;
 import com.aiplatform.backend.service.MemoryService;
+import com.aiplatform.backend.service.StreamRelayService;
 import com.aiplatform.backend.service.WalletService;
 import com.aiplatform.backend.service.ToolResultStorageService;
 import com.aiplatform.backend.service.ModelRoutingService;
 import com.aiplatform.backend.service.PrivacySettingService;
 import com.aiplatform.backend.service.UserPreferenceService;
 import com.aiplatform.backend.service.UsageTrackingService;
+import com.aiplatform.backend.service.UploadedFileReadService;
 import com.aiplatform.backend.service.provider.SearchAdapter;
 import com.aiplatform.backend.util.ClientIpUtil;
 import com.aiplatform.backend.dto.ModelUsageEvent;
@@ -73,6 +77,9 @@ public class ChatController {
     private final UserPreferenceService userPreferenceService;
     private final UsageTrackingService usageTrackingService;
     private final CacheLedgerClient cacheLedgerClient;
+    private final ChatAgentRuntimeService chatAgentRuntimeService;
+    private final UploadedFileReadService uploadedFileReadService;
+    private final StreamRelayService streamRelayService;
     private final ObjectMapper objectMapper;
     private final ApiLogMapper apiLogMapper;
     private final SysUserMapper sysUserMapper;
@@ -185,26 +192,25 @@ public class ChatController {
         SseEmitter emitter = new SseEmitter(isAgent ? 1_800_000L : 180_000L);
         String requestIp = ClientIpUtil.getClientIp(httpRequest);
 
+        // 断线续传/多端回放：独立的 generationId 作为回放缓冲 key，登记 active 标记。
+        final String generationId = uuid + ":" + System.currentTimeMillis();
+        final StreamSink sink = new StreamSink(emitter, generationId);
+
         sseExecutor.submit(() -> {
             final Long[] traceId = new Long[1];
             // 🔧 将当前请求的文件 URL 存入 ThreadLocal，供 read_uploaded_file 工具直接使用
             currentRequestFileUrls.set(req.getFileUrls());
-            aiService.setThinkingTokenConsumer(thinking -> {
-                try {
-                    emitter.send(SseEmitter.event()
-                            .name("thinking")
-                            .data(objectMapper.writeValueAsString(Map.of("token", thinking))));
-                } catch (Exception e) {
-                    log.warn("SSE send thinking failed: {}", e.getMessage());
-                }
-            });
+            streamRelayService.begin(generationId, uuid);
+            aiService.setThinkingTokenConsumer(thinking ->
+                    sink.emit("thinking", Map.of("token", thinking)));
             try {
+                List<String> requestImageRefs = getRequestImageRefs(req);
+                boolean requestHasImages = requestImageRefs != null && !requestImageRefs.isEmpty();
+
                 // 检查用户订阅的模型限制
                 String modelLimitError = checkModelLimit(userId, req.getModel());
                 if (modelLimitError != null) {
-                    emitter.send(SseEmitter.event()
-                            .name("error")
-                            .data(objectMapper.writeValueAsString(Map.of("message", modelLimitError))));
+                    sink.emit("error", Map.of("message", modelLimitError));
                     emitter.complete();
                     return;
                 }
@@ -230,6 +236,8 @@ public class ChatController {
                         Map.of(
                                 "agentId", req.getAgentId() != null ? req.getAgentId() : "",
                                 "hasFiles", req.getFileUrls() != null && !req.getFileUrls().isEmpty(),
+                                "fileUrls", req.getFileUrls() != null ? req.getFileUrls() : List.of(),
+                                "imageRefs", requestImageRefs != null ? requestImageRefs : List.of(),
                                 "thinking", Boolean.TRUE.equals(req.getThinking()),
                                 "temperature", req.getTemperature() != null ? req.getTemperature() : 0.0
                         ),
@@ -244,9 +252,7 @@ public class ChatController {
                 harnessEvolutionService.addEvent(traceId[0], "context", "history_loaded", Map.of("messageCount", history != null ? history.size() : 0));
 
                 ChatDTO.MessageVO userMsg = chatService.saveUserMessage(userId, uuid, req.getContent());
-                emitter.send(SseEmitter.event()
-                        .name("user")
-                        .data(objectMapper.writeValueAsString(Map.of("msgId", userMsg.getId()))));
+                sink.emit("user", Map.of("msgId", userMsg.getId()));
 
                 // 🔧 自动保存文件为工作文件（弥补上传时对话尚未创建的情况）
                 autoSaveWorkFiles(userId, uuid, req.getFileUrls());
@@ -259,6 +265,12 @@ public class ChatController {
                 if (isAgentMode) {
                     // ===== Agent 模式：使用 streamChatWithTools =====
                     AgentConfig agentConfig = agentService.getAgentConfig(req.getAgentId());
+                    sendAgentStatus(sink, traceId[0], "started", 0, "Agent 已启动", null, req.getAgentId());
+                    harnessEvolutionService.addEvent(traceId[0], "agent", "agent_started", Map.of(
+                            "agentId", req.getAgentId(),
+                            "status", "started",
+                            "turnIndex", 0
+                    ));
 
                     // 设置会话上下文（userId + conversationUuid 作为 sessionId）
                     String agentSessionId = userId + "-" + uuid;
@@ -281,31 +293,77 @@ public class ChatController {
                     // 优先：用户指定模型 → Agent配置模型 → 智能路由选择
                     String rawModel = req.getModel() != null && !req.getModel().isBlank()
                             ? req.getModel() : agentConfig.model();
-                    boolean agentHasImages = (req.getFileUrls() != null && !req.getFileUrls().isEmpty())
-                            || (req.getImageBase64List() != null && !req.getImageBase64List().isEmpty());
+                    boolean agentHasImages = requestHasImages;
                     String effectiveModel = resolveModelWithRouting(rawModel, true, agentHasImages, userId);
                     if (effectiveModel == null) {
-                        effectiveModel = findAllowedAvailableModel(userId, agentHasImages ? List.of("vision") : List.of("tool"));
+                        effectiveModel = findAllowedAvailableModel(userId, List.of("tool"));
                         log.warn("[ModelRouting] Agent 路由返回 null, fallback: {} → {}", rawModel, effectiveModel);
                     }
+                    if (effectiveModel == null || effectiveModel.isBlank() || !hasModelCapability(effectiveModel, "tool")) {
+                        String fallbackToolModel = findAllowedAvailableModel(userId, List.of("tool"));
+                        if (fallbackToolModel != null && !fallbackToolModel.isBlank()
+                                && !fallbackToolModel.equalsIgnoreCase(String.valueOf(effectiveModel))) {
+                            Map<String, Object> fallbackEvent = new LinkedHashMap<>();
+                            fallbackEvent.put("agentId", req.getAgentId());
+                            fallbackEvent.put("requestedModel", rawModel);
+                            fallbackEvent.put("fromModel", effectiveModel != null ? effectiveModel : "");
+                            fallbackEvent.put("toModel", fallbackToolModel);
+                            fallbackEvent.put("requiredCapability", "tool");
+                            fallbackEvent.put("status", "fallback");
+                            harnessEvolutionService.addEvent(traceId[0], "model", "model_fallback", fallbackEvent);
+                            sendAgentWarning(sink, traceId[0], "MODEL_CAPABILITY_FALLBACK",
+                                    "Selected model does not support tool calling; switched to a tool-capable model.",
+                                    fallbackEvent);
+                            effectiveModel = fallbackToolModel;
+                        }
+                    }
+                    if (effectiveModel == null || effectiveModel.isBlank() || !hasModelCapability(effectiveModel, "tool")) {
+                        String capabilityError = "Agent requires a model with tool calling capability, but no available tool-capable model was found.";
+                        Map<String, Object> detail = new LinkedHashMap<>();
+                        detail.put("agentId", req.getAgentId());
+                        detail.put("requestedModel", rawModel);
+                        detail.put("selectedModel", effectiveModel != null ? effectiveModel : "");
+                        detail.put("requiredCapability", "tool");
+                        sendAgentWarning(sink, traceId[0], "MODEL_CAPABILITY_MISMATCH", capabilityError, detail);
+                        harnessEvolutionService.addEvent(traceId[0], "failure", "failure_classified", Map.of(
+                                "agentId", req.getAgentId(),
+                                "model", effectiveModel != null ? effectiveModel : "",
+                                "status", "failed",
+                                "severity", "high",
+                                "failureType", "model_capability_mismatch",
+                                "errorCode", "MODEL_CAPABILITY_MISMATCH",
+                                "message", capabilityError,
+                                "detail", detail
+                        ));
+                        harnessEvolutionService.failTrace(traceId[0], "model_capability_mismatch", capabilityError, "high", detail);
+                        sink.emit("error", Map.of("message", capabilityError));
+                        emitter.complete();
+                        return;
+                    }
+                    Map<String, Object> modelEvent = new LinkedHashMap<>();
+                    modelEvent.put("agentId", req.getAgentId());
+                    modelEvent.put("model", effectiveModel);
+                    modelEvent.put("requestedModel", rawModel);
+                    modelEvent.put("hasImages", agentHasImages);
+                    modelEvent.put("status", effectiveModel != null && !effectiveModel.isBlank() ? "selected" : "failed");
+                    harnessEvolutionService.addEvent(traceId[0], "model", "model_selected", modelEvent);
+                    sendAgentStatus(sink, traceId[0], "model_selected", 0, "模型已选择", effectiveModel, req.getAgentId());
                     String agentLimitError = checkModelLimit(userId, effectiveModel);
                     if (agentLimitError != null) {
+                        sendAgentWarning(sink, traceId[0], "model_limit", agentLimitError, Map.of("model", effectiveModel != null ? effectiveModel : ""));
                         harnessEvolutionService.failTrace(traceId[0], "model_limit", agentLimitError, "medium",
                                 Map.of("model", effectiveModel != null ? effectiveModel : "", "uuid", uuid));
-                        emitter.send(SseEmitter.event()
-                                .name("error")
-                                .data(objectMapper.writeValueAsString(Map.of("message", agentLimitError))));
+                        sink.emit("error", Map.of("message", agentLimitError));
                         emitter.complete();
                         return;
                     }
                     String agentQuotaError = checkEstimatedUsageQuota(
                             userId, effectiveModel, req.getSystemPrompt(), history, req.getContent(), req.getMaxTokens(), "autocode");
                     if (agentQuotaError != null) {
+                        sendAgentWarning(sink, traceId[0], "quota_limit", agentQuotaError, Map.of("model", effectiveModel != null ? effectiveModel : ""));
                         harnessEvolutionService.failTrace(traceId[0], "quota_limit", agentQuotaError, "medium",
                                 Map.of("model", effectiveModel != null ? effectiveModel : "", "uuid", uuid));
-                        emitter.send(SseEmitter.event()
-                                .name("error")
-                                .data(objectMapper.writeValueAsString(Map.of("message", agentQuotaError))));
+                        sink.emit("error", Map.of("message", agentQuotaError));
                         emitter.complete();
                         return;
                     }
@@ -314,8 +372,7 @@ public class ChatController {
                     // - 有 vision 能力 → 直接构建 Vision 消息
                     // - 有 tool 能力但无 vision → Vision 路由：委托 vision 模型识别图片，将描述文本注入用户消息
                     // - 否则 → 纯文本消息
-                    boolean hasImages = (req.getFileUrls() != null && !req.getFileUrls().isEmpty())
-                            || (req.getImageBase64List() != null && !req.getImageBase64List().isEmpty());
+                    boolean hasImages = requestHasImages;
 
                     if (hasImages) {
                         boolean modelHasVision = hasModelCapability(effectiveModel, "vision");
@@ -323,21 +380,13 @@ public class ChatController {
 
                         if (modelHasVision) {
                             // 原生 Vision 模型：直接构建 Vision 消息
-                            if (req.getFileUrls() != null && !req.getFileUrls().isEmpty()) {
-                                Map<String, Object> visionMsg = aiService.buildVisionMessage(
-                                        req.getContent(), req.getFileUrls());
-                                agentMessages.add(visionMsg);
-                            } else {
-                                Map<String, Object> visionMsg = aiService.buildVisionMessage(
-                                        req.getContent(), req.getImageBase64List());
-                                agentMessages.add(visionMsg);
-                            }
+                            Map<String, Object> visionMsg = aiService.buildVisionMessage(
+                                    req.getContent(), requestImageRefs);
+                            agentMessages.add(visionMsg);
                         } else if (modelHasTool) {
                             // 🔧 Vision 路由：非 vision 但有 tool 能力的模型 → 委托 vision 模型识别图片
                             log.info("[Vision路由] 模型 '{}' 无 vision 能力，启用 Vision 路由", effectiveModel);
-                            List<String> imageUrls = req.getFileUrls() != null && !req.getFileUrls().isEmpty()
-                                    ? req.getFileUrls() : req.getImageBase64List();
-                            String imageDesc = performVisionRouting(imageUrls);
+                            String imageDesc = performVisionRouting(requestImageRefs);
                             String enhancedContent = req.getContent();
                             if (imageDesc != null && !imageDesc.isBlank()) {
                                 enhancedContent = req.getContent() + "\n\n[图片描述]\n" + imageDesc;
@@ -347,11 +396,9 @@ public class ChatController {
                             userMessage.put("content", enhancedContent);
                             agentMessages.add(userMessage);
                             // 发送图片描述事件给前端
-                            emitter.send(SseEmitter.event()
-                                    .name("vision_route")
-                                    .data(objectMapper.writeValueAsString(Map.of(
-                                            "desc", imageDesc != null ? imageDesc : "",
-                                            "model", effectiveModel))));
+                            sink.emit("vision_route", Map.of(
+                                    "desc", imageDesc != null ? imageDesc : "",
+                                    "model", effectiveModel));
                         } else {
                             // 无 vision 也无 tool → 纯文本消息（图片信息丢失）
                             log.warn("[Vision路由] 模型 '{}' 既不支持 vision 也不支持 tool，图片将被忽略", effectiveModel);
@@ -474,6 +521,24 @@ public class ChatController {
                             userId, uuid, effectiveSystemPrompt, "chat_agent", req.getContent());
                     agentSystemPrompt = applyCacheLedgerPromptContext(
                             userId, uuid, effectiveModel, "chat_agent", agentSystemPrompt);
+                    Map<String, Object> turnEvent = new LinkedHashMap<>();
+                    turnEvent.put("agentId", req.getAgentId());
+                    turnEvent.put("model", effectiveModel);
+                    turnEvent.put("turnIndex", 1);
+                    turnEvent.put("status", "running");
+                    turnEvent.put("inputChars", req.getContent() != null ? req.getContent().length() : 0);
+                    harnessEvolutionService.addEvent(traceId[0], "agent", "turn_started", turnEvent);
+                    sendAgentStatus(sink, traceId[0], "running", 1, "Agent 正在推理", effectiveModel, req.getAgentId());
+                    final String runtimeModel = effectiveModel;
+                    AiService.AgentRuntimeOptions runtimeOptions = buildAgentRuntimeOptions(
+                            harnessEvolutionService.runtimeHarnessPolicy("chat_agent", userId, uuid));
+                    if (runtimeOptions != null) {
+                        harnessEvolutionService.addEvent(traceId[0], "policy", "runtime_policy_applied", Map.of(
+                                "agentId", req.getAgentId(),
+                                "maxTurns", runtimeOptions.maxTurns() != null ? runtimeOptions.maxTurns() : "",
+                                "llmTimeoutSeconds", runtimeOptions.llmTimeoutSeconds() != null ? runtimeOptions.llmTimeoutSeconds() : ""
+                        ));
+                    }
 
                     aiService.streamChatWithTools(
                         effectiveModel,
@@ -484,20 +549,30 @@ public class ChatController {
                         augmentedTools,
                         wrappedExecutor,
                         token -> {
-                            try {
-                                fullContent.append(token);
-                                emitter.send(SseEmitter.event()
-                                        .name("token")
-                                        .data(objectMapper.writeValueAsString(Map.of("token", token))));
-                            } catch (Exception e) {
-                                log.warn("SSE 发送 token 失败: {}", e.getMessage());
-                            }
+                            fullContent.append(token);
+                            sink.emit("token", Map.of("token", token));
                         },
                         toolCall -> {
                             try {
-                                harnessEvolutionService.addEvent(traceId[0], "tool", "tool_call", Map.of(
-                                        "toolName", toolCall.toolName(),
-                                        "toolCallId", toolCall.toolCallId()));
+                                String rawArguments = toolCall.arguments();
+                                Map<String, Object> toolEvent = new LinkedHashMap<>();
+                                toolEvent.put("agentId", req.getAgentId());
+                                toolEvent.put("model", runtimeModel);
+                                toolEvent.put("toolName", toolCall.toolName());
+                                toolEvent.put("toolCallId", toolCall.toolCallId());
+                                toolEvent.put("turnIndex", 1);
+                                toolEvent.put("status", "calling");
+                                toolEvent.put("inputChars", rawArguments != null ? rawArguments.length() : 0);
+                                if (rawArguments != null && rawArguments.length() <= 20_000) {
+                                    toolEvent.put("argumentsJson", rawArguments);
+                                    toolEvent.put("argumentsTruncated", false);
+                                } else if (rawArguments != null) {
+                                    toolEvent.put("argumentPreview", rawArguments.substring(0, 20_000));
+                                    toolEvent.put("argumentsTruncated", true);
+                                }
+                                harnessEvolutionService.addEvent(traceId[0], "tool", "tool_call", toolEvent);
+                                sendAgentStatus(sink, traceId[0], "tool_calling", 1,
+                                        "正在调用工具: " + toolCall.toolName(), runtimeModel, req.getAgentId());
                                 // 🔧 OOM 防御 — SSE 发送前截断超大 tool_args（如 1M 的 code_content）
                                 //    前端 truncateToolArgs 只能处理已解析的数据，此处从源头截断避免
                                 //    Jackson 序列化 1MB+ JSON 时内存爆炸
@@ -520,21 +595,56 @@ public class ChatController {
                                             toolCallJson.length() / 1024);
                                 }
 
-                                emitter.send(SseEmitter.event()
-                                        .name("tool_call")
-                                        .data(toolCallJson));
+                                sink.emitRaw("tool_call", toolCallJson);
                             } catch (Exception e) {
                                 log.warn("SSE 发送 tool_call 失败: {}", e.getMessage());
                             }
                         },
                         toolResult -> {
                             try {
-                                harnessEvolutionService.addEvent(traceId[0], "tool", "tool_result", Map.of(
-                                        "toolName", toolResult.toolName(),
-                                        "toolCallId", toolResult.toolCallId(),
-                                        "resultLength", toolResult.result() != null ? toolResult.result().length() : 0));
                                 // 🔧 OOM 防御 — 分层截断 + OSS 外部化存储
                                 String rawResult = toolResult.result();
+                                ChatAgentRuntimeService.ToolFailure toolFailure =
+                                        chatAgentRuntimeService.classifyToolResult(toolResult.toolName(), toolResult.toolCallId(), rawResult);
+                                boolean toolFailed = toolFailure.failed();
+                                Map<String, Object> resultEvent = new LinkedHashMap<>();
+                                resultEvent.put("agentId", req.getAgentId());
+                                resultEvent.put("model", runtimeModel);
+                                resultEvent.put("toolName", toolResult.toolName());
+                                resultEvent.put("toolCallId", toolResult.toolCallId());
+                                resultEvent.put("turnIndex", 1);
+                                resultEvent.put("status", toolFailed ? "error" : "completed");
+                                resultEvent.put("outputChars", rawResult != null ? rawResult.length() : 0);
+                                if (toolFailed) {
+                                    resultEvent.put("failureType", toolFailure.failureType());
+                                    resultEvent.put("errorCode", toolFailure.errorCode());
+                                    resultEvent.put("message", toolFailure.message());
+                                    resultEvent.put("detail", toolFailure.detail());
+                                }
+                                harnessEvolutionService.addEvent(traceId[0], "tool", "tool_result", resultEvent);
+                                if (toolFailed) {
+                                    Map<String, Object> failureEvent = new LinkedHashMap<>();
+                                    failureEvent.put("agentId", req.getAgentId());
+                                    failureEvent.put("model", runtimeModel);
+                                    failureEvent.put("toolName", toolResult.toolName());
+                                    failureEvent.put("toolCallId", toolResult.toolCallId());
+                                    failureEvent.put("turnIndex", 1);
+                                    failureEvent.put("status", "failed");
+                                    failureEvent.put("severity", "medium");
+                                    failureEvent.put("failureType", toolFailure.failureType());
+                                    failureEvent.put("errorCode", toolFailure.errorCode());
+                                    failureEvent.put("message", toolFailure.message());
+                                    failureEvent.put("detail", toolFailure.detail());
+                                    harnessEvolutionService.addEvent(traceId[0], "failure", "failure_classified", failureEvent);
+                                }
+                                sendAgentStatus(sink, traceId[0], toolFailed ? "tool_error" : "tool_completed", 1,
+                                        (toolFailed ? "工具执行异常: " : "工具执行完成: ") + toolResult.toolName(),
+                                        runtimeModel, req.getAgentId());
+                                if (toolFailed) {
+                                    sendAgentWarning(sink, traceId[0], toolFailure.errorCode(),
+                                            toolFailure.message(),
+                                            toolFailure.detail());
+                                }
                                 int maxChars = getToolResultLimit(toolResult.toolName());
 
                                 Map<String, Object> resultData = new LinkedHashMap<>();
@@ -572,9 +682,7 @@ public class ChatController {
                                             resultJson.length() / 1024, toolResult.toolName());
                                 }
 
-                                emitter.send(SseEmitter.event()
-                                        .name("tool_result")
-                                        .data(resultJson));
+                                sink.emitRaw("tool_result", resultJson);
                             } catch (Exception e) {
                                 log.warn("SSE 发送 tool_result 失败: {}", e.getMessage());
                             }
@@ -583,25 +691,80 @@ public class ChatController {
                             try {
                                 // 🧠 内联继续对话：continueMessageId 存在时追加到现有 AI 消息
                                 ChatDTO.MessageVO assistantMsg;
+                                String finalContent = content;
+                                boolean emptyAssistantOutput = finalContent == null || finalContent.isBlank();
+                                if (emptyAssistantOutput) {
+                                    finalContent = "Agent returned an empty response. The runtime converted it into a visible failure so it can be retried or routed to another model.";
+                                    Map<String, Object> emptyDetail = new LinkedHashMap<>();
+                                    emptyDetail.put("model", model);
+                                    emptyDetail.put("agentId", req.getAgentId());
+                                    emptyDetail.put("turnIndex", 1);
+                                    sendAgentWarning(sink, traceId[0], "EMPTY_AGENT_RESPONSE", finalContent, emptyDetail);
+                                    harnessEvolutionService.addEvent(traceId[0], "failure", "failure_classified", Map.of(
+                                            "agentId", req.getAgentId(),
+                                            "model", model,
+                                            "turnIndex", 1,
+                                            "status", "failed",
+                                            "severity", "high",
+                                            "failureType", "empty_response",
+                                            "errorCode", "EMPTY_AGENT_RESPONSE",
+                                            "message", finalContent
+                                    ));
+                                }
                                 if (req.getContinueMessageId() != null && !req.getContinueMessageId().isBlank()) {
                                     assistantMsg = chatService.appendAssistantMessage(
-                                            userId, uuid, req.getContinueMessageId(), content, req.getExistingContent(),
+                                            userId, uuid, req.getContinueMessageId(), finalContent, req.getExistingContent(),
                                             model, inputTokens, outputTokens, latencyMs);
                                 } else {
                                     assistantMsg = chatService.saveAssistantMessage(
-                                            userId, uuid, content, model, inputTokens, outputTokens, latencyMs);
+                                            userId, uuid, finalContent, model, inputTokens, outputTokens, latencyMs);
                                 }
 
-                                recordApiLog(userId, uuid, model, inputTokens, cachedInputTokens, outputTokens, latencyMs, "success", null, requestIp);
+                                recordApiLog(userId, uuid, model, inputTokens, cachedInputTokens, outputTokens, latencyMs,
+                                        emptyAssistantOutput ? "failed" : "success",
+                                        emptyAssistantOutput ? "empty_response" : null,
+                                        requestIp);
                                 recordDialogueCacheUsage(userId, uuid, model, inputTokens, cachedInputTokens, outputTokens, latencyMs);
                                 updateUserTokens(userId, inputTokens + outputTokens);
                                 // 🔧 记录路由结果（成功）
-                                recordRoutingResult(model, hasImages ? "vision" : (isAgentMode ? "agent" : "chat"), true, latencyMs);
+                                recordRoutingResult(model, hasImages ? "vision" : (isAgentMode ? "agent" : "chat"), !emptyAssistantOutput, latencyMs);
                                 // ★ 记录用户模型使用偏好
-                                recordUserModelUsage(userId, model, hasImages ? "vision" : (isAgentMode ? "agent" : "chat"), true, latencyMs, (long)(inputTokens + outputTokens));
+                                recordUserModelUsage(userId, model, hasImages ? "vision" : (isAgentMode ? "agent" : "chat"), !emptyAssistantOutput, latencyMs, (long)(inputTokens + outputTokens));
                                 // 钱包扣费 + Agent 开发者分成
-                                billChatUsage(userId, model, inputTokens, cachedInputTokens, outputTokens, req.getAgentId());
-                                completeHarnessTrace(userId, traceId[0], content, model, inputTokens, outputTokens, latencyMs, false, true);
+                                if (!emptyAssistantOutput) {
+                                    billChatUsage(userId, model, inputTokens, cachedInputTokens, outputTokens, req.getAgentId());
+                                }
+                                Map<String, Object> responseEvent = new LinkedHashMap<>();
+                                responseEvent.put("agentId", req.getAgentId());
+                                responseEvent.put("model", model);
+                                responseEvent.put("turnIndex", 1);
+                                responseEvent.put("status", emptyAssistantOutput ? "completed_with_warning" : "completed");
+                                responseEvent.put("durationMs", latencyMs);
+                                responseEvent.put("inputChars", req.getContent() != null ? req.getContent().length() : 0);
+                                responseEvent.put("outputChars", finalContent != null ? finalContent.length() : 0);
+                                responseEvent.put("inputTokens", inputTokens);
+                                responseEvent.put("outputTokens", outputTokens);
+                                harnessEvolutionService.addEvent(traceId[0], "model", "llm_response", responseEvent);
+                                Map<String, Object> completedEvent = new LinkedHashMap<>();
+                                completedEvent.put("agentId", req.getAgentId());
+                                completedEvent.put("model", model);
+                                completedEvent.put("turnIndex", 1);
+                                completedEvent.put("status", emptyAssistantOutput ? "completed_with_warning" : "completed");
+                                completedEvent.put("outputChars", finalContent != null ? finalContent.length() : 0);
+                                harnessEvolutionService.addEvent(traceId[0], "agent", "completed", completedEvent);
+                                sendAgentStatus(sink, traceId[0], "completed", 1, "Agent 已完成", model, req.getAgentId());
+                                if (emptyAssistantOutput) {
+                                    Map<String, Object> failureEvidence = new LinkedHashMap<>();
+                                    failureEvidence.put("model", model != null ? model : "");
+                                    failureEvidence.put("agentId", req.getAgentId() != null ? req.getAgentId() : "");
+                                    failureEvidence.put("uuid", uuid);
+                                    failureEvidence.put("latencyMs", latencyMs);
+                                    failureEvidence.put("inputTokens", inputTokens);
+                                    failureEvidence.put("outputTokens", outputTokens);
+                                    harnessEvolutionService.failTrace(traceId[0], "empty_response", finalContent, "high", failureEvidence);
+                                } else {
+                                    completeHarnessTrace(userId, traceId[0], finalContent, model, inputTokens, outputTokens, latencyMs, false, true);
+                                }
 
                                 Map<String, Object> doneData = new java.util.LinkedHashMap<>();
                                 doneData.put("msgId", assistantMsg.getId());
@@ -613,35 +776,32 @@ public class ChatController {
                                 if (thinkingContent != null && !thinkingContent.isEmpty()) {
                                     doneData.put("thinkingContent", thinkingContent);
                                 }
-                                emitter.send(SseEmitter.event()
-                                        .name("done")
-                                        .data(objectMapper.writeValueAsString(doneData)));
+                                // 断线续传：done 前把终态 + 真实 msgId 写入 meta，供晚到 resume 者对齐消息 id。
+                                streamRelayService.markStatus(generationId, "done", String.valueOf(assistantMsg.getId()));
+                                sink.emit("done", doneData);
                                 emitter.complete();
 
                                 // 🔧 异步更新对话记忆（避免阻塞前端响应）
-                                autoSaveMemoryAsync(userId, uuid, req.getContent(), content, req.getFileUrls(), requestIp);
+                                autoSaveMemoryAsync(userId, uuid, req.getContent(), finalContent, req.getFileUrls(), requestIp);
                             } catch (Exception e) {
                                 log.error("SSE Agent 完成处理失败: {}", e.getMessage(), e);
                                 harnessEvolutionService.failTrace(traceId[0], "finish_persistence_error", e.getMessage(), "high",
                                         Map.of("model", req.getModel() != null ? req.getModel() : "", "uuid", uuid));
-                                try {
-                                    emitter.send(SseEmitter.event()
-                                            .name("error")
-                                            .data(objectMapper.writeValueAsString(Map.of("message",
-                                                    "保存回复失败: " + (e.getMessage() != null ? e.getMessage() : "未知错误")))));
-                                } catch (Exception ignored) {}
+                                streamRelayService.markStatus(generationId, "error", null);
+                                sink.emit("error", Map.of("message",
+                                        "保存回复失败: " + (e.getMessage() != null ? e.getMessage() : "未知错误")));
                                 try { emitter.complete(); } catch (Exception ignored) {}
                             }
                         },
                         agentSessionId,  // 传递 sessionId 供 ToolExecutor 访问会话级数据
-                        req.getThinking(), req.getThinkingBudget()  // 深度思考参数
+                        req.getThinking(), req.getThinkingBudget(),  // 深度思考参数
+                        runtimeOptions
                     );
 
                 } else {
                     // ===== 普通模式：使用原有 streamChat（支持 Vision 图片） =====
                     // 🔧 模型路由集成：未指定模型时自动选择
-                    boolean normalHasImages = (req.getFileUrls() != null && !req.getFileUrls().isEmpty())
-                            || (req.getImageBase64List() != null && !req.getImageBase64List().isEmpty());
+                    boolean normalHasImages = requestHasImages;
                     String routedModel = resolveModelWithRouting(req.getModel(), false, normalHasImages, userId);
                     String effectiveNormalModel;
                     if (routedModel != null) {
@@ -657,9 +817,7 @@ public class ChatController {
                     if (effectiveModelLimitError != null) {
                         harnessEvolutionService.failTrace(traceId[0], "model_limit", effectiveModelLimitError, "medium",
                                 Map.of("model", effectiveNormalModel != null ? effectiveNormalModel : "", "uuid", uuid));
-                        emitter.send(SseEmitter.event()
-                                .name("error")
-                                .data(objectMapper.writeValueAsString(Map.of("message", effectiveModelLimitError))));
+                        sink.emit("error", Map.of("message", effectiveModelLimitError));
                         emitter.complete();
                         return;
                     }
@@ -668,20 +826,13 @@ public class ChatController {
                     if (quotaError != null) {
                         harnessEvolutionService.failTrace(traceId[0], "quota_limit", quotaError, "medium",
                                 Map.of("model", effectiveNormalModel != null ? effectiveNormalModel : "", "uuid", uuid));
-                        emitter.send(SseEmitter.event()
-                                .name("error")
-                                .data(objectMapper.writeValueAsString(Map.of("message", quotaError))));
+                        sink.emit("error", Map.of("message", quotaError));
                         emitter.complete();
                         return;
                     }
 
-                    // 收集图片 URL（优先 OSS fileUrls，降级 base64 imageBase64List）
-                    List<String> imageUrls = null;
-                    if (req.getFileUrls() != null && !req.getFileUrls().isEmpty()) {
-                        imageUrls = req.getFileUrls();
-                    } else if (req.getImageBase64List() != null && !req.getImageBase64List().isEmpty()) {
-                        imageUrls = req.getImageBase64List();
-                    }
+                    // 收集图片引用（仅图片 URL 或图片 base64；普通文件 URL 留给工具读取）
+                    List<String> imageUrls = requestImageRefs;
 
                     // 🔧 Vision 路由：非 vision 模型不能直接传 image_url，需委托 vision 模型识别
                     String nonAgentImageDesc = null;
@@ -702,15 +853,9 @@ public class ChatController {
                             // 清空 imageUrls，不再以 image_url 格式发送给非 vision 模型
                             imageUrls = null;
                             // 通知前端使用了 Vision 路由
-                            try {
-                                emitter.send(SseEmitter.event()
-                                        .name("vision_route")
-                                        .data(objectMapper.writeValueAsString(Map.of(
-                                                "desc", nonAgentImageDesc != null ? nonAgentImageDesc : "",
-                                                "model", effectiveNormalModel))));
-                            } catch (Exception ve) {
-                                log.warn("发送 vision_route 事件失败: {}", ve.getMessage());
-                            }
+                            sink.emit("vision_route", Map.of(
+                                    "desc", nonAgentImageDesc != null ? nonAgentImageDesc : "",
+                                    "model", effectiveNormalModel));
                         }
                     }
 
@@ -721,26 +866,14 @@ public class ChatController {
                         harnessEvolutionService.addEvent(traceId[0], "routing", "search_start", Map.of(
                                 "query", searchDecision.query(),
                                 "reason", searchDecision.reason()));
-                        try {
-                            emitter.send(SseEmitter.event()
-                                    .name("search_start")
-                                    .data(objectMapper.writeValueAsString(Map.of(
-                                            "query", searchDecision.query(),
-                                            "reason", searchDecision.reason()))));
-                        } catch (Exception se) {
-                            log.warn("发送 search_start 事件失败: {}", se.getMessage());
-                        }
+                        sink.emit("search_start", Map.of(
+                                "query", searchDecision.query(),
+                                "reason", searchDecision.reason()));
                         searchResponse = aiService.searchWeb(searchDecision.query());
                         harnessEvolutionService.addEvent(traceId[0], "routing", "search_done", Map.of(
                                 "query", searchDecision.query(),
                                 "hasResponse", searchResponse != null));
-                        try {
-                            emitter.send(SseEmitter.event()
-                                    .name("search_result")
-                                    .data(objectMapper.writeValueAsString(searchResponse)));
-                        } catch (Exception se) {
-                            log.warn("发送 search_result 事件失败: {}", se.getMessage());
-                        }
+                        sink.emit("search_result", searchResponse);
                         String searchContext = aiService.buildSearchContext(searchResponse);
                         if (searchContext != null && !searchContext.isBlank()) {
                             effectiveSystemPrompt = (effectiveSystemPrompt == null || effectiveSystemPrompt.isBlank())
@@ -762,14 +895,8 @@ public class ChatController {
                         req.getThinking(),
                         req.getThinkingBudget(),
                         token -> {
-                            try {
-                                fullContent.append(token);
-                                emitter.send(SseEmitter.event()
-                                        .name("token")
-                                        .data(objectMapper.writeValueAsString(Map.of("token", token))));
-                            } catch (Exception e) {
-                                log.warn("SSE 发送 token 失败: {}", e.getMessage());
-                            }
+                            fullContent.append(token);
+                            sink.emit("token", Map.of("token", token));
                         },
                         (content, inputTokens, outputTokens, cachedInputTokens, latencyMs, model, thinkingContent) -> {
                             try {
@@ -805,9 +932,8 @@ public class ChatController {
                                 if (thinkingContent != null && !thinkingContent.isEmpty()) {
                                     doneData.put("thinkingContent", thinkingContent);
                                 }
-                                emitter.send(SseEmitter.event()
-                                        .name("done")
-                                        .data(objectMapper.writeValueAsString(doneData)));
+                                streamRelayService.markStatus(generationId, "done", String.valueOf(assistantMsg.getId()));
+                                sink.emit("done", doneData);
                                 emitter.complete();
 
                                 // 🔧 异步更新对话记忆（避免阻塞前端响应）
@@ -816,11 +942,10 @@ public class ChatController {
                                 log.error("SSE 完成处理失败: {}", e.getMessage(), e);
                                 harnessEvolutionService.failTrace(traceId[0], "finish_persistence_error", e.getMessage(), "high",
                                         Map.of("model", req.getModel() != null ? req.getModel() : "", "uuid", uuid));
+                                streamRelayService.markStatus(generationId, "error", null);
                                 try {
-                                    emitter.send(SseEmitter.event()
-                                            .name("error")
-                                            .data(objectMapper.writeValueAsString(Map.of("message",
-                                                    "保存回复失败: " + (e.getMessage() != null ? e.getMessage() : "未知错误")))));
+                                    sink.emit("error", Map.of("message",
+                                            "保存回复失败: " + (e.getMessage() != null ? e.getMessage() : "未知错误")));
                                 } catch (Exception ignored) {}
                                 try { emitter.complete(); } catch (Exception ignored) {}
                             }
@@ -838,11 +963,10 @@ public class ChatController {
                 recordUserModelUsage(userId, req.getModel(), null, false, 0, 0L);
                 harnessEvolutionService.failTrace(traceId[0], "runtime_error", e.getMessage(), "high",
                         Map.of("model", req.getModel() != null ? req.getModel() : "", "uuid", uuid));
+                streamRelayService.markStatus(generationId, "error", null);
                 try {
-                    emitter.send(SseEmitter.event()
-                            .name("error")
-                            .data(objectMapper.writeValueAsString(Map.of("message",
-                                    e.getMessage() != null ? e.getMessage() : "服务器内部错误"))));
+                    sink.emit("error", Map.of("message",
+                            e.getMessage() != null ? e.getMessage() : "服务器内部错误"));
                 } catch (Exception ignored) {}
                 // 使用 complete() 而非 completeWithError()：
                 // HTTP 200 已发出，completeWithError 会强制关闭 chunked 连接，
@@ -857,10 +981,262 @@ public class ChatController {
                 aiService.clearThinkingTokenConsumer();
                 aiService.clearCurrentUsedChannel();
                 aiService.clearPromptCacheKey();
+                // 断线续传：清 active 标记 + 缩短 buf/meta TTL（给晚到 resume 者回放窗口）。
+                // 放在 finally 保证所有退出路径（含早退/异常）都不会留下永久 streaming 标记。
+                streamRelayService.finish(generationId, uuid);
             }
         });
 
         return emitter;
+    }
+
+    /**
+     * 断线续传 / 多端实时回放：接入某对话正在进行的生成流。
+     * <p>先回放 Redis 缓冲中 seq &gt; afterSeq 的事件，再接实时订阅（seq 去重），
+     * 直到 done/error 或超时。生成已结束但仍在短 TTL 窗口内时，回放完整内容后收尾；
+     * 窗口外或无活跃生成时发 no_active，前端退回纯 DB 加载。
+     */
+    @GetMapping(value = "/conversations/{uuid}/stream", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
+    public SseEmitter resumeStream(
+            @RequestAttribute Long userId,
+            @PathVariable String uuid,
+            @RequestParam(required = false) Long afterSeq) {
+
+        SseEmitter emitter = new SseEmitter(1_800_000L);
+
+        // 鉴权：对话必须属于当前用户，避免任意用户 resume 他人对话流。
+        ChatConversation conv = conversationMapper.selectOne(
+                new LambdaQueryWrapper<ChatConversation>()
+                        .eq(ChatConversation::getUuid, uuid)
+                        .eq(ChatConversation::getUserId, userId)
+                        .eq(ChatConversation::getDeleted, 0)
+                        .orderByDesc(ChatConversation::getId)
+                        .last("LIMIT 1"));
+        if (conv == null) {
+            try {
+                emitter.send(SseEmitter.event().name("error")
+                        .data(objectMapper.writeValueAsString(Map.of("message", "对话不存在或无权访问"))));
+                emitter.complete();
+            } catch (Exception ignored) {}
+            return emitter;
+        }
+
+        final long baseSeq = afterSeq != null ? afterSeq : 0L;
+        sseExecutor.submit(() -> pumpResume(emitter, uuid, baseSeq));
+        return emitter;
+    }
+
+    /** resume 泵：先订阅→回放→实时循环（去重）→收尾。所有退出路径都 unsubscribe + complete。 */
+    private void pumpResume(SseEmitter emitter, String uuid, long afterSeq) {
+        String generationId = streamRelayService.getActiveGeneration(uuid);
+
+        // 无活跃生成：检查是否有刚结束、仍在短 TTL 窗口内的缓冲可回放。
+        if (generationId == null) {
+            String terminalGid = streamRelayService.findTerminalGeneration(uuid);
+            if (terminalGid != null) {
+                replayTerminal(emitter, terminalGid, afterSeq);
+            } else {
+                try {
+                    emitter.send(SseEmitter.event().name("no_active")
+                            .data(objectMapper.writeValueAsString(Map.of("message", "no active generation"))));
+                    emitter.complete();
+                } catch (Exception ignored) {}
+            }
+            return;
+        }
+
+        StreamRelayService.Subscription subscription = streamRelayService.subscribe(generationId);
+        try {
+            // 先 subscribe 再回放，避免"回放与实时之间"丢事件。
+            long replayedMaxSeq = afterSeq;
+            for (StreamRelayService.RelayEvent ev : streamRelayService.replay(generationId, afterSeq)) {
+                sendRelay(emitter, ev);
+                replayedMaxSeq = Math.max(replayedMaxSeq, ev.seq());
+                if (isTerminal(ev.name())) { emitter.complete(); return; }
+            }
+
+            Map<Object, Object> meta = streamRelayService.getMeta(generationId);
+            boolean localNode = streamRelayService.isLocalNode(meta);
+            long idleDeadline = System.currentTimeMillis() + STALE_RESUME_TIMEOUT_MS;
+
+            while (true) {
+                StreamRelayService.RelayEvent ev = subscription.poll();
+                if (ev != null) {
+                    if (ev.seq() <= replayedMaxSeq) continue; // 去重回放与实时重叠区间
+                    sendRelay(emitter, ev);
+                    replayedMaxSeq = Math.max(replayedMaxSeq, ev.seq());
+                    idleDeadline = System.currentTimeMillis() + STALE_RESUME_TIMEOUT_MS;
+                    if (isTerminal(ev.name())) { emitter.complete(); return; }
+                    continue;
+                }
+
+                // poll 超时：心跳保活，并检查生成是否已在别处结束/失效。
+                try {
+                    emitter.send(SseEmitter.event().comment("hb"));
+                } catch (Exception e) {
+                    return; // 浏览器已断开
+                }
+
+                String stillActive = streamRelayService.getActiveGeneration(uuid);
+                if (!generationId.equals(stillActive)) {
+                    // active 已消失/切换：补回放尾部（含可能错过的 done），然后收尾。
+                    for (StreamRelayService.RelayEvent tail : streamRelayService.replay(generationId, replayedMaxSeq)) {
+                        sendRelay(emitter, tail);
+                        replayedMaxSeq = Math.max(replayedMaxSeq, tail.seq());
+                    }
+                    emitter.complete();
+                    return;
+                }
+
+                // stale 保护：长时间无事件（同节点生成线程崩溃/异节点失联）→ 判定失效，收尾。
+                if (System.currentTimeMillis() > idleDeadline) {
+                    log.warn("[StreamRelay] resume 长时间无事件，判定 stale 收尾: gid={}", generationId);
+                    for (StreamRelayService.RelayEvent tail : streamRelayService.replay(generationId, replayedMaxSeq)) {
+                        sendRelay(emitter, tail);
+                    }
+                    emitter.complete();
+                    return;
+                }
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        } catch (Exception e) {
+            log.debug("[StreamRelay] resume 泵异常: uuid={}, error={}", uuid, e.getMessage());
+        } finally {
+            streamRelayService.unsubscribe(subscription);
+            try { emitter.complete(); } catch (Exception ignored) {}
+        }
+    }
+
+    /** 回放已结束生成的全部缓冲后收尾（不进实时循环）。 */
+    private void replayTerminal(SseEmitter emitter, String generationId, long afterSeq) {
+        try {
+            for (StreamRelayService.RelayEvent ev : streamRelayService.replay(generationId, afterSeq)) {
+                sendRelay(emitter, ev);
+            }
+        } catch (Exception e) {
+            log.debug("[StreamRelay] 终态回放失败: gid={}, error={}", generationId, e.getMessage());
+        } finally {
+            try { emitter.complete(); } catch (Exception ignored) {}
+        }
+    }
+
+    private void sendRelay(SseEmitter emitter, StreamRelayService.RelayEvent ev) throws Exception {
+        emitter.send(SseEmitter.event().name(ev.name()).data(ev.data()));
+    }
+
+    private boolean isTerminal(String name) {
+        return "done".equals(name) || "error".equals(name);
+    }
+
+    private static final long STALE_RESUME_TIMEOUT_MS = 60_000L;
+
+    private void sendAgentStatus(StreamSink sink, Long traceId, String status, Integer turnIndex,
+                                 String message, String model, String agentId) {
+        Map<String, Object> data = chatAgentRuntimeService.statusPayload(traceId, status, turnIndex, message, model, agentId);
+        sink.emit("agent_status", data);
+    }
+
+    private void sendAgentWarning(StreamSink sink, Long traceId, String code, String message, Map<String, Object> detail) {
+        Map<String, Object> data = chatAgentRuntimeService.warningPayload(traceId, code, message, detail);
+        sink.emit("agent_warning", data);
+    }
+
+    /**
+     * 统一流出口：直写当前请求的 emitter（保持"发送失败只 warn 不中断"语义），
+     * 同时通过 StreamRelayService 写入回放缓冲 + 向其他订阅者（resume 端）和跨节点 fanout。
+     * <p>浏览器关闭导致 emitter.send 抛异常时，只影响当前连接，生成主流程与 relay 不受影响。
+     */
+    private final class StreamSink {
+        private final SseEmitter emitter;
+        private final String generationId;
+
+        StreamSink(SseEmitter emitter, String generationId) {
+            this.emitter = emitter;
+            this.generationId = generationId;
+        }
+
+        /** 发送对象事件：先序列化，relay 缓冲/fanout，再直写当前 emitter。 */
+        void emit(String name, Object payload) {
+            String json;
+            try {
+                json = objectMapper.writeValueAsString(payload);
+            } catch (Exception e) {
+                log.warn("SSE 序列化事件失败: name={}, error={}", name, e.getMessage());
+                return;
+            }
+            emitRaw(name, json);
+        }
+
+        /** 发送已序列化的事件（tool_call/tool_result 等自行序列化的场景）。 */
+        void emitRaw(String name, String json) {
+            if (generationId != null) {
+                try { streamRelayService.emit(generationId, name, json); }
+                catch (Exception e) { log.debug("relay emit 失败: name={}, error={}", name, e.getMessage()); }
+            }
+            try {
+                emitter.send(SseEmitter.event().name(name).data(json));
+            } catch (Exception e) {
+                log.warn("SSE 发送 {} 失败: {}", name, e.getMessage());
+            }
+        }
+    }
+
+    private AiService.AgentRuntimeOptions buildAgentRuntimeOptions(Map<String, Object> policy) {
+        if (policy == null || policy.isEmpty()) return null;
+        Object runtimeObj = policy.get("agentRuntimePolicy");
+        if (!(runtimeObj instanceof Map<?, ?> runtime)) return null;
+        Integer maxTurns = intValue(runtime.get("maxTurns"));
+        Integer timeoutSeconds = firstInt(runtime,
+                "llmTimeoutSeconds", "timeoutSeconds", "timeoutSec", "timeout");
+        if (timeoutSeconds == null) {
+            Integer timeoutMs = intValue(runtime.get("timeoutMs"));
+            if (timeoutMs != null) {
+                timeoutSeconds = Math.max(1, timeoutMs / 1000);
+            }
+        }
+        if (maxTurns == null && timeoutSeconds == null) return null;
+        return new AiService.AgentRuntimeOptions(maxTurns, timeoutSeconds);
+    }
+
+    private Integer firstInt(Map<?, ?> map, String... keys) {
+        for (String key : keys) {
+            Integer value = intValue(map.get(key));
+            if (value != null) return value;
+        }
+        return null;
+    }
+
+    private Integer intValue(Object value) {
+        if (value == null) return null;
+        if (value instanceof Number number) return number.intValue();
+        try {
+            return Integer.parseInt(String.valueOf(value));
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    private String traceHarnessVersion(Long traceId) {
+        if (traceId == null) return null;
+        try {
+            HarnessTrace trace = harnessEvolutionService.getTrace(traceId);
+            return trace != null ? trace.getHarnessVersion() : null;
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    private boolean isLikelyToolError(String result) {
+        if (result == null || result.isBlank()) return false;
+        String lower = result.toLowerCase(Locale.ROOT);
+        return lower.contains("\"error\"")
+                || lower.contains("error:")
+                || lower.contains("exception")
+                || lower.contains("timeout")
+                || lower.contains("failed")
+                || lower.contains("失败")
+                || lower.contains("异常");
     }
 
     /** 同步发送消息（兜底） */
@@ -1072,8 +1448,9 @@ public class ChatController {
             item.put("provider", mc.getProvider() != null ? mc.getProvider() : "");
             item.put("description", mc.getDescription() != null ? mc.getDescription() : "");
             item.put("contextLength", mc.getContextLength() != null ? mc.getContextLength() : 0);
-            item.put("inputPrice", mc.getInputPrice() != null ? mc.getInputPrice() : BigDecimal.ZERO);
-            item.put("cachedInputPrice", mc.getCachedInputPrice() != null ? mc.getCachedInputPrice() : BigDecimal.ZERO);
+            BigDecimal inputPrice = mc.getInputPrice() != null ? mc.getInputPrice() : BigDecimal.ZERO;
+            item.put("inputPrice", inputPrice);
+            item.put("cachedInputPrice", mc.getCachedInputPrice() != null ? mc.getCachedInputPrice() : inputPrice);
             item.put("outputPrice", mc.getOutputPrice() != null ? mc.getOutputPrice() : BigDecimal.ZERO);
             Set<String> caps = new LinkedHashSet<>(parseLooseList(mc.getCapabilities()));
             caps.addAll(channelTagsByModel.getOrDefault(modelId, Set.of()));
@@ -1107,9 +1484,7 @@ public class ChatController {
             ApiLog apiLog = new ApiLog();
             apiLog.setUserId(userId);
             apiLog.setModel(model != null ? model : "unknown");
-            apiLog.setInputTokens(inputTokens);
-            apiLog.setCachedInputTokens(cachedInputTokens);
-            apiLog.setOutputTokens(outputTokens);
+            apiLog.setSceneType("chat");
             apiLog.setLatencyMs(latencyMs);
             apiLog.setStatus(status);
             apiLog.setErrorMsg(errorMsg);
@@ -1127,7 +1502,18 @@ public class ChatController {
                         : String.valueOf(channel.getId()));
                 }
             }
-            BigDecimal cost = usageTrackingService.calculateCost(model, inputTokens, cachedInputTokens, outputTokens);
+            UsageTrackingService.CostBreakdown costBreakdown =
+                    usageTrackingService.calculateCostBreakdown(model, inputTokens, cachedInputTokens, outputTokens);
+            BigDecimal cost = costBreakdown.getTotalCost();
+            apiLog.setInputTokens(costBreakdown.getInputTokens());
+            apiLog.setCachedInputTokens(costBreakdown.getCachedInputTokens());
+            apiLog.setOutputTokens(costBreakdown.getOutputTokens());
+            apiLog.setInputPriceSnapshot(costBreakdown.getInputPrice());
+            apiLog.setCachedInputPriceSnapshot(costBreakdown.getCachedInputPrice());
+            apiLog.setOutputPriceSnapshot(costBreakdown.getOutputPrice());
+            apiLog.setInputCost(costBreakdown.getInputCost());
+            apiLog.setCachedInputCost(costBreakdown.getCachedInputCost());
+            apiLog.setOutputCost(costBreakdown.getOutputCost());
             apiLog.setCost(cost);
             apiLogMapper.insert(apiLog);
             updateUserCost(userId, cost);
@@ -1351,7 +1737,7 @@ public class ChatController {
             if (ctx.getInjectedSystemPrompt() != null && !ctx.getInjectedSystemPrompt().isBlank()) {
                 sb.append(ctx.getInjectedSystemPrompt());
             }
-            String harnessGuidance = harnessEvolutionService.activeHarnessGuidance(harnessSurface);
+            String harnessGuidance = harnessEvolutionService.runtimeHarnessGuidance(harnessSurface, userId, convUuid);
             if (harnessGuidance != null && !harnessGuidance.isBlank()) {
                 if (!sb.isEmpty()) {
                     sb.append("\n\n");
@@ -1416,7 +1802,9 @@ public class ChatController {
             if (modelId.equals(mc.getModelId()) || modelId.equals(String.valueOf(mc.getId()))) {
                 String caps = mc.getCapabilities();
                 if (caps == null || caps.isBlank()) return false;
-                return Arrays.asList(caps.split(",")).contains(capability);
+                return Arrays.stream(caps.split(","))
+                        .map(String::trim)
+                        .anyMatch(item -> item.equalsIgnoreCase(capability));
             }
         }
         return false;
@@ -1446,6 +1834,35 @@ public class ChatController {
             }
         }
         return best != null ? best.getModelId() : null;
+    }
+
+    private List<String> getRequestImageRefs(ChatDTO.SendMessageRequest req) {
+        if (req == null) return List.of();
+        if (req.getImageUrls() != null && !req.getImageUrls().isEmpty()) {
+            return req.getImageUrls();
+        }
+        if (req.getImageBase64List() != null && !req.getImageBase64List().isEmpty()) {
+            return req.getImageBase64List();
+        }
+        if (req.getFileUrls() == null || req.getFileUrls().isEmpty()) {
+            return List.of();
+        }
+        return req.getFileUrls().stream()
+                .filter(this::looksLikeImageReference)
+                .toList();
+    }
+
+    private boolean looksLikeImageReference(String value) {
+        if (value == null || value.isBlank()) return false;
+        String lower = value.toLowerCase(Locale.ROOT).trim();
+        if (lower.startsWith("data:image/")) return true;
+        int queryIdx = lower.indexOf('?');
+        String path = queryIdx >= 0 ? lower.substring(0, queryIdx) : lower;
+        return path.endsWith(".png")
+                || path.endsWith(".jpg")
+                || path.endsWith(".jpeg")
+                || path.endsWith(".gif")
+                || path.endsWith(".webp");
     }
 
     /**
@@ -1626,94 +2043,9 @@ public class ChatController {
         try {
             var args = objectMapper.readTree(argumentsJson);
             String fileName = args.has("fileName") ? args.get("fileName").asText() : null;
-            if (fileName == null || fileName.isBlank()) {
-                return "错误: 缺少 fileName 参数";
-            }
-
-            ChatConversation conv = conversationMapper.selectOne(
-                    new com.baomidou.mybatisplus.core.conditions.query.QueryWrapper<ChatConversation>()
-                            .eq("uuid", convUuid).eq("deleted", 0)
-                            .orderByDesc("id")
-                            .last("LIMIT 1"));
-            if (conv == null) return "错误: 对话不存在";
-
-            // ── 策略1：work_file 表多策略搜索 ──
-            String ossUrl = findWorkFileAndGetUrl(userId, conv.getId(), fileName);
-
-            // ── 策略2：ThreadLocal 当前请求的 fileUrls 兜底 ──
-            if (ossUrl == null) {
-                ossUrl = findInCurrentRequestUrls(fileName);
-                log.info("[read_uploaded_file] 策略2(ThreadLocal) {} -> {}", fileName,
-                        ossUrl != null ? "FOUND" : "NOT FOUND");
-            }
-
-            // ── 策略3：跨会话搜索（用户所有对话的 work_file）──
-            if (ossUrl == null) {
-                ossUrl = findInAllUserFiles(userId, fileName);
-                log.info("[read_uploaded_file] 策略3(跨会话) {} -> {}", fileName,
-                        ossUrl != null ? "FOUND" : "NOT FOUND");
-            }
-
-            if (ossUrl == null || ossUrl.isBlank()) {
-                // 列出当前对话文件 + ThreadLocal 文件供参考
-                var hint = buildFileListHint(userId, conv.getId());
-                return "文件 \"" + fileName + "\" 未找到。" + hint;
-            }
-
-            // 从 OSS 下载文件
-            log.info("[read_uploaded_file] 下载文件: {} -> {}", fileName, ossUrl);
-
-            java.net.http.HttpClient client = java.net.http.HttpClient.newBuilder()
-                    .connectTimeout(java.time.Duration.ofSeconds(10))
-                    .build();
-            java.net.http.HttpRequest request = java.net.http.HttpRequest.newBuilder()
-                    .uri(java.net.URI.create(ossUrl))
-                    .timeout(java.time.Duration.ofSeconds(30))
-                    .GET()
-                    .build();
-            java.net.http.HttpResponse<byte[]> response = client.send(request,
-                    java.net.http.HttpResponse.BodyHandlers.ofByteArray());
-
-            if (response.statusCode() != 200) {
-                return "下载文件失败: HTTP " + response.statusCode();
-            }
-
-            byte[] data = response.body();
-            String mimeType = guessMimeType(fileName);
-            String lowerName = fileName.toLowerCase();
-
-            // Excel 文件 → 尝试用 Python 桥接解析
-            if (lowerName.endsWith(".xlsx") || lowerName.endsWith(".xls")) {
-                try {
-                    return parseExcelWithPython(data, fileName);
-                } catch (Exception e) {
-                    log.warn("[read_uploaded_file] Python 解析 Excel 失败，返回文件信息: {}", e.getMessage());
-                    return "文件 \"" + fileName + "\" (" + data.length + " bytes, " + mimeType + ")\n"
-                            + "Python 解析失败: " + e.getMessage() + "\n"
-                            + "请使用命令行工具或手动下载查看。OSS URL: " + ossUrl;
-                }
-            }
-
-            // CSV 文件 → 直接当文本返回
-            if (lowerName.endsWith(".csv")) {
-                return new String(data, java.nio.charset.StandardCharsets.UTF_8);
-            }
-
-            // 图片文件 → 返回 URL（模型可用 Vision 能力查看）
-            if (mimeType.startsWith("image/")) {
-                return "图片文件 \"" + fileName + "\" (" + data.length + " bytes, " + mimeType + ")\n"
-                        + "图片 URL: " + ossUrl;
-            }
-
-            // 其他文本文件 → 尝试返回文本内容
-            try {
-                String text = new String(data, java.nio.charset.StandardCharsets.UTF_8);
-                if (text.length() > 10000) text = text.substring(0, 10000) + "\n\n[... 内容过长已截断，原 " + data.length + " bytes ...]";
-                return text;
-            } catch (Exception e) {
-                return "文件 \"" + fileName + "\" (" + data.length + " bytes, " + mimeType + ")\n"
-                        + "该文件为二进制格式，无法直接文本化。OSS URL: " + ossUrl;
-            }
+            UploadedFileReadService.ReadResult result = uploadedFileReadService.readByName(
+                    userId, convUuid, null, fileName, currentRequestFileUrls.get());
+            return result.output();
         } catch (Exception e) {
             log.error("read_uploaded_file 执行失败: {}", e.getMessage());
             return "读取文件失败: " + e.getMessage();
@@ -2167,9 +2499,9 @@ public class ChatController {
         if (requestedModel != null && !requestedModel.isBlank() && !"auto".equalsIgnoreCase(requestedModel)) {
             log.debug("[ModelRouting] 用户指定模型: {}", requestedModel);
             if (!isModelAllowed(userId, requestedModel)) {
-                String fallback = findAllowedAvailableModel(userId, hasImages
-                        ? List.of("vision")
-                        : (isAgentMode ? List.of("tool") : null));
+                String fallback = findAllowedAvailableModel(userId, isAgentMode
+                        ? List.of("tool")
+                        : (hasImages ? List.of("vision") : null));
                 log.warn("[ModelRouting] requested model {} is outside subscription limit, fallback to {}",
                         requestedModel, fallback);
                 return fallback;
@@ -2184,12 +2516,12 @@ public class ChatController {
             ModelRoutingService.RouteContext ctx = new ModelRoutingService.RouteContext();
 
             // 场景类型判断
-            if (hasImages) {
-                ctx.setSceneType("vision");
-                ctx.setRequiredCapabilities(Arrays.asList("vision"));
-            } else if (isAgentMode) {
+            if (isAgentMode) {
                 ctx.setSceneType("agent");
                 ctx.setRequiredCapabilities(Arrays.asList("tool"));
+            } else if (hasImages) {
+                ctx.setSceneType("vision");
+                ctx.setRequiredCapabilities(Arrays.asList("vision"));
             } else {
                 ctx.setSceneType("chat");
             }
@@ -2226,7 +2558,9 @@ public class ChatController {
             log.error("[ModelRouting] 路由失败，降级为默认模型: {}", e.getMessage());
         }
 
-        return findAllowedAvailableModel(userId, null);
+        return findAllowedAvailableModel(userId, isAgentMode
+                ? List.of("tool")
+                : (hasImages ? List.of("vision") : null));
     }
 
     private String findAllowedAvailableModel(Long userId, List<String> requiredCapabilities) {

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import uuid
+import asyncio
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import quote, urlparse
@@ -15,6 +16,9 @@ from pydantic import BaseModel
 
 from core.state import _tasks
 from core.docker_manager import docker_manager
+from core.config import get_settings
+from core.workspace_index import build_workspace_index
+from runtime.system_context import reconcile_context
 from runtime.session_events import append_event
 from services.local_runner_manager import local_runner_manager
 from services.local_project_grants import local_project_grants
@@ -25,7 +29,7 @@ router = APIRouter()
 _device_channels: dict[tuple[str, str], WebSocket] = {}
 
 CONNECTOR_PROTOCOL = "muhuo-autocode"
-CONNECTOR_MIN_VERSION = os.getenv("AUTOCODE_LOCAL_CONNECTOR_MIN_VERSION", "0.4.7")
+CONNECTOR_MIN_VERSION = os.getenv("AUTOCODE_LOCAL_CONNECTOR_MIN_VERSION", "0.4.12")
 CONNECTOR_FILENAME = os.getenv("AUTOCODE_LOCAL_CONNECTOR_WINDOWS_FILENAME", "AutoCodeLocalConnectorSetup.exe")
 
 
@@ -48,6 +52,20 @@ class LocalImportTaskRequest(BaseModel):
     project_path: str = ""
     enable_smart_planning: bool = False
     sync_to_cloud: bool = False
+    model: str | None = None
+
+
+class LocalConnectorAutoImportRequest(BaseModel):
+    grant_id: str = ""
+    project_path: str = ""
+    project_name: str = ""
+    device_id: str = ""
+    device_name: str = ""
+    device_os: str = ""
+    public_api_base: str = ""
+    enable_smart_planning: bool = False
+    sync_to_cloud: bool = False
+    model: str | None = None
 
 
 class LocalProjectGrantRevokeRequest(BaseModel):
@@ -319,6 +337,79 @@ async def _sync_local_snapshot_to_workspace(task_id: str, workspace_id: str) -> 
     }
 
 
+def _initialize_imported_project_context(task: dict, *, project_root: str, cloud_snapshot_synced: bool) -> None:
+    workspace_id = str(task.get("workspace_id") or "")
+    context_payload = {
+        "project_root": project_root,
+        "workspace_id": workspace_id,
+        "cloud_snapshot_synced": cloud_snapshot_synced,
+        "index_docs": [],
+        "message": (
+            "本地导入项目已建立上下文索引；后续自然语言需求仍走 AI 路由，"
+            "续跑默认复用该索引与上次检索计划。"
+        ),
+    }
+    if cloud_snapshot_synced and workspace_id:
+        try:
+            ws_path = (get_settings().workspace_base_dir / workspace_id).resolve()
+            autocode_dir = ws_path / ".autocode"
+            autocode_dir.mkdir(parents=True, exist_ok=True)
+            index = build_workspace_index(ws_path)
+            source_files = [
+                str(item.get("path") or "")
+                for item in (index.get("files") or [])
+                if item.get("is_source")
+            ][:80]
+            top_dirs = [str(item) for item in (index.get("top_level_dirs") or [])[:40]]
+            (autocode_dir / "PROJECT_PROFILE.md").write_text(
+                "\n".join([
+                    "# Imported Project Profile",
+                    "",
+                    f"- project_root: `{project_root}`",
+                    f"- workspace_id: `{workspace_id}`",
+                    f"- total_files: {index.get('total_file_count', 0)}",
+                    f"- source_files: {index.get('source_file_count', 0)}",
+                    f"- top_dirs: {', '.join(top_dirs) if top_dirs else '(none)'}",
+                    "",
+                    "This project was imported through Local Connector. Reuse this profile before scanning.",
+                ]),
+                encoding="utf-8",
+            )
+            (autocode_dir / "PROJECT_MAP.md").write_text(
+                "# Imported Project Map\n\n"
+                + "\n".join(f"- `{path}`" for path in source_files)
+                + ("\n" if source_files else "- No source files indexed.\n"),
+                encoding="utf-8",
+            )
+            (autocode_dir / "COMMANDS.md").write_text(
+                "# Imported Project Commands\n\n"
+                "- Prefer Local Connector structured tools for local reads/writes.\n"
+                "- Run project-specific validation only after inspecting existing scripts/configs.\n",
+                encoding="utf-8",
+            )
+            manifest = reconcile_context(ws_path, workspace_id=workspace_id, task_id=str(task.get("id") or ""), write=True)
+            context_payload.update({
+                "index_docs": [
+                    ".autocode/PROJECT_PROFILE.md",
+                    ".autocode/PROJECT_MAP.md",
+                    ".autocode/COMMANDS.md",
+                ],
+                "source_file_count": index.get("source_file_count", 0),
+                "total_file_count": index.get("total_file_count", 0),
+                "system_context_epoch": manifest.get("epoch"),
+            })
+            task["system_context_epoch"] = manifest.get("epoch")
+        except Exception as exc:
+            context_payload["index_error"] = str(exc)
+    else:
+        context_payload["message"] = (
+            "本地项目已绑定但未同步云端快照；后续应通过 Local Connector 结构化工具按需读取，"
+            "不要用 shell 反复探测 Windows 绝对路径。"
+        )
+    task["imported_project_context"] = context_payload
+    append_event(task, "imported_project_context_initialized", context_payload, source="local_runner")
+
+
 @router.post("/session")
 async def create_local_runner_session(payload: LocalRunnerSessionRequest, request: Request):
     task_id = f"local-import-{os.urandom(8).hex()}"
@@ -355,8 +446,12 @@ async def local_runner_session_status(session_id: str, request: Request):
     return _status_payload_with_command(session, request)
 
 
-@router.post("/session/{session_id}/register-task")
-async def register_local_import_task(session_id: str, payload: LocalImportTaskRequest, request: Request):
+async def _register_local_import_task_from_session(
+    *,
+    session_id: str,
+    payload: LocalImportTaskRequest,
+    request: Request,
+) -> dict:
     session = local_runner_manager.get(session_id)
     if not session:
         raise HTTPException(status_code=404, detail="local runner session not found")
@@ -371,6 +466,9 @@ async def register_local_import_task(session_id: str, payload: LocalImportTaskRe
     project_root = (payload.project_path or session.project_root or session.command_project_path or "本地项目").strip()
     title = (payload.title or Path(project_root).name or "本地项目").strip()
     description = f"本地导入项目：{project_root}。后续请优先通过 Local Connector 在用户本机读取、修改和验证。"
+    requested_model = (payload.model or "").strip() or None
+    if requested_model and requested_model.lower() == "auto":
+        requested_model = None
 
     await local_runner_manager.bind_session_to_task(session_id, task_id)
     session.command_project_path = project_root
@@ -401,6 +499,7 @@ async def register_local_import_task(session_id: str, payload: LocalImportTaskRe
         "created_at": now,
         "workspace_id": workspace_id,
         "user_id": str(user_id) if user_id else None,
+        "model": requested_model,
         "agents": ["frontend", "backend"],
         "logs": [
             {
@@ -439,6 +538,7 @@ async def register_local_import_task(session_id: str, payload: LocalImportTaskRe
         "review_confirmed": None,
         "enable_smart_planning": bool(payload.enable_smart_planning),
         "execution_mode": "agentic",
+        "execution_target": "local_ide",
         "local_execution_enabled": True,
         "local_runner_session_id": session_id,
         "local_project_grant_id": str(grant.get("grant_id") or ""),
@@ -448,6 +548,13 @@ async def register_local_import_task(session_id: str, payload: LocalImportTaskRe
         "events": [],
     }
     _tasks[task_id] = task
+    if requested_model:
+        append_event(
+            task,
+            "task_model_selected",
+            {"model": requested_model, "source": "local_project_import"},
+            source="local_runner",
+        )
     if payload.sync_to_cloud:
         try:
             snapshot_meta = await _sync_local_snapshot_to_workspace(task_id, workspace_id)
@@ -458,6 +565,11 @@ async def register_local_import_task(session_id: str, payload: LocalImportTaskRe
             task["cloud_snapshot_status"] = "failed"
             task["cloud_snapshot_error"] = str(exc)
             append_event(task, "local_snapshot_sync_failed", {"error": str(exc)}, source="local_runner")
+    _initialize_imported_project_context(
+        task,
+        project_root=project_root,
+        cloud_snapshot_synced=task.get("cloud_snapshot_status") == "synced",
+    )
     append_event(
         task,
         "local_runner_enabled",
@@ -473,6 +585,94 @@ async def register_local_import_task(session_id: str, payload: LocalImportTaskRe
     append_event(task, "local_runner_connected", {"session_id": session_id, "project_root": project_root}, source="local_runner")
     save_task(dict(task))
     return {**task, "local_runner": _status_payload_with_command(session, request, project_path=project_root)}
+
+
+@router.post("/session/{session_id}/register-task")
+async def register_local_import_task(session_id: str, payload: LocalImportTaskRequest, request: Request):
+    return await _register_local_import_task_from_session(session_id=session_id, payload=payload, request=request)
+
+
+@router.post("/connector/auto-import")
+async def connector_auto_import_local_project(payload: LocalConnectorAutoImportRequest, request: Request):
+    """Import a local project selected inside the desktop connector.
+
+    This endpoint avoids relying on the browser to successfully dispatch a second
+    muhuo-autocode:// deep link. The already-running connector advertises a device
+    channel for the local grant; once the web app registers that grant here, the
+    backend can push a connect_request through the device channel and create the
+    task after the runner attaches.
+    """
+    user_id = _request_user_id(request)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="missing user id")
+    project_path = (payload.project_path or "").strip()
+    if not project_path:
+        raise HTTPException(status_code=400, detail="project_path is required")
+
+    public_api_base = (payload.public_api_base or _public_api_base_url(request)).strip().rstrip("/")
+    grant = local_project_grants.upsert(
+        user_id=user_id,
+        server_base=public_api_base,
+        project_root=project_path,
+        grant_id=(payload.grant_id or "").strip(),
+        task_id="",
+        workspace_id="",
+        device_id=(payload.device_id or "").strip(),
+        device_name=(payload.device_name or "").strip(),
+        device_os=(payload.device_os or "").strip(),
+    )
+    grant_id = str(grant.get("grant_id") or "")
+    device_id = str(grant.get("device_id") or payload.device_id or "").strip()
+    if not device_id:
+        raise HTTPException(status_code=409, detail="连接器设备信息缺失，请升级并重新打开 AutoCode Local Connector")
+
+    task_id = f"local-import-{os.urandom(8).hex()}"
+    try:
+        session = await local_runner_manager.enable(task_id)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=429, detail=str(exc)) from exc
+    session.user_id = user_id
+    session.public_api_base = public_api_base
+    session.command_project_path = project_path
+    session.local_project_grant_id = grant_id
+
+    device_ws = _device_channels.get((user_id, device_id))
+    if not device_ws:
+        raise HTTPException(status_code=409, detail="连接器设备通道未在线，请保持 AutoCode Local Connector 打开后重试")
+    try:
+        await device_ws.send_json({
+            "type": "connect_request",
+            "server": session.public_api_base or _public_api_base_url(request),
+            "session": session.session_id,
+            "token": session.token,
+            "project": project_path,
+            "min_version": CONNECTOR_MIN_VERSION,
+            "grant_id": grant_id,
+            "task_id": task_id,
+        })
+    except Exception as exc:
+        raise HTTPException(status_code=409, detail=f"向连接器发送连接请求失败：{exc}") from exc
+
+    deadline = datetime.utcnow().timestamp() + 20
+    while datetime.utcnow().timestamp() < deadline:
+        if session.connected:
+            break
+        await asyncio.sleep(0.5)
+    if not session.connected:
+        raise HTTPException(status_code=409, detail="已向连接器发送请求，但本地 Runner 未在 20 秒内连接")
+
+    title = (payload.project_name or Path(project_path).name or "本地项目").strip()
+    return await _register_local_import_task_from_session(
+        session_id=session.session_id,
+        payload=LocalImportTaskRequest(
+            title=title,
+            project_path=project_path,
+            enable_smart_planning=payload.enable_smart_planning,
+            sync_to_cloud=payload.sync_to_cloud,
+            model=payload.model,
+        ),
+        request=request,
+    )
 
 
 @router.get("/{task_id}/status")
@@ -502,7 +702,7 @@ async def sync_local_runner_snapshot(task_id: str, request: Request):
     if not task:
         raise HTTPException(status_code=404, detail="task not found")
     if not task.get("local_import_mode"):
-        raise HTTPException(status_code=400, detail="只有本地导入项目需要同步云端副本")
+        raise HTTPException(status_code=400, detail="只有本地 IDE 互联任务需要同步云端副本")
     request_user_id = _request_user_id(request)
     task_user_id = str(task.get("user_id") or "")
     if task_user_id and request_user_id and task_user_id != request_user_id:
@@ -543,10 +743,11 @@ async def set_local_runner_mode(task_id: str, payload: LocalRunnerModeRequest, r
         if task.get("local_import_mode") and task.get("cloud_snapshot_status") != "synced":
             raise HTTPException(
                 status_code=409,
-                detail="该任务是未同步云端的本地导入项目。关闭本地执行后云端没有可操作的项目文件，请先同步云端副本或继续使用本地连接器。",
+                detail="该任务是未同步云端的本地 IDE 互联任务。切回云端工作区后云端没有可操作的项目文件，请先同步云端副本或继续使用本地 IDE 互联。",
             )
         await local_runner_manager.disable(task_id)
         task["local_execution_enabled"] = False
+        task["execution_target"] = "cloud_workspace"
         append_event(task, "local_runner_disabled", {"enabled": False}, source="local_runner")
         save_task(dict(task))
         return {"enabled": False, "connected": False, "connection_state": "disabled"}
@@ -594,6 +795,7 @@ async def set_local_runner_mode(task_id: str, payload: LocalRunnerModeRequest, r
             raise HTTPException(status_code=409, detail=f"目标设备连接请求发送失败：{exc}") from exc
 
     task["local_execution_enabled"] = True
+    task["execution_target"] = "local_ide"
     task["local_runner_session_id"] = session.session_id
     append_event(
         task,

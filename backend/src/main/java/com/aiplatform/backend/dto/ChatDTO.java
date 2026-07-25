@@ -16,6 +16,9 @@ public class ChatDTO {
         private String updatedAt;
         private List<MessageVO> messages;
         private Boolean hasMore; // 是否还有更早的消息（分页加载用）
+        private Boolean streaming; // 是否有后台生成正在进行（断线续传标记）
+        private String streamingMessageId; // 生成中的助手消息落库 id（生成中通常为 null）
+        private Long streamingSeq; // 保留：客户端已消费的最大 seq（暂未用）
     }
 
     @Data
@@ -52,6 +55,8 @@ public class ChatDTO {
         private String agentId;
         /** 图片 base64 列表（可选），用于 Vision 模式 */
         private List<String> imageBase64List;
+        /** 图片 URL 列表（可选），仅用于 Vision 模式；fileUrls 可包含 Excel 等非图片文件 */
+        private List<String> imageUrls;
         /** 已上传文件路径列表（可选），Agent 模式下供工具使用（如 Excel 台账文件） */
         private List<String> uploadedFilePaths;
         /** 文件 OSS URL 列表（可选），文件已上传至 OSS，传递 URL 替代直接上传 */

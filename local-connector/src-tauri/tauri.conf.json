@@ -1,0 +1,37 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "AutoCode IDE",
+  "version": "0.4.8",
+  "identifier": "com.muhuo.autocode.localconnector",
+  "build": {
+    "beforeDevCommand": "npm run dev:web",
+    "beforeBuildCommand": "npm run build:web",
+    "devUrl": "http://localhost:5173",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "security": {
+      "csp": "default-src 'self'; img-src 'self' asset: http://asset.localhost data: blob:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self' ipc: http://localhost:* http://127.0.0.1:* ws://localhost:* ws://127.0.0.1:*; frame-src http://localhost:* http://127.0.0.1:*;"
+    },
+    "windows": [
+      {
+        "title": "AutoCode IDE",
+        "width": 1440,
+        "height": 900,
+        "resizable": true
+      }
+    ]
+  },
+  "bundle": {
+    "active": true,
+    "useLocalToolsDir": true,
+    "targets": ["nsis"]
+  },
+  "plugins": {
+    "deep-link": {
+      "desktop": {
+        "schemes": ["muhuo-autocode"]
+      }
+    }
+  }
+}

@@ -1,23 +1,15 @@
 ﻿# -*- coding: utf-8 -*-
 """
-Agent Orchestrator 鈥?Provider-agnostic 澶?Agent 鍗忎綔缂栨帓锛堝€熼壌 OpenCode 鏋舵瀯锛?
+Provider-agnostic AutoCode Agent orchestrator.
 
-鏍稿績鏀瑰姩锛坴2.0锛夛細
-- LLM 璋冪敤锛欰nthropic SDK 鈫?LLMClient 缁熶竴鎶借薄锛堟敮鎸?DeepSeek/Kimi/Qwen/Claude锛?
-- 妯″瀷閫夋嫨锛氱‖缂栫爜 MODEL_PREFERENCES 鈫?channel_service.select_best_tool_model()
-- 宸ュ叿鏍煎紡锛欰nthropic MCP (input_schema) 鈫?OpenAI function calling
-- 鍝嶅簲瑙ｆ瀽锛歜lock.type == "tool_use" 鈫?response.tool_calls
-
-娴佺▼涓嶅彉锛?
-1. 鐞嗚В鐢ㄦ埛闇€姹?鈫?鎷嗚В涓哄瓙浠诲姟
-2. 鍚姩瀵瑰簲绫诲瀷鐨?Agent 骞惰鎵ц
-3. 鍚?Agent 鍦ㄩ殧绂?Workspace 涓搷浣滐紙鏂囦欢璇诲啓 / bash / git锛?
-4. 鍗遍櫓鎿嶄綔锛堝垹闄?瑕嗙洊锛夋殏鍋滐紝绛夊緟鐢ㄦ埛纭
-5. 鏋勫缓 鈫?棰勮 鈫?鐢ㄦ埛楠屾敹 鈫?杩唬鎴栭儴缃?
+The orchestrator coordinates AI planning, bounded tool execution, artifact
+validation, continuation context, review, and task completion events.
 """
 import asyncio
+import difflib
 import json
 import os
+import posixpath
 import re
 import uuid
 from datetime import datetime
@@ -39,11 +31,13 @@ from core.workspace_index import (
     load_workspace_index,
     is_actionable_development_request,
     plan_retrieval,
+    RetrievalPlan,
     render_retrieval_plan,
     search_workspace_code,
 )
 from core.state import _tasks, _confirmations
 from core.review_agent import ReviewAgent
+from core.execution_protocol import build_task_capability_profile, is_auxiliary_artifact
 from schemas.task import SubTask, SubTaskStatus, TaskPlan
 from services.channel_service import select_best_tool_model, fetch_all_channels, resolve_channel_for_model
 from services.dev_server_manager import dev_server_manager
@@ -68,6 +62,10 @@ IGNORED_WORKSPACE_PARTS = {
 }
 
 
+class AgentWaitingForUserInput(Exception):
+    """Stop the current execution stack while preserving a structured user question."""
+
+
 def _read_json_file(path: Path) -> dict[str, Any]:
     try:
         return json.loads(path.read_text(encoding="utf-8", errors="replace"))
@@ -75,83 +73,133 @@ def _read_json_file(path: Path) -> dict[str, Any]:
         return {}
 
 
-def _select_validation_command(ws_path: Path, project_type: str = "") -> tuple[str | None, str]:
+def _plan_steps(execution_plan: dict[str, Any] | None) -> list[dict[str, Any]]:
+    return [step for step in ((execution_plan or {}).get("validation_plan") or []) if isinstance(step, dict)]
+
+
+def _planned_command(execution_plan: dict[str, Any] | None, kinds: set[str]) -> tuple[str | None, str]:
+    for step in _plan_steps(execution_plan):
+        command = str(step.get("command") or "").strip()
+        kind = str(step.get("kind") or "command").strip().lower()
+        if command and kind in kinds:
+            return command, str(step.get("description") or f"execution plan: {kind}")
+    return None, ""
+
+
+def _select_validation_command(
+    ws_path: Path,
+    project_type: str = "",
+    execution_plan: dict[str, Any] | None = None,
+    changed_files: list[str] | None = None,
+) -> tuple[str | None, str]:
+    planned, reason = _planned_command(
+        execution_plan,
+        {"command", "validate", "validation", "test", "build", "lint", "typecheck", "check"},
+    )
+    if planned:
+        return planned, reason
+
     package = _read_json_file(ws_path / "package.json") if (ws_path / "package.json").exists() else {}
     scripts = package.get("scripts") or {}
     if scripts:
-        for name in ("build", "test", "lint", "typecheck", "check"):
+        for name in ("test", "build", "lint", "typecheck", "check"):
             if name in scripts:
+                if (ws_path / "pnpm-lock.yaml").exists():
+                    return f"pnpm run {name}", f"package.json script: {name}"
+                if (ws_path / "yarn.lock").exists():
+                    return f"yarn {name}", f"package.json script: {name}"
+                if (ws_path / "bun.lockb").exists() or (ws_path / "bun.lock").exists():
+                    return f"bun run {name}", f"package.json script: {name}"
                 return f"npm run {name}", f"package.json script: {name}"
-        return "npm install --package-lock=false --dry-run", "package.json dependency dry-run"
 
-    if (ws_path / "pyproject.toml").exists() or (ws_path / "requirements.txt").exists() or any(ws_path.glob("*.py")):
+    changed_python = [path for path in (changed_files or []) if Path(path).suffix.lower() == ".py"]
+    if (ws_path / "pyproject.toml").exists() or (ws_path / "requirements.txt").exists() or changed_python or any(ws_path.glob("*.py")):
         if (ws_path / "tests").exists() or any(ws_path.glob("test_*.py")):
             return "python -m pytest", "Python tests"
-        return "python -m compileall .", "Python syntax compile"
-
+        return "python -m compileall -q .", "Python syntax compile"
     if (ws_path / "pom.xml").exists():
-        return "mvn test", "Maven test"
+        return "mvn test", "Maven tests"
+    if (ws_path / "gradlew").exists():
+        return "./gradlew test", "Gradle wrapper tests"
     if (ws_path / "build.gradle").exists() or (ws_path / "settings.gradle").exists():
-        if (ws_path / "gradlew").exists():
-            return "./gradlew test", "Gradle wrapper test"
-        return "gradle test", "Gradle test"
+        return "gradle test", "Gradle tests"
     if (ws_path / "go.mod").exists():
         return "go test ./...", "Go tests"
     if (ws_path / "Cargo.toml").exists():
         return "cargo test", "Rust tests"
+    if any(ws_path.glob("*.sln")) or any(ws_path.glob("*.csproj")) or any(ws_path.glob("*.fsproj")):
+        return "dotnet test", ".NET tests"
+    if (ws_path / "Makefile").exists() or (ws_path / "makefile").exists():
+        return "make test", "Make test target"
+    if (ws_path / "composer.json").exists():
+        return "composer test", "Composer test script"
+    if (ws_path / "Gemfile").exists():
+        return "bundle exec rake test", "Ruby test task"
+    if (ws_path / "mix.exs").exists():
+        return "mix test", "Elixir tests"
+    if (ws_path / "pubspec.yaml").exists():
+        return "dart analyze", "Dart analysis"
+    if (ws_path / "Package.swift").exists():
+        return "swift test", "Swift tests"
+    if (ws_path / "deno.json").exists() or (ws_path / "deno.jsonc").exists():
+        return "deno test", "Deno tests"
 
     shell_scripts = list(ws_path.glob("*.sh"))
     if shell_scripts:
-        return "bash -n " + " ".join(str(p.name) for p in shell_scripts[:5]), "Shell syntax check"
+        return "bash -n " + " ".join(path.name for path in shell_scripts[:5]), "Shell syntax check"
     ps_scripts = list(ws_path.glob("*.ps1"))
     if ps_scripts:
-        return "pwsh -NoProfile -Command \"Get-ChildItem *.ps1 | ForEach-Object { $null = [scriptblock]::Create((Get-Content $_ -Raw)) }\"", "PowerShell syntax check"
+        return 'pwsh -NoProfile -Command "Get-ChildItem *.ps1 | ForEach-Object { $null = [scriptblock]::Create((Get-Content $_ -Raw)) }"', "PowerShell syntax check"
+    return None, "artifact validation only; no command declared or inferred"
 
-    return None, "no validation command detected"
+def _is_implementation_file(raw_path: str) -> bool:
+    normalized = str(raw_path or "").replace("\\", "/").strip("/")
+    if not normalized or is_auxiliary_artifact(normalized):
+        return False
+    name = normalized.rsplit("/", 1)[-1].lower()
+    if name.startswith(("readme", "changelog", "license", "contributing", "code_of_conduct")):
+        return False
+    # Exclude known delivery/data assets instead of trying to enumerate every
+    # programming language. An unfamiliar extension remains a valid code target.
+    non_implementation_suffixes = {
+        ".md", ".mdx", ".rst", ".txt", ".pdf", ".doc", ".docx",
+        ".ppt", ".pptx", ".xls", ".xlsx", ".csv", ".tsv",
+        ".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".ico",
+        ".mp3", ".wav", ".mp4", ".mov", ".avi", ".zip", ".tar", ".gz",
+    }
+    return Path(name).suffix.lower() not in non_implementation_suffixes
 
 
 def _has_source_file(files: list[str] | tuple[str, ...] | set[str]) -> bool:
-    for raw in files or []:
-        path = str(raw).replace("\\", "/").lstrip("/")
-        if path.startswith(".autocode/"):
-            continue
-        if Path(path).suffix.lower() in SOURCE_FILE_SUFFIXES:
-            return True
-    return False
+    return any(_is_implementation_file(raw) for raw in (files or []))
 
 
 def _subtask_expects_source(subtask: SubTask, project_type: str = "") -> bool:
-    text = " ".join([
-        subtask.title or "",
-        subtask.description or "",
-        " ".join(str(p) for p in (subtask.estimated_files or [])),
-    ]).lower()
-    # 楠岃瘉/鏂囨。绫婚樁娈碉紙鍐掔儫娴嬭瘯銆佷娇鐢ㄨ鏄庛€丷EADME锛変笉瑕佹眰浜у嚭婧愮爜锛?
-    # 鍗充娇 estimated_files 涓垪鍑轰簡婧愮爜鏂囦欢锛堝彲鑳芥槸鍥犱负寮曠敤浜嗗疄鐜伴樁娈电殑鏂囦欢锛夈€?
-    doc_phase_tokens = (
-        "smoke test", "usage notes", "usage guide", "readme", "document", "docs",
-        "鍐掔儫娴嬭瘯", "浣跨敤璇存槑", "浣跨敤鎸囧崡", "璇存槑", "鏂囨。",
+    semantic_text = " ".join([subtask.title or "", subtask.description or ""]).lower()
+    explicitly_non_implementation = (
+        "不实现", "无需实现", "不修改源码", "不产出代码", "只定义契约", "仅定义契约",
+        "do not implement", "without implementation", "no code changes", "contract only",
     )
-    if any(token in text for token in doc_phase_tokens):
+    if any(token in semantic_text for token in explicitly_non_implementation):
         return False
-    doc_only_tokens = (
-        "濂戠害", "璇存槑", "鏂囨。", "姊崇悊", "鍏ュ彛", "鍘熷瀷", "璁″垝", "瀹℃煡", "浣跨敤璇存槑", "鍐掔儫娴嬭瘯",
-        "濂戠害", "contract", "璇存槑", "鏂囨。", "姊崇悊", "map", "鍘熷瀷", "prototype",
-        "璁″垝", "plan", "瀹℃煡", "review",
-    )
-    implementation_tokens = (
-        "实现", "开发", "核心行为", "功能", "修复", "改动", "代码", "源码",
-        "implement", "build", "fix", "feature",
-    )
-    if any(Path(str(p)).suffix.lower() in SOURCE_FILE_SUFFIXES for p in (subtask.estimated_files or [])):
-        return True
-    is_doc_only = any(token in text for token in doc_only_tokens)
-    if any(token in text for token in implementation_tokens) and not is_doc_only:
-        return True
-    if any(token in text for token in ("实现", "核心行为", "源码", "代码", "功能", "implement", "feature")) and not is_doc_only:
-        return True
-    return False
 
+    implementation_tokens = (
+        "实现", "开发", "核心行为", "功能改动", "修复", "修改源码", "代码改动", "真实源码",
+        "implement", "develop", "fix", "modify source", "code change", "feature",
+    )
+    if any(token in semantic_text for token in implementation_tokens):
+        return True
+
+    documentation_or_validation_tokens = (
+        "冒烟测试", "使用说明", "使用指南", "仅验证", "验证阶段", "代码审查", "产物审查",
+        "契约", "文档", "项目地图", "原型", "规划",
+        "smoke test", "usage notes", "usage guide", "validation only", "review only",
+        "contract", "documentation", "project map", "prototype", "planning",
+    )
+    if any(token in semantic_text for token in documentation_or_validation_tokens):
+        return False
+
+    return any(_is_implementation_file(raw) for raw in (subtask.estimated_files or []))
 
 def _normalize_agent_path(raw_path: str) -> str:
     raw = (raw_path or "").strip().replace("\\", "/")
@@ -179,6 +227,127 @@ def _safe_workspace_path(ws_path: Path, raw_path: str, *, must_exist: bool = Fal
     except ValueError:
         raise PermissionError("path escapes the current task workspace")
     return target
+
+
+def _read_lines_result(path: Path, rel_path: str, start: int, end: int, *, max_lines: int = 240) -> str:
+    if start < 1:
+        start = 1
+    if end < start:
+        end = start
+    if end - start + 1 > max_lines:
+        end = start + max_lines - 1
+    lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    total = len(lines)
+    selected = lines[start - 1:min(end, total)]
+    width = max(len(str(min(end, total))), len(str(start)), 3)
+    body = "\n".join(
+        f"{idx:>{width}} | {line}"
+        for idx, line in enumerate(selected, start=start)
+    )
+    if not body:
+        body = "(no lines in requested range)"
+    display_end = min(end, total) if total else 0
+    if start > total:
+        display_end = total
+    return f"[OK] {rel_path} lines {start}-{display_end} of {total}\n{body}"
+
+
+def _surface_map_candidates_for_task(ws_path: Path, task: dict | None) -> list[str]:
+    if not task:
+        return []
+    profile_path = ws_path / ".autocode" / "PROJECT_PROFILE.json"
+    surface_map: dict[str, list[str]] = {}
+    try:
+        data = json.loads(profile_path.read_text(encoding="utf-8", errors="replace"))
+        raw = data.get("surface_map") if isinstance(data, dict) else {}
+        if isinstance(raw, dict):
+            for key, values in raw.items():
+                if isinstance(values, list):
+                    surface_map[str(key)] = [str(value) for value in values if value]
+    except Exception:
+        return []
+    if not surface_map:
+        return []
+    task_text = " ".join(
+        str(task.get(key) or "")
+        for key in ("title", "description", "original_request", "user_request", "current_step")
+    ).lower()
+    buckets: list[str] = []
+    if any(term in task_text for term in ("页面", "界面", "软件", "看不到", "gui", "ui", "view", "screen", "frontend")):
+        buckets.append("app_gui")
+    if any(term in task_text for term in ("官网", "文档", "docs", "documentation", "site")):
+        buckets.append("docs_site")
+    if any(term in task_text for term in ("api", "接口", "后端", "server", "backend", "flask")):
+        buckets.append("backend_api")
+    if any(term in task_text for term in ("配置", "设置", "config", "settings")):
+        buckets.append("config_store")
+    if any(term in task_text for term in ("包", "库", "源码", "package", "source", "library")):
+        buckets.append("package_source")
+    if not buckets:
+        return []
+    candidates: list[str] = []
+    seen: set[str] = set()
+    for bucket in buckets:
+        for rel_path in surface_map.get(bucket) or []:
+            normalized = str(rel_path).replace("\\", "/").lstrip("/")
+            if normalized and normalized not in seen:
+                candidates.append(normalized)
+                seen.add(normalized)
+    return candidates
+
+
+# ── code_editor 工具辅助：原子写入、撤销栈、unified diff ──
+_CODE_EDITOR_UNDO: dict[str, list[str | None]] = {}
+_CODE_EDITOR_UNDO_LIMIT = 20
+_CODE_EDITOR_DIFF_LIMIT = 4000
+
+
+def _code_editor_push_undo(key: str, old_text: str | None) -> None:
+    stack = _CODE_EDITOR_UNDO.setdefault(key, [])
+    stack.append(old_text)
+    if len(stack) > _CODE_EDITOR_UNDO_LIMIT:
+        del stack[0]
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    """原子写入文本（同目录临时文件 + os.replace），全程 UTF-8。"""
+    tmp = path.with_name(path.name + ".tmp-autocode")
+    tmp.write_text(text, encoding="utf-8", newline="")
+    os.replace(tmp, path)
+
+
+def _unified_diff_text(old: str, new: str, rel_path: str) -> str:
+    diff_lines = list(difflib.unified_diff(
+        old.splitlines(), new.splitlines(),
+        fromfile=f"a/{rel_path}", tofile=f"b/{rel_path}", lineterm="", n=3,
+    ))
+    if not diff_lines:
+        return "(无内容差异)"
+    out = "\n".join(diff_lines)
+    if len(out) > _CODE_EDITOR_DIFF_LIMIT:
+        out = out[:_CODE_EDITOR_DIFF_LIMIT] + "\n... (diff 已截断)"
+    return out
+
+
+def code_editor_undo_for_workspace(workspace_id: str, rel_path: str) -> str | None:
+    """供 API 调用：弹出 code_editor 撤销栈顶并恢复文件内容。
+
+    返回恢复结果描述文本；没有可撤销的编辑时返回 None。
+    """
+    settings = get_settings()
+    ws_path = settings.workspace_base_dir / workspace_id
+    normalized = str(rel_path or "").strip().replace("\\", "/").lstrip("/")
+    undo_key = f"{ws_path}::{normalized}"
+    stack = _CODE_EDITOR_UNDO.get(undo_key)
+    if not stack:
+        return None
+    previous = stack.pop()
+    path = _safe_workspace_path(ws_path, normalized, must_exist=False)
+    if previous is None:
+        path.unlink(missing_ok=True)
+        return f"[OK] 已撤销创建，文件已删除: {normalized}"
+    _atomic_write_text(path, previous)
+    return f"[OK] 已恢复上次编辑前的内容: {normalized}"
 
 
 def _normalize_local_bash_command(command: str) -> str:
@@ -232,6 +401,11 @@ def _agent_changed_files(result: Any) -> list[str]:
         if isinstance(files, (list, tuple, set)):
             return [str(p) for p in files if str(p).strip()]
     return []
+
+
+def _tool_result_indicates_write_success(result: str) -> bool:
+    text = str(result or "").lstrip()
+    return text.startswith("[OK]") or text.startswith("[LOCAL] [OK]")
 
 
 def _agent_needs_auto_continuation(task: dict | None) -> bool:
@@ -388,27 +562,11 @@ def _check_retrieval_read_guard(task: dict | None, rel_path: str) -> str | None:
     if is_index_doc or rel_path in read_files:
         return None
     is_candidate = rel_path in candidate_files
-    budget = max(0, int(guard.get("read_budget") or 3))
-    if len(read_files) >= budget and not is_candidate:
-        append_event(
-            task,
-            "retrieval_guard_blocked",
-            {
-                "path": rel_path,
-                "read_budget": budget,
-                "read_count": len(read_files),
-                "candidate": False,
-                "candidate_files": list(candidate_files)[:50],
-            },
-            source="retrieval_guard",
-        )
-        return (
-            "[READ_BUDGET_BLOCKED] 当前增量任务已达到源码读取预算。"
-            "请优先基于 .autocode/RETRIEVAL_PLAN.md 的 Candidate Files 修改；"
-            f"如必须读取 `{rel_path}`，请先用现有上下文说明原因并收敛目标。"
-        )
+    budget = max(0, int(guard.get("read_budget") or 12))
+    # 记账但不阻断：读取始终放行，超预算只附一条软提示。
     read_files.append(rel_path)
     guard["read_files"] = read_files
+    over_budget = len(read_files) > budget and not is_candidate
     append_event(
         task,
         "retrieval_guard_accounted",
@@ -417,16 +575,76 @@ def _check_retrieval_read_guard(task: dict | None, rel_path: str) -> str | None:
             "read_budget": budget,
             "read_count": len(read_files),
             "candidate": is_candidate,
+            "over_budget": over_budget,
         },
         source="retrieval_guard",
     )
+    if over_budget:
+        return (
+            f"[READ_BUDGET_SOFT] 已读取 {len(read_files)} 个文件（软上限 {budget}）。"
+            "建议基于现有上下文与 .autocode/RETRIEVAL_PLAN.md 的 Candidate Files 收敛改动；"
+            "如确有必要可继续读取，此提示不阻断。"
+        )
     return None
+
+
+def _retrieval_plan_epoch(task: dict | None) -> int:
+    if not isinstance(task, dict):
+        return 0
+    plan = task.get("retrieval_plan")
+    if isinstance(plan, dict):
+        try:
+            return int(plan.get("system_context_epoch") or 0)
+        except (TypeError, ValueError):
+            return 0
+    return 0
+
+
+def _can_reuse_retrieval_plan(task: dict | None) -> bool:
+    if not isinstance(task, dict):
+        return False
+    plan = task.get("retrieval_plan")
+    if not isinstance(plan, dict) or not plan.get("candidate_files"):
+        return False
+    current_epoch = int(task.get("system_context_epoch") or 0)
+    plan_epoch = _retrieval_plan_epoch(task)
+    return plan_epoch == 0 or current_epoch == 0 or plan_epoch == current_epoch
+
+
+def _reuse_retrieval_plan(task: dict, *, source: str) -> dict | None:
+    if not _can_reuse_retrieval_plan(task):
+        return None
+    plan = dict(task.get("retrieval_plan") or {})
+    previous_guard = task.get("retrieval_guard") if isinstance(task.get("retrieval_guard"), dict) else {}
+    task["retrieval_guard"] = {
+        "active": True,
+        "candidate_files": list(plan.get("candidate_files") or []),
+        "index_docs": list(plan.get("index_docs") or []),
+        "read_budget": int(plan.get("read_budget") or max(12, len(plan.get("candidate_files") or []) + 8)),
+        "read_files": list(previous_guard.get("read_files") or []),
+    }
+    append_event(
+        task,
+        "retrieval_plan_reused",
+        {
+            "source": source,
+            "candidate_files": task["retrieval_guard"]["candidate_files"],
+            "read_budget": task["retrieval_guard"]["read_budget"],
+            "read_files": task["retrieval_guard"]["read_files"],
+            "system_context_epoch": task.get("system_context_epoch"),
+        },
+        source="agent_efficiency",
+    )
+    return plan
 
 
 def _is_read_only_bash(command: str) -> bool:
     normalized = re.sub(r"\s+", " ", str(command or "").strip())
     if not normalized:
         return False
+    normalized = re.sub(r"\s+2>\s*(nul|/dev/null)", "", normalized, flags=re.IGNORECASE)
+    normalized = re.sub(r"\s+\|\|\s+echo\s+.*$", "", normalized, flags=re.IGNORECASE)
+    normalized = re.sub(r"\s+\|\s+head\s+-?\d+\s*$", "", normalized, flags=re.IGNORECASE)
     lowered = normalized.lower()
     risky_tokens = (
         " >", ">", "| tee", "rm ", "del ", "erase ", "mv ", "move ", "cp ", "copy ",
@@ -437,6 +655,279 @@ def _is_read_only_bash(command: str) -> bool:
         return False
     return any(lowered == prefix or lowered.startswith(prefix + " ") for prefix in READ_ONLY_BASH_PREFIXES)
 
+
+def _assistant_content_says_complete(content: str) -> bool:
+    text = (content or "").strip().lower()
+    if not text:
+        return False
+    markers = (
+        "done",
+        "completed",
+        "all done",
+        "task completed",
+        "任务完成",
+        "任务已完成",
+        "已完成",
+        "已经完成",
+        "无需进一步操作",
+        "无须进一步操作",
+    )
+    return any(marker in text for marker in markers)
+
+
+def _assistant_content_promises_edit_without_tool(content: str) -> bool:
+    text = (content or "").strip().lower()
+    if not text or _assistant_content_says_complete(text):
+        return False
+    edit_markers = (
+        "开始编辑", "开始修改", "现在修改", "现在开始修改", "现在开始编辑",
+        "我将修改", "我会修改", "马上修改", "需要修改", "需要补全",
+        "修改这", "编辑这", "补全这", "添加到", "写入",
+        "start editing", "start modifying", "i will edit", "i will modify",
+        "i'll edit", "i'll update", "let me edit", "let me update",
+    )
+    target_markers = (
+        "apply_patch", "write_file", "code_editor", "文件", "源码", "代码",
+        "ui/", "src/", ".py", ".js", ".ts", ".tsx", ".html", ".css",
+    )
+    return any(marker in text for marker in edit_markers) and any(marker in text for marker in target_markers)
+
+
+def _assistant_content_requests_blocking_input(content: str) -> bool:
+    text = (content or "").strip()
+    if not text or _assistant_content_says_complete(text):
+        return False
+    if _is_hard_blocking_input(text):
+        return True
+    lowered = text.lower()
+    ask_markers = (
+        "请你", "请直接回复", "需要你确认", "需要一个明确", "拿到", "目标页面",
+        "目标界面", "源码路径", "组件路径", "允许我", "如果你不清楚", "二选一",
+        "which page", "which file", "confirm", "choose one", "blocking",
+    )
+    blocking_markers = (
+        "阻塞", "无法继续", "没法", "不能安全", "没有找到", "缺少", "还没有拿到",
+        "blocked", "cannot continue", "missing", "need your input",
+    )
+    return any(marker in lowered for marker in ask_markers) and any(marker in lowered for marker in blocking_markers)
+
+
+def _autonomy_mode(task: dict | None) -> str:
+    value = str((task or {}).get("autonomy_mode") or "strong").strip().lower()
+    return value if value in {"strong", "balanced", "conservative"} else "strong"
+
+
+def _is_hard_blocking_input(content: str) -> bool:
+    text = (content or "").strip().lower()
+    if not text:
+        return False
+    hard_markers = (
+        "凭证", "密钥", "授权码", "验证码", "登录", "账号", "密码", "支付", "生产",
+        "真实设备", "外部账号", "无法访问本地目录", "本地目录不可访问", "连接器未连接",
+        "credential", "secret", "api key", "login", "password", "2fa", "captcha",
+        "production", "payment", "destructive", "dangerous",
+    )
+    destructive_markers = (
+        "删除大量", "清空", "重置", "回滚", "推送", "发布到生产",
+        "rm -rf", "git reset", "git push", "drop database",
+    )
+    explicit_pause = ("先暂停", "暂停", "停止等待", "stop", "pause")
+    return (
+        any(marker in text for marker in hard_markers)
+        or any(marker in text for marker in destructive_markers)
+        or any(marker in text for marker in explicit_pause)
+    )
+
+
+def _is_soft_entry_blocker(content: str) -> bool:
+    text = (content or "").strip()
+    if not text:
+        return False
+    soft_markers = (
+        "目标页面", "目标界面", "源码路径", "组件路径", "前端源码入口", "入口",
+        "run_ui.py", "ui 入口", "界面入口", "没有找到实际", "缺少明确入口",
+        "which page", "which file", "component path", "source entry", "entrypoint",
+    )
+    blocking_markers = (
+        "阻塞", "无法继续", "没法", "没有找到", "缺少", "还没有拿到",
+        "blocked", "cannot continue", "missing", "need your input",
+    )
+    lowered = text.lower()
+    return any(marker.lower() in lowered for marker in soft_markers) and any(marker in lowered for marker in blocking_markers)
+
+
+def _intervention_payload(
+    *,
+    intervention_type: str,
+    severity: str,
+    content: str,
+    choices: list[dict[str, str]],
+    default_action: str,
+    auto_resolved: bool,
+    agent_type: str,
+    iteration: int,
+    signature: str,
+) -> dict:
+    file_evidence = sorted(set(re.findall(
+        r"(?:^|[\s`'\"(（])((?:\.autocode|src|app|pages|components|lib|ui|backend|frontend|agent-platform|tests)/[A-Za-z0-9_./@()+\-]+\.[A-Za-z0-9]+|[A-Za-z0-9_.-]+\.py)",
+        content or "",
+    )))[:12]
+    summary = re.sub(r"\s+", " ", (content or "").strip())
+    return {
+        "type": intervention_type,
+        "severity": severity,
+        "question": summary[:300],
+        "full_text": content,
+        "evidence": {
+            "files": file_evidence,
+            "agent": agent_type,
+            "iteration": iteration,
+        },
+        "options": choices,
+        "default_action": default_action,
+        "auto_resolved": auto_resolved,
+        "signature": signature,
+        "created_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+    }
+
+
+def _auto_decision_for_soft_blocker(task: dict, *, task_id: str, agent_type: str, iteration: int, content: str) -> str:
+    normalized_content = re.sub(r"\s+", " ", (content or "").strip())[:2000]
+    signature = stable_hash({
+        "kind": "auto_decision",
+        "content": normalized_content,
+        "mode": _autonomy_mode(task),
+    })
+    choices = _blocking_input_choices(content)
+    default_action = (
+        "请基于现有上下文继续实现；缺少明确入口时按最合理位置新建或接入。"
+        "不要再次询问入口；先检查 .autocode/PROJECT_MAP.md、.autocode/SURFACE_MAP.md、"
+        "SESSION_SUMMARY.md 和已有候选文件。若没有现成入口，就按项目技术栈新建最接近的管理/风控入口，"
+        "完成后运行验证并在总结中写明入口位置。"
+    )
+    intervention = _intervention_payload(
+        intervention_type="soft_blocker",
+        severity="advisory",
+        content=content,
+        choices=choices,
+        default_action=default_action,
+        auto_resolved=True,
+        agent_type=agent_type,
+        iteration=iteration,
+        signature=signature,
+    )
+    task.setdefault("interventions", []).append(intervention)
+    append_event(
+        task,
+        "agent_auto_decision",
+        {
+            "agent": agent_type,
+            "iteration": iteration,
+            "reason": "soft_blocker_auto_resolved",
+            "signature": signature,
+            "intervention": intervention,
+            "default_action": default_action,
+        },
+        source="agent_autonomy",
+    )
+    task["autonomy_mode"] = _autonomy_mode(task)
+    task["current_step"] = "遇到软阻塞，已按强自主策略自动选择最合理入口继续。"
+    return f"[AGENT_AUTO_DECISION]\n{default_action}\n\n原始阻塞内容：\n{content[:1600]}"
+
+
+def _blocking_input_choices(content: str) -> list[dict[str, str]]:
+    text = content or ""
+    choices: list[dict[str, str]] = []
+    if re.search(r"(目标页面|目标界面|源码路径|组件路径|前端源码|page|component|source)", text, re.I):
+        contextual = (
+            ("群组列表页", "这个功能放在群组列表页；如果没有现成页面，请新建或接入最接近的群组管理入口。"),
+            ("群组详情页", "这个功能放在群组详情页；请接入现有详情入口，没有就按项目结构新建。"),
+            ("审核/风控页", "这个功能属于审核/风控页；请优先定位现有风控或管理入口，没有就新建。"),
+            ("后台管理页", "这个功能放在后台管理页；请按现有技术栈接入，没有对应入口就新建。"),
+        )
+        choices.append({
+            "label": "允许新建管理页",
+            "message": "允许你新建必要的群组管理/风控页面，并按现有项目技术栈接入入口和交互。",
+        })
+        choices.extend({"label": label, "message": message} for label, message in contextual)
+    if not choices:
+        choices.extend([
+            {"label": "继续并自行决定", "message": "请基于现有上下文继续实现；缺少明确入口时按最合理位置新建或接入。"},
+            {"label": "允许新建", "message": "允许你新建必要的文件或页面来完成这个功能。"},
+            {"label": "先暂停", "message": "先暂停，我稍后补充更多信息。"},
+        ])
+    return choices[:6]
+
+
+def _open_blocking_input_request(task: dict, *, task_id: str, agent_type: str, iteration: int, content: str) -> bool:
+    normalized_content = re.sub(r"\s+", " ", (content or "").strip())[:2000]
+    signature = stable_hash({
+        "kind": "user_input",
+        "content": normalized_content,
+    })
+    pending = task.get("pending_user_input") if isinstance(task.get("pending_user_input"), dict) else {}
+    if pending.get("signature") == signature:
+        return False
+
+    choices = _blocking_input_choices(content)
+    intervention = _intervention_payload(
+        intervention_type="hard_blocker",
+        severity="blocking",
+        content=content,
+        choices=choices,
+        default_action=choices[0]["message"] if choices else "",
+        auto_resolved=False,
+        agent_type=agent_type,
+        iteration=iteration,
+        signature=signature,
+    )
+    event = append_event(
+        task,
+        "intervention_opened",
+        {
+            "agent": agent_type,
+            "iteration": iteration,
+            "question": content,
+            "message": content,
+            "signature": signature,
+            "options": choices,
+            "allow_free_text": True,
+            "intervention": intervention,
+        },
+        source="agent_blocker",
+    )
+    append_event(
+        task,
+        "user_input_requested",
+        {
+            "agent": agent_type,
+            "iteration": iteration,
+            "question": content,
+            "message": content,
+            "signature": signature,
+            "options": choices,
+            "allow_free_text": True,
+            "intervention": intervention,
+        },
+        source="agent_blocker",
+    )
+    event_id = event.get("id") if isinstance(event, dict) else f"user-input-{task_id}-{signature[:12]}"
+    task["status"] = "waiting_user_input"
+    task["execution_active"] = False
+    task["needs_continuation"] = False
+    task["current_step"] = "等待用户选择处理方式或补充信息。"
+    task["pending_user_input"] = {
+        "event_id": event_id,
+        "question": content,
+        "message": content,
+        "signature": signature,
+        "options": choices,
+        "allow_free_text": True,
+        "intervention": intervention,
+        "requested_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+    }
+    task.setdefault("interventions", []).append(intervention)
+    return True
 
 def _is_validation_command(command: str) -> bool:
     lowered = str(command or "").lower()
@@ -487,16 +978,13 @@ def _is_documentation_phase(group_subtasks: list[Any], changed_files: list[str])
         "map existing", "entrypoint", "usage notes", "document", "docs",
         "readme", "define script contract", "smoke test and usage notes",
         "smoke test", "usage", "usage guide",
-        "濂戠害", "璁″垝", "瑙勫垝", "璁捐", "鏋舵瀯", "瑙勮寖", "璇存槑", "鏂囨。",
-        "姊崇悊", "鍏ュ彛", "浣跨敤璇存槑", "鍐掔儫娴嬭瘯", "鏄庣‘鑴氭湰濂戠害",
-        "濂戠害", "璁″垝", "瑙勫垝", "璁捐", "鏋舵瀯", "瑙勮寖", "璇存槑", "鏂囨。",
-        "姊崇悊", "鍏ュ彛", "浣跨敤璇存槑", "鍐掔儫娴嬭瘯", "鏄庣‘鑴氭湰濂戠害",
+        "契约", "计划", "规划", "设计", "架构", "规范", "说明", "文档",
+        "梳理", "入口", "使用说明", "冒烟测试", "明确脚本契约",
     )
     implementation_keywords = (
         "implement", "coding", "code", "core script behavior", "fix",
         "feature", "api", "frontend", "backend logic",
-        "瀹炵幇", "缂栫爜", "浠ｇ爜", "鏍稿績琛屼负", "淇", "鍔熻兘", "鍓嶇", "鍚庣閫昏緫",
-        "瀹炵幇", "缂栫爜", "浠ｇ爜", "鏍稿績琛屼负", "淇", "鍔熻兘", "鍓嶇", "鍚庣閫昏緫",
+        "实现", "编码", "代码", "核心行为", "修复", "功能", "前端", "后端逻辑",
     )
     if any(keyword in title_text for keyword in implementation_keywords):
         return False
@@ -535,6 +1023,220 @@ def _phase_expected_artifacts(ws_path: Path, group_subtasks: list[Any]) -> list[
     return result
 
 
+def _absolute_iteration_cap() -> int:
+    """Hard safety ceiling on total agent iterations within one continuation window.
+
+    Progress-aware auto-continuation grants each segment its full requested budget
+    until this ceiling is reached; only then is human confirmation required. The
+    window resets (via ``auto_continuation_budget_base``) whenever the user manually
+    approves continuation, so a genuinely-progressing task is never throttled.
+    """
+    try:
+        cap = int(os.getenv("AUTOCODE_ABSOLUTE_ITERATION_CAP", "10000"))
+    except (TypeError, ValueError):
+        cap = 10000
+    return max(1, cap)
+
+
+def _env_int(name: str, default: int, *, minimum: int = 0) -> int:
+    try:
+        value = int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        value = default
+    return max(minimum, value)
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return str(raw).strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _unrestricted_dev_mode(task: dict | None = None) -> bool:
+    if isinstance(task, dict) and "unrestricted_dev_mode" in task:
+        return bool(task.get("unrestricted_dev_mode"))
+    return _env_bool("AUTOCODE_UNRESTRICTED_DEV_MODE", True)
+
+
+def _remaining_absolute_iteration_budget(task: dict | None) -> int:
+    task = task or {}
+    cap = _absolute_iteration_cap()
+    try:
+        base = int(task.get("auto_continuation_budget_base") or 0)
+    except (TypeError, ValueError):
+        base = 0
+    try:
+        used = int(task.get("total_agent_iterations") or task.get("agent_iteration") or 0)
+    except (TypeError, ValueError):
+        used = 0
+    consumed_in_window = max(0, used - base)
+    return max(1, cap - consumed_in_window)
+
+
+def _cap_agent_iteration_budget(task: dict, requested: int) -> int:
+    remaining = _remaining_absolute_iteration_budget(task)
+    return max(1, min(requested, max(1, remaining)))
+
+
+def _progress_fingerprint(task: dict) -> tuple[int, int, int]:
+    """Cross-segment progress signal: (completed_subtasks, total_subtasks, changed_file_count).
+
+    Read from durable task state (``task['plan']`` and accumulated change snapshots),
+    so it is stable across auto-continuation segments and context compaction.
+    """
+    plan = task.get("plan") if isinstance(task.get("plan"), dict) else {}
+    subtasks = plan.get("subtasks") if isinstance(plan.get("subtasks"), list) else []
+    completed = 0
+    total = 0
+    for st in subtasks:
+        if not isinstance(st, dict):
+            continue
+        total += 1
+        if str(st.get("status") or "") == "completed":
+            completed += 1
+    try:
+        changed = len(_collect_completion_changed_files(task))
+    except Exception:
+        changed = 0
+    return completed, total, changed
+
+
+def _progress_watchdog_signature(
+    task: dict | None,
+    *,
+    changed_files: list[str] | None = None,
+    written_files: list[str] | None = None,
+    validation_command: str = "",
+    validation_exit_code: int | None = None,
+    validation_output: str = "",
+    pending_user_messages: int = 0,
+) -> dict[str, Any]:
+    task = task or {}
+    completed, total_subtasks, changed_count = _progress_fingerprint(task)
+    guard = task.get("retrieval_guard") if isinstance(task.get("retrieval_guard"), dict) else {}
+    candidate_files = [
+        str(path).replace("\\", "/")
+        for path in (guard.get("candidate_files") or [])
+        if str(path).strip()
+    ][:100]
+    changed = sorted({str(path).replace("\\", "/") for path in (changed_files or []) if str(path).strip()})[:200]
+    written = sorted({str(path).replace("\\", "/") for path in (written_files or []) if str(path).strip()})[:100]
+    validation_sig = ""
+    if validation_command:
+        validation_sig = stable_hash({
+            "command": validation_command,
+            "exit_code": validation_exit_code,
+            "output": (validation_output or "")[:4000],
+        })
+    return {
+        "completed_subtasks": completed,
+        "total_subtasks": total_subtasks,
+        "changed_file_count": max(changed_count, len(changed)),
+        "changed_files": changed,
+        "written_files": written,
+        "validation": validation_sig,
+        "candidate_files": candidate_files,
+        "pending_user_messages": int(pending_user_messages or 0),
+    }
+
+
+def _discovery_result_signature(result: str) -> str:
+    normalized_lines: list[str] = []
+    for raw in str(result or "").splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        normalized_lines.append(line[:500])
+        if len(normalized_lines) >= 120:
+            break
+    return stable_hash({"discovery_result": "\n".join(normalized_lines)})
+
+
+def _apply_progress_watchdog(
+    task: dict,
+    signature: dict[str, Any],
+    *,
+    iteration: int,
+    agent_type: str,
+    duplicate_discovery: bool = False,
+    discovery_progress: bool = False,
+    action_progress: bool = False,
+) -> dict[str, Any]:
+    watchdog = task.setdefault("progress_watchdog", {})
+    if not isinstance(watchdog, dict):
+        watchdog = {}
+        task["progress_watchdog"] = watchdog
+    previous = watchdog.get("last_signature") if isinstance(watchdog.get("last_signature"), dict) else None
+    made_progress = previous is None or previous != signature or bool(discovery_progress) or bool(action_progress)
+    was_forced = bool(watchdog.get("force_transition_pending"))
+
+    if made_progress:
+        watchdog["no_progress_iterations"] = 0
+        watchdog["no_progress_after_force"] = 0
+        if action_progress:
+            watchdog["force_transition_pending"] = False
+            watchdog["targeted_discovery_after_force"] = 0
+        elif was_forced and discovery_progress:
+            watchdog["targeted_discovery_after_force"] = int(watchdog.get("targeted_discovery_after_force") or 0) + 1
+            watchdog["force_transition_pending"] = True
+        else:
+            watchdog["force_transition_pending"] = False
+            watchdog["targeted_discovery_after_force"] = 0
+        watchdog.pop("stop_reason", None)
+    else:
+        watchdog["no_progress_iterations"] = int(watchdog.get("no_progress_iterations") or 0) + 1
+        if was_forced:
+            watchdog["no_progress_after_force"] = int(watchdog.get("no_progress_after_force") or 0) + 1
+
+    if duplicate_discovery:
+        watchdog["duplicate_discovery_streak"] = int(watchdog.get("duplicate_discovery_streak") or 0) + 1
+    elif made_progress:
+        watchdog["duplicate_discovery_streak"] = 0
+
+    no_progress_limit = _env_int("AUTOCODE_NO_PROGRESS_ITERATIONS", 2, minimum=1)
+    stop_after_force = _env_int("AUTOCODE_NO_PROGRESS_STOP_AFTER_FORCE", 2, minimum=1)
+    duplicate_limit = _env_int("AUTOCODE_DUPLICATE_DISCOVERY_LIMIT", 2, minimum=1)
+    targeted_discovery_limit = _env_int("AUTOCODE_TARGETED_DISCOVERY_AFTER_FORCE", 6, minimum=1)
+    force_transition = (
+        int(watchdog.get("no_progress_iterations") or 0) >= no_progress_limit
+        or duplicate_discovery
+        or int(watchdog.get("duplicate_discovery_streak") or 0) >= duplicate_limit
+        or bool(
+            was_forced
+            and discovery_progress
+            and not action_progress
+            and int(watchdog.get("targeted_discovery_after_force") or 0) > targeted_discovery_limit
+        )
+    )
+    stop = bool(
+        was_forced
+        and not made_progress
+        and int(watchdog.get("no_progress_after_force") or 0) >= stop_after_force
+    )
+    if _unrestricted_dev_mode(task):
+        stop = False
+    if force_transition and not stop:
+        if not watchdog.get("force_transition_pending"):
+            watchdog["forced_transition_count"] = int(watchdog.get("forced_transition_count") or 0) + 1
+        watchdog["force_transition_pending"] = True
+    if stop:
+        watchdog["stop_reason"] = "blocked_by_no_progress"
+        watchdog["force_transition_pending"] = False
+
+    watchdog["last_signature"] = signature
+    watchdog["last_iteration"] = iteration
+    watchdog["last_agent"] = agent_type
+    watchdog["last_progress_at"] = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+    return {
+        "made_progress": made_progress,
+        "force_transition": force_transition and not stop,
+        "stop": stop,
+        "reason": watchdog.get("stop_reason") or ("duplicate_discovery" if duplicate_discovery else "no_progress"),
+        "watchdog": dict(watchdog),
+    }
+
+
 def _agent_iteration_policy(task: dict | None, description: str, has_memory_context: bool) -> tuple[int, int]:
     """Return (max_iterations, context_compress_interval) for an agent run."""
     task = task or {}
@@ -543,8 +1245,8 @@ def _agent_iteration_policy(task: dict | None, description: str, has_memory_cont
     flow = str(recon.get("recommended_flow") or "")
     desc = (description or "").lower()
     if any(marker in desc for marker in ("ai 助手增量开发请求", "强制续改", "chat continuation", "continue development")):
-        continuation_iterations = int(os.getenv("AUTOCODE_CHAT_CONTINUATION_MAX_ITERATIONS", "24"))
-        return max(S0_LIGHT_MAX_ITERATIONS, continuation_iterations), 12
+        continuation_iterations = int(os.getenv("AUTOCODE_CHAT_CONTINUATION_MAX_ITERATIONS", "18"))
+        return _cap_agent_iteration_budget(task, max(S0_LIGHT_MAX_ITERATIONS, continuation_iterations)), 12
     is_s0_light = complexity == "S0" or flow in {"light_script", "light_tool"}
     if is_s0_light:
         is_contract_or_docs = any(
@@ -552,16 +1254,16 @@ def _agent_iteration_policy(task: dict | None, description: str, has_memory_cont
             for keyword in (
                 "define script contract", "script_contract.md", "contract",
                 "usage notes", "smoke test", "readme",
-                "鏄庣‘鑴氭湰濂戠害", "浣跨敤璇存槑", "鍐掔儫娴嬭瘯",
+                "明确脚本契约", "使用说明", "冒烟测试",
             )
         )
         max_iterations = S0_CONTRACT_MAX_ITERATIONS if is_contract_or_docs else S0_LIGHT_MAX_ITERATIONS
-        return max(4, max_iterations), max(24, max_iterations + 6)
+        return _cap_agent_iteration_budget(task, max(4, max_iterations)), max(24, max_iterations + 6)
 
     max_iterations = DEFAULT_MAX_ITERATIONS
     if has_memory_context:
-        max_iterations = int(DEFAULT_MAX_ITERATIONS * 1.5)
-    return max_iterations, 12
+        max_iterations = min(DEFAULT_MAX_ITERATIONS, 24)
+    return _cap_agent_iteration_budget(task, max_iterations), 12
 
 
 def _count_source_files(ws_path: Path) -> int:
@@ -569,7 +1271,7 @@ def _count_source_files(ws_path: Path) -> int:
     if not ws_path.exists():
         return 0
     for path in ws_path.rglob("*"):
-        if not path.is_file() or path.suffix not in SOURCE_FILE_SUFFIXES:
+        if not path.is_file():
             continue
         try:
             rel = path.relative_to(ws_path)
@@ -577,7 +1279,8 @@ def _count_source_files(ws_path: Path) -> int:
             continue
         if any(part in IGNORED_WORKSPACE_PARTS for part in rel.parts):
             continue
-        count += 1
+        if _is_implementation_file(rel.as_posix()):
+            count += 1
     return count
 
 
@@ -788,13 +1491,13 @@ def _build_completion_summary(task: dict, ws_path: Path) -> str:
 - 状态：{task.get("status")}
 - Agent 迭代：{result.get("iterations", task.get("agent_iteration", "-"))}
 - 自动快照：{len(snapshots)}
-- 代码审查：{review_line}
+- 产物审查：{review_line}
 - 预览地址：{preview}
 
-主要修改文件：
+主要产物或修改文件：
 {file_lines}{more}
 
-你可以在文件面板查看源码，在 Git 面板查看自动快照和 Diff，也可以继续在 AI 助手里要求我运行测试、打开文件或回退到某次提交。"""
+你可以在文件面板查看产物，在活动面板查看验证依据；代码任务还可以在 Git 面板查看自动快照和 Diff。"""
 
 
 def _collect_completion_changed_files(task: dict) -> list[str]:
@@ -812,6 +1515,36 @@ def _collect_completion_changed_files(task: dict) -> list[str]:
             if path and path not in changed_files:
                 changed_files.append(path)
     return changed_files
+
+
+def _meaningful_changed_file_list(changed_files: list[str] | tuple[str, ...] | set[str]) -> list[str]:
+    meaningful: list[str] = []
+    for raw in changed_files or []:
+        rel = str(raw or "").replace("\\", "/").lstrip("/")
+        if rel and not is_auxiliary_artifact(rel) and rel not in meaningful:
+            meaningful.append(rel)
+    return meaningful
+
+
+def _meaningful_completion_changed_files(task: dict) -> list[str]:
+    return _meaningful_changed_file_list(_collect_completion_changed_files(task))
+
+
+def _requires_real_change_for_completion(task: dict, execution_plan: dict | None, description: str = "") -> bool:
+    plan = execution_plan or {}
+    intent = str(plan.get("intent") or "").strip().lower()
+    if intent == "code_development":
+        return True
+    if intent in {"answer_only", "review_only", "run_command", "ide_action"}:
+        return False
+    if _execution_mode(task) == "agentic":
+        prompt = " ".join([
+            str(description or ""),
+            str(task.get("last_chat_continuation_message") or ""),
+            str(task.get("title") or ""),
+        ])
+        return is_actionable_development_request(prompt)
+    return False
 
 
 def _build_completion_summary(task: dict, ws_path: Path) -> str:
@@ -832,13 +1565,125 @@ def _build_completion_summary(task: dict, ws_path: Path) -> str:
 - 状态：{task.get("status")}
 - Agent 迭代：{result.get("iterations", task.get("agent_iteration", "-"))}
 - 自动快照：{len(snapshots)}
-- 代码审查：{review_line}
+- 产物审查：{review_line}
 - 预览地址：{preview}
 
-主要修改文件：
+主要产物或修改文件：
 {file_lines}{more}
 
-你可以在文件面板查看源码，在 Git 面板查看自动快照和 Diff，也可以继续在 AI 助手里要求我运行测试、打开文件或回退到某次提交。"""
+你可以在文件面板查看产物，在活动面板查看验证依据；代码任务还可以在 Git 面板查看自动快照和 Diff。"""
+
+
+def _build_completion_report(task: dict, ws_path: Path) -> dict:
+    result = task.get("last_agent_result") or {}
+    review = task.get("review") if isinstance(task.get("review"), dict) else {}
+    changed_files = _collect_completion_changed_files(task)
+    meaningful_changed_files = _meaningful_changed_file_list(changed_files)
+    phase_reviews = task.get("phase_reviews") or []
+    events = task.get("events") or []
+    validation_events = [
+        event for event in events
+        if str(event.get("type") or "") in {"artifact_verified", "local_snapshot_synced", "phase_ci_done", "tool_result"}
+        and isinstance(event.get("payload"), dict)
+    ]
+    validation_commands: list[str] = []
+    for record in task.get("command_history") or []:
+        command = str((record or {}).get("command") or "").strip()
+        if command and command not in validation_commands:
+            validation_commands.append(command)
+    for event in validation_events:
+        payload = event.get("payload") or {}
+        command = str(payload.get("command") or (payload.get("args") or {}).get("command") or "").strip()
+        if command and command not in validation_commands:
+            validation_commands.append(command)
+
+    review_score = review.get("score") if review else None
+    review_passed = bool(review.get("passed", True)) if review else None
+    advisory_risk = bool(review and not review.get("passed", True))
+    unresolved_items: list[str] = []
+    risk_items: list[str] = []
+    if not meaningful_changed_files and _requires_real_change_for_completion(task, task.get("active_execution_plan"), str(task.get("description") or "")):
+        unresolved_items.append("未检测到真实业务/源码文件变更。")
+    if review and not review.get("passed", True):
+        risk_items.append(f"产物审查未通过，评分 {review.get('score', '-')}，已作为 advisory 风险记录。")
+    if result and not result.get("validated_after_write") and result.get("writes_count"):
+        risk_items.append("检测到写入后未记录明确验证通过标记，请人工复核验证事件。")
+
+    report = {
+        "status": task.get("status"),
+        "autonomy_mode": _autonomy_mode(task),
+        "goal": task.get("title") or task.get("description") or task.get("id"),
+        "requirement_coverage": {
+            "summary": "已按当前任务目标执行；具体覆盖以变更文件、验证记录和审查结果为准。",
+            "changed_file_count": len(meaningful_changed_files),
+            "has_ui_entry_evidence": any(re.search(r"(ui|page|component|run_ui|app|src)", path, re.I) for path in meaningful_changed_files),
+        },
+        "ui_entry": {
+            "candidates": [path for path in meaningful_changed_files if re.search(r"(run_ui|ui|page|component|app|src)", path, re.I)][:10],
+            "note": "若任务涉及界面，优先在这些候选入口复现。",
+        },
+        "changed_files": meaningful_changed_files[:100],
+        "validation": {
+            "validated_after_write": bool(result.get("validated_after_write")),
+            "commands": validation_commands[:20],
+            "event_count": len(validation_events),
+        },
+        "review": {
+            "passed": review_passed,
+            "score": review_score,
+            "issue_count": len(review.get("issues") or []) if review else 0,
+            "phase_review_count": len(phase_reviews),
+            "advisory": advisory_risk,
+        },
+        "unresolved_items": unresolved_items,
+        "risks": risk_items,
+        "reproduce_steps": [
+            "打开文件面板查看 changed_files 中的主要改动。",
+            "按 validation.commands 中记录的命令复跑验证；若为空，请按项目 manifest 选择最小验证。",
+            "如果是本地导入项目，在本机运行对应 UI 入口确认功能可见。",
+        ],
+        "generated_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+    }
+    return report
+
+
+
+def _build_compact_context_state(task_snapshot: dict) -> dict:
+    """Build the durable state injected after context compaction."""
+    active_route = task_snapshot.get("active_intent_route") if isinstance(task_snapshot.get("active_intent_route"), dict) else {}
+    active_execution_plan = task_snapshot.get("active_execution_plan") if isinstance(task_snapshot.get("active_execution_plan"), dict) else {}
+    retrieval_guard = task_snapshot.get("retrieval_guard") if isinstance(task_snapshot.get("retrieval_guard"), dict) else {}
+    command_history = task_snapshot.get("command_history") if isinstance(task_snapshot.get("command_history"), list) else []
+    last_failed_command = next((
+        item for item in reversed(command_history)
+        if isinstance(item, dict) and str(item.get("status") or "").lower() in {"failed", "error"}
+    ), None)
+    last_agent_result = task_snapshot.get("last_agent_result") if isinstance(task_snapshot.get("last_agent_result"), dict) else {}
+    # 子任务进度：让 agent 压缩/续跑后一眼看到哪些子任务已完成、还剩哪些，避免重复劳动。
+    _plan = task_snapshot.get("plan") if isinstance(task_snapshot.get("plan"), dict) else {}
+    _subtasks = _plan.get("subtasks") if isinstance(_plan.get("subtasks"), list) else []
+    subtask_progress = [
+        {
+            "id": st.get("id"),
+            "title": st.get("title"),
+            "status": st.get("status") or "pending",
+        }
+        for st in _subtasks
+        if isinstance(st, dict)
+    ]
+    return {
+        "active_intent_route": active_route,
+        "active_execution_plan": active_execution_plan,
+        "current_target": active_execution_plan.get("target") or active_route.get("target"),
+        "candidate_files": list(retrieval_guard.get("candidate_files") or []),
+        "read_budget": retrieval_guard.get("read_budget"),
+        "read_files": list(retrieval_guard.get("read_files") or []),
+        "changed_files": list(last_agent_result.get("changed_files") or []),
+        "last_failed_command": last_failed_command,
+        "subtask_progress": subtask_progress,
+        "next_step": task_snapshot.get("current_step") or "",
+        "system_context_epoch": task_snapshot.get("system_context_epoch"),
+    }
 
 
 def _write_context_summary(ws_path: Path, task_id: str, agent_type: str, iteration: int, messages: list[dict]) -> str:
@@ -854,7 +1699,7 @@ def _write_context_summary(ws_path: Path, task_id: str, agent_type: str, iterati
             for tc in msg.get("tool_calls") or []:
                 function = tc.get("function") or {}
                 tool_names.append(function.get("name") or tc.get("name") or "?")
-            content = f"[宸ュ叿璋冪敤: {', '.join(tool_names)}]"
+            content = f"[工具调用: {', '.join(tool_names)}]"
         content = re.sub(r"\s+", " ", content)[:500] if content else "(empty)"
         recent_lines.append(f"- **{role}**: {content}")
 
@@ -894,21 +1739,31 @@ def _write_context_summary(ws_path: Path, task_id: str, agent_type: str, iterati
     return summary
 
 
-# 鈹€鈹€鈹€ 鐜鍙橀噺瑕嗙洊 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+# ─── 环境变量覆盖 ─────────────────────────────────────────────
 DEFAULT_MODEL = os.getenv("AUTOCODE_MODEL", "")
-DEFAULT_MAX_ITERATIONS = int(os.getenv("AUTOCODE_MAX_ITERATIONS", "60"))
+DEFAULT_MAX_ITERATIONS = int(os.getenv("AUTOCODE_MAX_ITERATIONS", "36"))
 S0_CONTRACT_MAX_ITERATIONS = int(os.getenv("AUTOCODE_S0_CONTRACT_MAX_ITERATIONS", "8"))
 S0_LIGHT_MAX_ITERATIONS = int(os.getenv("AUTOCODE_S0_LIGHT_MAX_ITERATIONS", "18"))
 MAX_INSTALL_RETRIES = int(os.getenv("AUTOCODE_MAX_INSTALL_RETRIES", "3"))
 
 
-# 鈹€鈹€鈹€ Agent System Prompt 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+# ─── Agent System Prompt ──────────────────────────────────────────
 AGENT_SYSTEM_PROMPTS = {
+    "general": """你是 AutoCode 通用执行 Agent。你根据当前 ExecutionPlan 完成代码、文档、电子表格、演示文稿、PDF、图片、数据或混合产物任务。
+
+关键要求：
+- 不使用有限项目类型或语言白名单；先读取执行计划、产物合同和候选上下文，再选择可用工具。
+- 只执行计划要求的阶段。不要因为存在或缺少某个 manifest 就擅自进入依赖安装、构建、预览或产物审查。
+- 代码任务使用与实际 manifest 和环境匹配的验证命令；非代码产物使用对应结构化工具和格式验证。
+- 达到 artifact_contracts 与 completion_checks 后立即总结并停止。缺少能力时明确报告 capability_unavailable。
+- 续跑或压缩恢复时复用已有 ExecutionPlan、PROJECT_PROFILE、RETRIEVAL_PLAN、MEMORY 和已读文件状态，不重新全量探索。
+- 使用中文简要汇报真实进展和验证结果。""",
+
     "frontend": """你是一个自主前端开发 Agent。收到任务后按 Agentic Loop 工作：观察项目结构，读取相关文件，做最小必要修改，运行构建或类型检查，失败则继续分析并修复。
 
 关键要求：
 - 不要一开始覆盖整个文件；优先 search_code/read_file 定位后再 apply_patch。
-- 写入后必须运行合适验证，例如 npm run build、npm test、tsc。
+- 写入后必须运行与 ExecutionPlan、真实 manifest 和产物格式匹配的验证；没有依据时不要猜测命令。
 - Next.js 静态导出项目必须避免不可导出的动态路由；动态路由需要 generateStaticParams。
 - 使用中文简要汇报真实进展。""",
 
@@ -922,11 +1777,24 @@ AGENT_SYSTEM_PROMPTS = {
 
     "devops": """你是一个自主 DevOps Agent。优先读取项目命令和部署配置，做最小必要修改，执行验证命令，失败则继续诊断。不要越权访问工作区外路径。""",
     "researcher": """你是一个技术调研 Agent。优先检索项目内索引和相关文件，输出清晰的技术判断、风险和建议。""",
+    "reviewer": """你是一个只读代码审查 Agent。你只做审查，不做修改。
+
+关键要求：
+- 只能使用只读工具（read_file / search_code / glob / lsp）定位并阅读相关代码，禁止任何写入或命令执行。
+- 聚焦被要求审查的范围：正确性、边界条件、错误处理、安全隐患、与需求的偏差。
+- 输出结构化结论：发现的问题（按严重度排序）、涉及的文件与行号、具体修改建议。
+- 不要泛泛而谈；没有确凿依据的猜测要标注为推测。
+- 用中文简要汇报审查结论。""",
 }
 
 
 def _agent_ownership_prompt(agent_type: str) -> str:
     policies = {
+        "general": {
+            "allowed": ["执行计划声明的目标及其必要依赖"],
+            "ask": ["工作区外或高风险目标"],
+            "avoid": ["与执行计划无关的文件"],
+        },
         "frontend": {
             "allowed": ["app/", "pages/", "src/", "components/", "styles/", "public/", "*.css", "*.tsx", "*.jsx", "*.vue"],
             "ask": ["API contract files", "package.json dependencies", "routing config"],
@@ -958,19 +1826,24 @@ def _agent_ownership_prompt(agent_type: str) -> str:
             "avoid": ["code changes"],
         },
     }
-    policy = policies.get(agent_type, policies["frontend"])
+    policy = policies.get(agent_type, policies.get("general", policies["frontend"]))
     return (
-        "## Agent 鏂囦欢鎵€鏈夋潈杈圭晫\n"
-        f"- 褰撳墠瑙掕壊: `{agent_type}`\n"
-        f"- 浼樺厛璐熻矗: {', '.join(policy['allowed'])}\n"
-        f"- 璺ㄨ竟鐣屼慨鏀瑰墠鍏堣鏄庣悊鐢? {', '.join(policy['ask'])}\n"
-        f"- 榛樿閬垮厤淇敼: {', '.join(policy['avoid'])}\n"
-        "- 濡傛灉蹇呴』璺ㄨ竟鐣屼慨鏀癸紝璇峰湪鍥炲涓槑纭鏄庡師鍥犮€佹秹鍙婃枃浠跺拰椋庨櫓銆俓n"
+        "## Agent 文件所有权边界\n"
+        f"- 当前角色: `{agent_type}`\n"
+        f"- 优先负责: {', '.join(policy['allowed'])}\n"
+        f"- 跨边界修改前先说明理由: {', '.join(policy['ask'])}\n"
+        f"- 默认避免修改: {', '.join(policy['avoid'])}\n"
+        "- 如果必须跨边界修改，请在回复中明确说明原因、涉及文件和风险。\n"
     )
 
 
 def _agent_ownership_prompt(agent_type: str) -> str:
     policies = {
+        "general": {
+            "allowed": ["执行计划声明的目标及其必要依赖"],
+            "ask": ["工作区外或高风险目标"],
+            "avoid": ["与执行计划无关的文件"],
+        },
         "frontend": {
             "allowed": ["app/", "pages/", "src/", "components/", "styles/", "public/", "*.css", "*.tsx", "*.jsx", "*.vue"],
             "ask": ["API contract files", "package.json dependencies", "routing config"],
@@ -1002,18 +1875,19 @@ def _agent_ownership_prompt(agent_type: str) -> str:
             "avoid": ["code changes"],
         },
     }
-    policy = policies.get(agent_type, policies["frontend"])
+    policy = policies.get(agent_type, policies.get("general", policies["frontend"]))
     return (
-        "## Agent 鏂囦欢鎵€鏈夋潈杈圭晫\n"
-        f"- 褰撳墠瑙掕壊: `{agent_type}`\n"
-        f"- 浼樺厛璐熻矗: {', '.join(policy['allowed'])}\n"
-        f"- 璺ㄨ竟鐣屼慨鏀瑰墠鍏堣鏄庣悊鐢? {', '.join(policy['ask'])}\n"
-        f"- 榛樿閬垮厤淇敼: {', '.join(policy['avoid'])}\n"
-        "- 濡傛灉蹇呴』璺ㄨ竟鐣屼慨鏀癸紝璇峰湪鍥炲涓槑纭鏄庡師鍥犮€佹秹鍙婃枃浠跺拰椋庨櫓銆俓n"
+        "## Agent 文件所有权边界\n"
+        f"- 当前角色: `{agent_type}`\n"
+        f"- 优先负责: {', '.join(policy['allowed'])}\n"
+        f"- 跨边界修改前先说明理由: {', '.join(policy['ask'])}\n"
+        f"- 默认避免修改: {', '.join(policy['avoid'])}\n"
+        "- 如果必须跨边界修改，请在回复中明确说明原因、涉及文件和风险。\n"
     )
 
 
 ROLE_FILE_OWNERSHIP = {
+    "general": ["*"],
     "frontend": [
         "app/", "pages/", "src/", "components/", "styles/", "public/",
         "package.json", "vite.config.", "next.config.", "tailwind.config.",
@@ -1092,7 +1966,7 @@ def _load_workspace_role_ownership(ws_path: Path | None) -> dict[str, list[str]]
         role = role.strip().lower()
         if not re.fullmatch(r"[a-zA-Z0-9_-]+", role):
             continue
-        parsed = [p.strip().strip("`") for p in re.split(r"[,锛宂", patterns) if p.strip()]
+        parsed = [p.strip().strip("`") for p in re.split(r"[,，\n]", patterns) if p.strip()]
         if parsed:
             rules[role] = parsed
     return rules
@@ -1129,7 +2003,7 @@ def _load_workspace_role_ownership(ws_path: Path | None) -> dict[str, list[str]]
         role = role.strip().lower()
         if not re.fullmatch(r"[a-zA-Z0-9_-]+", role):
             continue
-        parsed = [p.strip().strip("`") for p in re.split(r"[,锛孿n]", patterns) if p.strip()]
+        parsed = [p.strip().strip("`") for p in re.split(r"[,，\n]", patterns) if p.strip()]
         if parsed:
             rules[role] = parsed
     return rules
@@ -1169,7 +2043,7 @@ def _load_workspace_role_ownership(ws_path: Path | None) -> dict[str, list[str]]
             continue
         tokens = [
             item.strip().strip("`").strip("'\"")
-            for item in re.split(r"[,锛孿s]+", patterns)
+            for item in re.split(r"[,，\s]+", patterns)
             if item.strip()
         ]
         parsed = [item for item in tokens if item and item not in {"-", "[]"}]
@@ -1178,18 +2052,41 @@ def _load_workspace_role_ownership(ws_path: Path | None) -> dict[str, list[str]]
     return rules
 
 
+def _normalize_role_write_path(rel_path: str) -> str:
+    raw = str(rel_path or "").strip().replace("\\", "/")
+    if raw.startswith("/workspace/"):
+        raw = raw[len("/workspace/"):]
+    elif raw == "/workspace":
+        raw = ""
+    elif raw.startswith("workspace/"):
+        raw = raw[len("workspace/"):]
+    raw = raw.lstrip("/")
+    while raw.startswith("./"):
+        raw = raw[2:]
+    normalized = posixpath.normpath(raw) if raw else ""
+    if normalized == ".":
+        return ""
+    return normalized.lstrip("/")
+
+
 def _role_can_write_path(agent_type: str, rel_path: str, ws_path: Path | None = None) -> tuple[bool, str]:
-    normalized = rel_path.replace("\\", "/").lstrip("/")
+    normalized = _normalize_role_write_path(rel_path)
     if normalized.startswith(".autocode/CHAT.md") or normalized.startswith(".autocode/MEMORY.md"):
+        return True, ""
+    # scratch 豁免：临时/调试脚本（如探测换行符、验证片段）不受角色边界限制，
+    # 任何角色都可写 .autocode/scratch/ 下的文件，避免 agent 卡在文件所有权检查上。
+    if normalized.startswith(".autocode/scratch/"):
         return True, ""
     if normalized.startswith(".git/"):
         return False, "Git internal files are never writable by agents"
+    if _env_bool("AUTOCODE_DISABLE_ROLE_OWNERSHIP", _unrestricted_dev_mode()):
+        return True, ""
     workspace_rules = _load_workspace_role_ownership(ws_path)
     allowed = (
         workspace_rules.get(agent_type)
         or workspace_rules.get(agent_type.lower())
         or ROLE_FILE_OWNERSHIP.get(agent_type)
-        or ROLE_FILE_OWNERSHIP.get("frontend", [])
+        or ROLE_FILE_OWNERSHIP.get("general", [])
     )
     if any(_pattern_matches_path(p, normalized) for p in allowed):
         return True, ""
@@ -1203,7 +2100,129 @@ def _role_can_write_path(agent_type: str, rel_path: str, ws_path: Path | None = 
         return True, ""
     return False, (
         f"Role `{agent_type}` is not allowed to write `{normalized}`. "
-        "Use the owning role or update .autocode/ROLE_OWNERSHIP.md before crossing boundaries."
+        "Ask the user to approve this cross-boundary write or use the owning role; do not edit .autocode/ROLE_OWNERSHIP.md just to bypass the boundary. "
+        "临时调试脚本请写到 .autocode/scratch/ 下（任意角色可写）。"
+    )
+
+
+def _consume_role_write_grant(task: dict | None, agent_type: str, rel_path: str) -> bool:
+    if task is None:
+        return False
+    normalized = _normalize_role_write_path(rel_path)
+    grants = task.get("role_write_grants")
+    if not isinstance(grants, list):
+        return False
+    for grant in grants:
+        if not isinstance(grant, dict):
+            continue
+        if str(grant.get("agent_type") or "") != str(agent_type):
+            continue
+        if _normalize_role_write_path(str(grant.get("path") or "")) != normalized:
+            continue
+        uses_remaining = int(grant.get("uses_remaining") or 0)
+        if uses_remaining <= 0:
+            continue
+        grant["uses_remaining"] = uses_remaining - 1
+        grant["used"] = grant["uses_remaining"] <= 0
+        grant["used_at"] = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+        return True
+    return False
+
+
+def _grant_role_write_once(task: dict | None, agent_type: str, rel_path: str) -> None:
+    if task is None:
+        return
+    normalized = _normalize_role_write_path(rel_path)
+    if not normalized:
+        return
+    grants = task.setdefault("role_write_grants", [])
+    if not isinstance(grants, list):
+        grants = []
+        task["role_write_grants"] = grants
+    for grant in grants:
+        if not isinstance(grant, dict):
+            continue
+        if str(grant.get("agent_type") or "") == str(agent_type) and _normalize_role_write_path(str(grant.get("path") or "")) == normalized:
+            grant["uses_remaining"] = max(int(grant.get("uses_remaining") or 0), 10)
+            grant["used"] = False
+            grant["granted_at"] = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+            return
+    grants.append({
+        "agent_type": str(agent_type),
+        "path": normalized,
+        "granted_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        "used": False,
+        "uses_remaining": 10,
+    })
+
+
+def _should_auto_grant_local_role_write(task: dict | None, rel_path: str) -> bool:
+    if not task or not task.get("local_execution_enabled"):
+        return False
+    if str(os.getenv("AUTOCODE_AUTO_GRANT_LOCAL_ROLE_WRITES", "true")).strip().lower() in {"0", "false", "no", "off"}:
+        return False
+    normalized = _normalize_role_write_path(rel_path)
+    if not normalized or normalized.startswith(".git/") or normalized.startswith(".autocode/"):
+        return False
+    blocked_prefixes = ("dist/", "build/", ".next/", "node_modules/", "__pycache__/")
+    if normalized.startswith(blocked_prefixes):
+        return False
+    return True
+
+
+def _is_generated_artifact_path(rel_path: str) -> bool:
+    normalized = _normalize_role_write_path(rel_path).lower()
+    parts = [part for part in normalized.split("/") if part]
+    generated = {"dist", "build", ".next", "out", "target", "node_modules", "__pycache__"}
+    return any(part in generated or part.startswith("dist ") for part in parts)
+
+
+def _generated_artifact_read_block(task: dict | None, rel_path: str) -> str:
+    if not task or not _is_generated_artifact_path(rel_path):
+        return ""
+    guard = task.get("retrieval_guard") if isinstance(task.get("retrieval_guard"), dict) else {}
+    candidates = [
+        str(path).replace("\\", "/")
+        for path in (guard.get("candidate_files") or [])
+        if str(path).strip() and not _is_generated_artifact_path(str(path))
+    ][:20]
+    if not candidates:
+        return ""
+    return (
+        "[GENERATED_ARTIFACT_SUPPRESSED] 该路径位于 dist/build 等生成产物中。"
+        "当前任务已有源码候选文件，请回到源码文件修改，不要分析打包产物。\n"
+        + "\n".join(candidates)
+    )
+
+
+def _fast_edit_read_block(task: dict | None, tool_name: str, rel_path: str) -> str:
+    if not _unrestricted_dev_mode(task):
+        return ""
+    if tool_name not in {"read_file", "read_lines", "glob", "search_code"}:
+        return ""
+    guard = task.get("retrieval_guard") if isinstance(task, dict) and isinstance(task.get("retrieval_guard"), dict) else {}
+    candidate_files = [
+        _normalize_role_write_path(str(path))
+        for path in (guard.get("candidate_files") or [])
+        if str(path).strip()
+    ]
+    read_files = [
+        _normalize_role_write_path(str(path))
+        for path in (guard.get("read_files") or [])
+        if str(path).strip()
+    ]
+    limit = _env_int("AUTOCODE_FAST_EDIT_FILE_READ_LIMIT", 5, minimum=1)
+    if len(set(read_files)) < limit or not candidate_files:
+        return ""
+    normalized = _normalize_role_write_path(rel_path)
+    if normalized in candidate_files:
+        return ""
+    if tool_name == "read_lines" and normalized in candidate_files:
+        return ""
+    return (
+        "[FAST_EDIT_MODE_ENTERED] 已读取足够多关键文件，极速模式要求停止扩散 discovery。"
+        "请基于候选文件直接编辑、验证，或给出具体阻塞原因。\n"
+        + "\n".join(candidate_files[:30])
     )
 
 
@@ -1235,20 +2254,116 @@ async def _record_role_write_block(
                 "agent": agent_type,
                 "path": rel_path,
                 "reason": reason,
-                "ownership_file": ".autocode/ROLE_OWNERSHIP.md",
+                "recoverable": True,
+                "resolution": "request_user_approval_or_use_owning_role",
             },
             source="security",
         )
         persist(task_id)
 
 
+async def _await_role_write_confirmation(
+    *,
+    task_id: str,
+    agent_type: str,
+    rel_path: str,
+    reason: str,
+    tool_name: str,
+    tool_args: dict[str, Any],
+    persist,
+    log,
+    timeout_seconds: int = 300,
+) -> bool:
+    task = _tasks.get(task_id)
+    normalized = _normalize_role_write_path(rel_path)
+    if not task or not normalized:
+        return False
+    approval_id = f"approval-{uuid.uuid4().hex[:12]}"
+    approval_event = append_event(
+        task,
+        "approval_requested",
+        {
+            "approval_id": approval_id,
+            "tool": tool_name,
+            "action": "cross_boundary_write",
+            "path": normalized,
+            "agent": agent_type,
+            "reason": reason,
+            "message": reason,
+            "payload": {
+                "kind": "role_write_grant",
+                "action": "cross_boundary_write",
+                "path": normalized,
+                "tool": tool_name,
+                "tool_args": dict(tool_args or {}),
+            },
+            "auto_approve_after_seconds": 0,
+            "manual_required": True,
+            "high_risk": False,
+        },
+        source="security",
+    )
+    event_id = str(approval_event.get("id") or "")
+    task["status"] = "waiting_confirm"
+    task["pending_confirmation"] = {
+        "kind": "role_write_grant",
+        "action": "cross_boundary_write",
+        "path": normalized,
+        "reason": reason,
+        "event_id": event_id,
+        "approval_id": approval_id,
+        "payload": {
+            "tool": tool_name,
+            "tool_args": dict(tool_args or {}),
+            "path": normalized,
+        },
+        "manual_required": True,
+        "high_risk": False,
+        "auto_approve_after_seconds": 0,
+    }
+    persist(task_id)
+    log("warn", f"Waiting user confirm: cross-boundary-write {normalized}", agent_type)
+
+    waited = 0
+    while waited < timeout_seconds:
+        await asyncio.sleep(1)
+        waited += 1
+        conf = _confirmations.get(task_id)
+        if conf and (conf.get("approval_id") == approval_id or conf.get("event_id") == event_id):
+            _confirmations.pop(task_id, None)
+            task = _tasks.get(task_id)
+            approved = bool(conf.get("approved") or conf.get("confirmed"))
+            if task:
+                if approved:
+                    task["status"] = "running"
+                    task.pop("pending_confirmation", None)
+                    _grant_role_write_once(task, agent_type, normalized)
+                    persist(task_id)
+                    log("success", f"User approved cross-boundary write: {normalized}; executing original write", agent_type)
+                    return True
+                task["status"] = "cancelled"
+                task["current_step"] = "用户拒绝了跨角色写入"
+                task.pop("pending_confirmation", None)
+                persist(task_id)
+            return False
+        task = _tasks.get(task_id)
+        if task and task.get("status") == "cancelled":
+            return False
+
+    task = _tasks.get(task_id)
+    if task:
+        task.pop("pending_confirmation", None)
+        persist(task_id)
+    return False
+
+
 WORKSPACE_SECURITY_RULES = """
 
-瀹夊叏杈圭晫锛?
-- 鍙兘鎿嶄綔褰撳墠浠诲姟鐨?/workspace 鐩綍銆?
-- 绂佹璇诲彇銆佸垪鍑恒€佹悳绱㈡垨淇敼 /workspace/..銆佸涓绘満璺緞銆佸叾浠?workspace銆佺郴缁熺洰褰曞拰鐢ㄦ埛鐩綍銆?
-- 鎵€鏈?read_file/write_file/glob 璺緞蹇呴』鏄浉瀵硅矾寰勶紝鎴栦互 /workspace/ 寮€澶淬€?
-- bash 鍛戒护涓嶅緱浣跨敤 .. 璺緞绌胯秺锛屼笉寰楁壂鎻?/銆?workspace/..銆?data銆?tmp/autocode-workspaces 绛夌洰褰曘€?
+安全边界：
+- 只能操作当前任务工作区，或 Local Connector 已授权且执行计划明确指定的本地目录。
+- workspace 文件使用 workspace 工具；本地文件使用结构化 Local Connector 工具，不得混用或伪造路径。
+- 禁止目录穿越、扫描系统目录、访问其他任务工作区或未授权用户目录。
+- 高风险命令、越界路径和不可逆操作必须由权限引擎确认。
 """
 
 AGENT_SYSTEM_PROMPTS = {
@@ -1257,20 +2372,38 @@ AGENT_SYSTEM_PROMPTS = {
 }
 
 
-# 鈹€鈹€鈹€ Agent 宸ュ叿瀹氫箟锛圤penAI function calling 鏍煎紡锛夆攢鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+# ─── Agent 工具定义（OpenAI function calling 格式）──────────
 # Effective Agent tool schema is generated from the unified registry so model tool use,
 # permissions, activity labels, and local-runner capability stay aligned.
 AGENT_TOOLS = tool_registry.agent_tool_definitions()
 
 
+def _effective_agent_tools(task: dict | None):
+    """Return the tool set exposed to the current agent run.
+
+    Default is the full ``AGENT_TOOLS`` set (parent runs are unaffected). When a
+    task dict carries an ``allowed_tools`` allowlist (used by read-only spawned
+    subagents), the set is narrowed to that subset. An empty/absent allowlist
+    means "no restriction". Names not present in the registry are ignored.
+    """
+    if not isinstance(task, dict):
+        return AGENT_TOOLS
+    allowed = task.get("allowed_tools")
+    if not allowed:
+        return AGENT_TOOLS
+    allowed_set = {str(name) for name in allowed}
+    filtered = [tool for tool in AGENT_TOOLS if getattr(tool, "name", None) in allowed_set]
+    return filtered or AGENT_TOOLS
+
+
 class AgentOrchestrator:
     """
-    澶?Agent 缂栨帓鍣紙v2.0 鈥?Provider 鏃犲叧锛夈€?
+    Provider-agnostic Agent 编排器。
 
-    - 閫氳繃 channel_service 鍔ㄦ€侀€夋嫨鏈€浣崇殑 tool-capable 妯″瀷
-    - 浣跨敤 LLMClient 缁熶竴鎶借薄涓嶅悓 LLM 鎻愪緵鍟?
-    - 宸ュ叿瀹氫箟浣跨敤 OpenAI function calling 鏍煎紡
-    - 鍙?OpenCode 鏋舵瀯鍚彂
+    - 通过 channel_service 动态选择最佳的 tool-capable 模型
+    - 使用 LLMClient 统一抽象不同 LLM 提供商
+    - 工具定义使用 OpenAI function calling 格式
+    - 参考 OpenCode 架构设计
     """
 
     def __init__(self):
@@ -1279,37 +2412,40 @@ class AgentOrchestrator:
         self._active_tasks: dict[str, bool] = {}  # task_id -> running
         self._model: Optional[str] = None
         self._channel_config: Optional[dict] = None
-        # 瀵硅瘽娑堟伅闃熷垪锛氱敤鎴峰彂閫佺殑娑堟伅锛孉gent 寰幆鍙栬蛋澶勭悊
+        # 对话消息队列：用户发送的消息，Agent 循环取走处理
         self._user_message_queues: dict[str, list[dict]] = {}
-        # SSE 鎺ㄩ€侀槦鍒楋細Agent 澶勭悊缁撴灉鎺ㄩ€佺粰鍓嶇鐨勫璇?
+        # SSE 推送队列：Agent 处理结果推送给前端的对话
         self._chat_sse_queues: dict[str, asyncio.Queue] = {}
-        # 绛夊緟娑堟伅鐨勪簨浠讹細Agent 寰幆绛夊緟鐢ㄦ埛娑堟伅鏃朵娇鐢?
+        # 等待消息的事件：Agent 循环等待用户消息时使用
         self._message_events: dict[str, asyncio.Event] = {}
-        # 鏅鸿兘璺敱锛氭ā鍨嬭矾鐢卞櫒 + FailoverLLMClient 缂撳瓨
+        # 智能路由：模型路由器 + FailoverLLMClient 缓存
         self._router = model_router
         self._failover_clients: dict[str, FailoverLLMClient] = {}
         self._explicit_model_clients: dict[str, LLMClient] = {}
-        # 浠诲姟涓婁笅鏂囩紦瀛橈紙閬垮厤閲嶅妫€娴嬪鏉傚害锛?
+        # 任务上下文缓存（避免重复检测复杂度）
         self._task_contexts: dict[str, TaskContext] = {}
+        # Background read-only subagents keyed by parent task id.
+        self._background_subagents: dict[str, list[asyncio.Task]] = {}
 
     async def _ensure_client(self, ctx: TaskContext | None = None, requested_model: str | None = None) -> LLMClient | FailoverLLMClient:
         """
-        寤惰繜鍒濆鍖?LLM 瀹㈡埛绔€?
+        延迟初始化 LLM 客户端。
 
-        浼樺厛绾э細
-        1. 鐜鍙橀噺锛圓UTOCODE_MODEL锛夆啋 寮€鍙?娴嬭瘯鐜
-        2. 鏅鸿兘璺敱锛圡odelRouter锛夆啋 鐢熶骇鐜锛堟湁 TaskContext 鏃朵紭鍏堬級
-        3. 鍥為€€閫夋嫨锛坰elect_best_tool_model锛夆啋 鏁版嵁搴撴棤璺敱瑙勫垯鏃?
+        优先级：
+        1. 任务/用户显式指定模型：UI 选择的模型必须优先于智能路由
+        2. 环境变量 AUTOCODE_MODEL：用于开发和测试环境
+        3. ModelRouter 智能路由：未显式指定模型时使用 TaskContext
+        4. select_best_tool_model 回退：数据库没有路由规则时使用
         """
         requested_model = (requested_model or "").strip()
-        if requested_model and ctx is None:
+        if requested_model and requested_model.lower() != "auto":
             if requested_model in self._explicit_model_clients:
                 self._model = requested_model
                 return self._explicit_model_clients[requested_model]
 
             result = resolve_channel_for_model(requested_model)
             if not result:
-                raise RuntimeError(f"鎸囧畾妯″瀷涓嶅彲鐢ㄦ垨鏈厤缃笭閬? {requested_model}")
+                raise RuntimeError(f"指定模型不可用或未配置渠道: {requested_model}")
 
             channel, channel_model = result
             self._model = requested_model
@@ -1324,16 +2460,16 @@ class AgentOrchestrator:
             client = create_client_from_channel(self._channel_config, timeout=180.0)
             self._explicit_model_clients[requested_model] = client
             logger.info(
-                f"[Orchestrator] 浣跨敤浠诲姟鎸囧畾妯″瀷: {requested_model} "
+                f"[Orchestrator] 使用任务指定模型并跳过智能路由: {requested_model} "
                 f"via {channel.provider}/{channel.name}"
             )
             return client
 
-        # 濡傛灉宸叉湁瀹㈡埛绔笖鏃犳柊涓婁笅鏂囷紝鐩存帴杩斿洖
+        # 如果已有客户端且无新上下文，直接返回
         if self._llm is not None and ctx is None:
             return self._llm
 
-        # 浼樺厛浣跨敤鐜鍙橀噺閰嶇疆锛堥€傜敤浜庢湰鍦板紑鍙?娴嬭瘯鐜锛?
+        # 优先使用环境变量配置（适用于本地开发/测试环境）
         env_model = os.getenv("AUTOCODE_MODEL", "").strip()
         env_api_key = os.getenv("AUTOCODE_API_KEY", "").strip()
         env_base_url = os.getenv("AUTOCODE_BASE_URL", "").strip()
@@ -1346,7 +2482,7 @@ class AgentOrchestrator:
         )
 
         if env_model and env_api_key and not via_muhugochat:
-            logger.info(f"[Orchestrator] 浣跨敤鐜鍙橀噺閰嶇疆: model={env_model} provider={env_provider}")
+            logger.info(f"[Orchestrator] 使用环境变量配置: model={env_model} provider={env_provider}")
             self._model = env_model
             self._channel_config = {
                 "api_key": env_api_key,
@@ -1355,16 +2491,11 @@ class AgentOrchestrator:
                 "model": env_model,
             }
             self._llm = create_client_from_channel(self._channel_config, timeout=180.0)
-            logger.info(f"[Orchestrator] 宸插垵濮嬪寲 LLM 瀹㈡埛绔?(鐜鍙橀噺妯″紡)")
+            logger.info("[Orchestrator] 已初始化 LLM 客户端（环境变量模式）")
             return self._llm
 
-        # 鈹€鈹€ 鏅鸿兘璺敱妯″紡锛堢敓浜х幆澧冿級鈹€鈹€
+        # ── 智能路由模式（生产环境）──
         if ctx is not None:
-            if requested_model:
-                logger.info(
-                    "[Orchestrator] task requested model=%s; using routed failover mode for agent execution",
-                    requested_model,
-                )
             ctx_key = f"{ctx.agent_type}|{ctx.task_phase}|{ctx.complexity}"
             if ctx_key in self._failover_clients:
                 cached = self._failover_clients[ctx_key]
@@ -1375,16 +2506,16 @@ class AgentOrchestrator:
 
             try:
                 logger.info(
-                    f"[Orchestrator] 馃 鏅鸿兘璺敱: agent={ctx.agent_type} "
+                    f"[Orchestrator] 智能路由: agent={ctx.agent_type} "
                     f"phase={ctx.task_phase} complexity={ctx.complexity} "
                     f"caps={ctx.required_capabilities}"
                 )
                 candidates = await self._router.select(ctx)
 
                 if not candidates:
-                    logger.warning("[Orchestrator] 鏅鸿兘璺敱鏈壘鍒板€欓€夛紝鍥為€€鍒伴粯璁ら€夋嫨")
+                    logger.warning("[Orchestrator] 智能路由未找到候选，回退到默认选择")
                 else:
-                    # 鍒涘缓 FailoverLLMClient锛堜富妯″瀷 + 2 涓閫夛級
+                    # 创建 FailoverLLMClient（主模型 + 2 个备选）
                     fclient = FailoverLLMClient(candidates, base_timeout=180.0)
                     self._failover_clients[ctx_key] = fclient
 
@@ -1394,17 +2525,17 @@ class AgentOrchestrator:
                     self._llm = fclient._get_or_create_client(best)
 
                     logger.info(
-                        f"[Orchestrator] 鉁?鏅鸿兘璺敱閫夊畾: {best.model_id} "
+                        f"[Orchestrator] ✅ 智能路由选定: {best.model_id} "
                         f"(score={best.score:.3f} provider={best.provider}) "
-                        f"澶囬€? {[c.model_id for c in candidates[1:3]]}"
+                        f"备选: {[c.model_id for c in candidates[1:3]]}"
                     )
                     return fclient
 
             except Exception as e:
-                logger.warning(f"[Orchestrator] 鏅鸿兘璺敱澶辫触锛堝洖閫€鍒伴粯璁ら€夋嫨锛? {e}")
+                logger.warning(f"[Orchestrator] 智能路由失败（回退到默认选择）: {e}")
 
-        # 鈹€鈹€ 鍥為€€锛氫粠鏁版嵁搴撻€夋嫨妯″瀷锛堝吋瀹规棫閫昏緫锛夆攢鈹€
-        logger.info("[Orchestrator] 姝ｅ湪浠庢暟鎹簱閫夋嫨鏈€浣?tool 妯″瀷...")
+        # ── 回退：从数据库选择模型（兼容旧逻辑）──
+        logger.info("[Orchestrator] 正在从数据库选择最佳工具模型...")
 
         result = select_best_tool_model()
         if not result:
@@ -1426,7 +2557,7 @@ class AgentOrchestrator:
 
         self._llm = create_client_from_channel(self._channel_config, timeout=180.0)
         logger.info(
-            f"[Orchestrator] 宸插垵濮嬪寲 LLM 瀹㈡埛绔? "
+            f"[Orchestrator] 已初始化 LLM 客户端: "
             f"model={model_name} provider={channel.provider} base_url={channel.base_url}"
         )
         return self._llm
@@ -1438,25 +2569,25 @@ class AgentOrchestrator:
     def cancel_task(self, task_id: str):
         self._active_tasks[task_id] = False
 
-    # 鈹€鈹€鈹€ 瀵硅瘽娑堟伅鏈哄埗 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ─── 对话消息机制 ──────────────────────────────────────────
 
     def receive_user_message(self, task_id: str, message: str) -> asyncio.Queue:
-        """鎺ユ敹鐢ㄦ埛鍙戦€佺殑瀵硅瘽娑堟伅锛岃繑鍥?SSE 鎺ㄩ€侀槦鍒椼€?
+        """接收用户发送的对话消息，返回 SSE 推送队列。
         
-        濡傛灉浠诲姟涓嶅瓨鍦ㄦ垨涓嶅湪杩愯涓紝杩斿洖 None銆?
-        娑堟伅浼氭敞鍏ュ埌 Agent 寰幆涓紝Agent 鐨勬枃鏈搷搴斾細鎺ㄩ€佸埌杩斿洖鐨?Queue 涓€?
+        如果任务不存在或不在运行中，返回 None。
+        消息会注入到 Agent 循环中，Agent 的文本响应会推送到返回的 Queue 中。
         """
         if task_id not in _tasks:
             return None
         task = _tasks[task_id]
-        if task["status"] not in ("running", "waiting_confirm", "pending"):
+        if task["status"] not in ("running", "waiting_confirm", "waiting_user_input", "pending"):
             return None
 
-        # 鍒涘缓鎴栬幏鍙?SSE 鎺ㄩ€侀槦鍒?
+        # 创建或获取 SSE 推送队列
         if task_id not in self._chat_sse_queues:
             self._chat_sse_queues[task_id] = asyncio.Queue()
 
-        # 灏嗙敤鎴锋秷鎭姞鍏ラ槦鍒?
+        # 将用户消息加入队列
         input_id = f"input-{uuid.uuid4().hex[:16]}"
         admitted_at = datetime.utcnow().isoformat(timespec="seconds") + "Z"
         if task_id not in self._user_message_queues:
@@ -1562,11 +2693,11 @@ class AgentOrchestrator:
         except Exception as e:
             logger.debug(f"[Harness] Failed to add trace event: {e}")
 
-        # 濡傛灉鏈夌瓑寰呬簨浠讹紝瑙﹀彂瀹?
+        # 如果有等待事件，触发它
         if task_id in self._message_events:
             self._message_events[task_id].set()
 
-        # 涔熸妸鐢ㄦ埛娑堟伅鎺ㄩ€佸埌 SSE 闃熷垪锛堜綔涓虹‘璁ゅ洖鎵э級
+        # 也把用户消息推送到 SSE 队列（作为确认回执）
         self._chat_sse_queues[task_id].put_nowait({
             "type": "confirm",
             "content": "已收到你的指令，Agent 会根据当前任务状态处理。",
@@ -1746,10 +2877,10 @@ class AgentOrchestrator:
 
         desc = tool_registry.describe_invocation(tool_name, args)
 
-        # 鎴柇缁撴灉
-        summary = result[:500] if result else "(鏃犺緭鍑?"
+        # 截断结果
+        summary = result[:500] if result else "(无输出)"
         if len(result) > 500:
-            summary += "\n... (杈撳嚭杩囬暱锛屽凡鎴柇)"
+            summary += "\n...（输出过长，已截断）"
 
         if task_id in _tasks:
             _tasks[task_id].setdefault("logs", []).append({
@@ -1765,7 +2896,7 @@ class AgentOrchestrator:
             self._persist_task(task_id)
 
         try:
-            self._chat_sse_queues[task_id].put_nowait({
+            event_payload = {
                 "type": "tool_progress",
                 "tool_name": tool_name,
                 "description": desc,
@@ -1774,7 +2905,14 @@ class AgentOrchestrator:
                 "result_summary": summary,
                 "output_path": (output_meta or {}).get("full_path", ""),
                 "output_truncated": bool((output_meta or {}).get("truncated")),
-            })
+            }
+            if tool_name == "code_editor" and result and "\n" in result:
+                # code_editor 结果格式为 "[OK] 摘要\n{diff}"，diff 单独下发供前端渲染编辑卡片
+                _, diff_text = result.split("\n", 1)
+                if diff_text.strip():
+                    event_payload["diff"] = diff_text[:4000]
+                    event_payload["edit_command"] = str((args or {}).get("command") or "")
+            self._chat_sse_queues[task_id].put_nowait(event_payload)
         except asyncio.QueueFull:
             pass
 
@@ -1809,12 +2947,12 @@ class AgentOrchestrator:
         self._user_message_queues.pop(task_id, None)
         self._message_events.pop(task_id, None)
         self._task_contexts.pop(task_id, None)
-        # 娓呯悊璇ヤ换鍔＄浉鍏崇殑璺敱缂撳瓨
+        # 清理该任务相关的路由缓存
         keys_to_del = [k for k in self._failover_clients if k.startswith(f"{task_id}|")]
         for k in keys_to_del:
             self._failover_clients.pop(k, None)
 
-    # 鈹€鈹€鈹€ 宸ヤ綔绌洪棿璁板繂绯荤粺 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ─── 工作空间记忆系统 ──────────────────────────────────────
 
     def _init_workspace_memory(
         self, ws_path: Path, task_id: str,
@@ -1883,12 +3021,12 @@ class AgentOrchestrator:
         ])
         (autocode_dir / "MEMORY.md").write_text(memory_content, encoding="utf-8")
 
-        # 2.1.1 鍚屾鍒颁簲灞傝蹇?L2锛堟俯璁板繂锛? VFS锛堣交閲忔浛浠?ES/Milvus锛?
-        # best-effort锛氫换浣曞紓甯搁兘涓嶅奖鍝嶄换鍔′富娴佺▼
+        # 2.1.1 同步到五层记忆 L2（温记忆）/ VFS（轻量替代 ES/Milvus）
+        # best-effort：任何异常都不影响任务主流程
         try:
             memory_service.put_workspace_plan(task_id, plan_content)
             memory_service.put_workspace_memory(task_id, memory_content)
-            # 鍚屾椂灏嗘枃浠堕暅鍍忓埌 VFS /memory 渚夸簬璺ㄤ换鍔″叏鏂囨绱?
+            # 同时将文件镜像到 VFS /memory 便于跨任务全文检索
             from services.vfs_service import vfs
             vfs.write(f"/memory/{task_id}/PLAN.md", plan_content,
                       {"source": "workspace", "scope": "task", "scope_id": task_id,
@@ -1897,7 +3035,7 @@ class AgentOrchestrator:
                       {"source": "workspace", "scope": "task", "scope_id": task_id,
                        "privacy_level": "project", "tags": ["memory"]})
         except Exception as _e:
-            logger.warning(f"[Orchestrator] 璁板繂鍚屾澶辫触锛堝凡蹇界暐锛? {_e}")
+            logger.warning(f"[Orchestrator] 记忆同步失败（已忽略）: {_e}")
 
     def _update_workspace_memory(
         self, ws_path: Path, task_id: str,
@@ -1915,51 +3053,51 @@ class AgentOrchestrator:
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         content = mem_path.read_text(encoding="utf-8")
 
-        # 鏇存柊鐘舵€佽
+        # 更新状态行
         import re as _re
         content = _re.sub(
-            r'\*\*鐘舵€乗*\*:.*',
-            f'**鐘舵€?*: {status}',
+            r'\*\*状态\*\*:.*',
+            f'**状态**: {status}',
             content,
         )
         content = _re.sub(
-            r'\*\*褰撳墠闃舵\*\*:.*',
-            f'**褰撳墠闃舵**: {phase}',
+            r'\*\*当前阶段\*\*:.*',
+            f'**当前阶段**: {phase}',
             content,
         )
         content = _re.sub(
-            r'\*\*宸茬敤杩唬\*\*:\s*\d+',
-            f'**宸茬敤杩唬**: {iteration} / {DEFAULT_MAX_ITERATIONS}',
+            r'\*\*已用迭代\*\*:\s*\d+',
+            f'**已用迭代**: {iteration} / {DEFAULT_MAX_ITERATIONS}',
             content,
         )
 
         if completed_items:
             done_section = "\n".join(f"- [x] {item}" for item in completed_items)
             content = _re.sub(
-                r'## 宸插畬鎴怽n(?:- \[.\].*\n?)*',
-                f'## 宸插畬鎴怽n{done_section}\n',
+                r'## 已完成\n(?:- \[.\].*\n?)*',
+                f'## 已完成\n{done_section}\n',
                 content,
             )
 
         if issues:
             issue_section = "\n".join(f"- {item}" for item in issues)
             content = _re.sub(
-                r'## 閬囧埌鐨勯棶棰榎n(?:- .*\n?)*',
-                f'## 閬囧埌鐨勯棶棰榎n{issue_section}\n',
+                r'## 遇到的问题\n(?:- .*\n?)*',
+                f'## 遇到的问题\n{issue_section}\n',
                 content,
             )
 
         if decisions:
             dec_section = "\n".join(f"- {item}" for item in decisions)
             content = _re.sub(
-                r'## 鍏抽敭鍐崇瓥璁板綍\n(?:- .*\n?)*',
-                f'## 鍏抽敭鍐崇瓥璁板綍\n{dec_section}\n',
+                r'## 关键决策记录\n(?:- .*\n?)*',
+                f'## 关键决策记录\n{dec_section}\n',
                 content,
             )
 
         mem_path.write_text(content, encoding="utf-8")
 
-        # 2.1.2 鍚屾鐘舵€佸埌浜斿眰璁板繂 L2锛涘叧閿喅绛?闂钀?L3 鍐疯蹇嗭紙best-effort锛?
+        # 2.1.2 同步状态到五层记忆 L2；关键决策/问题落 L3 冷记忆（best-effort）
         try:
             memory_service.update_workspace_status(task_id, status, phase)
             from services.vfs_service import vfs
@@ -1968,7 +3106,7 @@ class AgentOrchestrator:
                        "privacy_level": "project", "tags": ["memory"]})
             if decisions:
                 memory_service.archive_cold(
-                    title=f"[{task_id[:8]}] 鍏抽敭鍐崇瓥", content="\n".join(f"- {d}" for d in decisions),
+                    title=f"[{task_id[:8]}] 关键决策", content="\n".join(f"- {d}" for d in decisions),
                     scope="task", scope_id=task_id, tags=["decision"],
                     related_tasks=[task_id], source="workspace_file")
             if issues:
@@ -1977,9 +3115,9 @@ class AgentOrchestrator:
                     scope="task", scope_id=task_id, tags=["issue"],
                     related_tasks=[task_id], source="workspace_file")
         except Exception as _e:
-            logger.warning(f"[Orchestrator] 璁板繂鍚屾澶辫触锛堝凡蹇界暐锛? {_e}")
+            logger.warning(f"[Orchestrator] 记忆同步失败（已忽略）: {_e}")
 
-    # 鈹€鈹€鈹€ 鏅鸿兘澶辫触鎭㈠ 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ─── 智能失败恢复 ──────────────────────────────────────────
 
     async def _diagnose_and_fix_install(
         self, workspace_id: str, ws_path: Path, log,
@@ -2128,15 +3266,15 @@ class AgentOrchestrator:
             task["current_step"] = "初始化工作空间"
             self._persist_task(task_id)
 
-            # 1. 纭繚 LLM 瀹㈡埛绔凡鍒濆鍖栵紙浣跨敤鏅鸿兘璺敱锛?
+            # 1. 确保 LLM 客户端已初始化（使用智能路由）
             task["progress"] = 5
             task["current_step"] = "分析任务复杂度并初始化 LLM"
 
-            # 1.1 妫€娴嬩换鍔″鏉傚害
+            # 1.1 检测任务复杂度
             exec_agents = [a for a in agent_types if a != "researcher"]
             task_complexity = ModelRouter.detect_complexity(description, len(exec_agents))
             logger.info(
-                f"[Orchestrator] 浠诲姟澶嶆潅搴? {task_complexity} "
+                f"[Orchestrator] 任务复杂度: {task_complexity} "
                 f"(agents={len(exec_agents)}, desc='{description[:80]}...')"
             )
             task["complexity"] = task_complexity
@@ -2145,7 +3283,7 @@ class AgentOrchestrator:
                 "agent_count": len(exec_agents),
             })
 
-            # 1.2 鏋勫缓 TaskContext 骞跺垵濮嬪寲璺敱瀹㈡埛绔?
+            # 1.2 构建 TaskContext 并初始化路由客户端
             primary_agent = exec_agents[0] if exec_agents else agent_types[0]
             global_ctx = TaskContext(
                 agent_type=primary_agent,
@@ -2158,15 +3296,15 @@ class AgentOrchestrator:
             await self._ensure_client(global_ctx, requested_model=task.get("model"))
             self._persist_task(task_id)
 
-            # 2. 鍒濆鍖?/ 澶嶇敤 Workspace
+            # 2. 初始化 / 复用 Workspace
             if task.get("needs_continuation") or task.get("chat_continuation_message"):
-                log("info", f"澶嶇敤 Workspace: {workspace_id}", "orchestrator")
+                log("info", f"复用 Workspace: {workspace_id}", "orchestrator")
             else:
-                log("info", f"鍒涘缓 Workspace: {workspace_id}", "orchestrator")
+                log("info", f"创建 Workspace: {workspace_id}", "orchestrator")
             await docker_manager.create_workspace(workspace_id, project_type)
             ws_path = self._settings.workspace_base_dir / workspace_id
 
-            # 鈹€鈹€ 鏂偣缁窇锛氭仮澶嶄笂娆′腑鏂殑杩涘害 鈹€鈹€
+            # ── 断点续跑：恢复上次中断的进度 ──
             last_session_path = ws_path / ".autocode" / "SESSION_SUMMARY.md"
             if task.get("needs_continuation") and last_session_path.exists():
                 try:
@@ -2188,7 +3326,7 @@ class AgentOrchestrator:
                 "project_type": project_type,
             })
 
-            # 2.1 鍐欏叆宸ヤ綔绌洪棿璁板繂鏂囦欢銆傜画璺?瀵硅瘽澧為噺鎵ц鏃朵繚鐣欏凡鏈夎鍒掍笌璁板繂銆?
+            # 2.1 写入工作空间记忆文件。跨轮对话增量执行时保留已有计划与记忆。
             preserve_memory = bool(task.get("needs_continuation") or task.get("chat_continuation_message"))
             if preserve_memory and (ws_path / ".autocode" / "PLAN.md").exists():
                 log("info", "保留已有工作空间记忆文件，进入续跑/增量执行模式", "orchestrator")
@@ -2196,20 +3334,20 @@ class AgentOrchestrator:
                 self._init_workspace_memory(ws_path, task_id, description, project_type, agent_types)
                 log("success", "工作空间记忆文件已初始化 (.autocode/PLAN.md, MEMORY.md)", "orchestrator")
 
-            # 3. 鍒濆鍖?Git
+            # 3. 初始化 Git
             git_manager.init(ws_path)
             log("success", "Git 仓库已初始化", "orchestrator")
 
-            # 4. 鍚姩 PTY 缁堢
+            # 4. 启动 PTY 终端
             terminal_manager.start_session(workspace_id, str(ws_path))
             log("info", "终端会话已启动", "orchestrator")
 
-            # 5. [Researcher 闃舵]
+            # 5. [Researcher 阶段]
             research_report = None
             if "researcher" in agent_types:
                 task["progress"] = 10
                 task["current_step"] = "Researcher 调研中"
-                log("info", "馃攳 鍚姩 Researcher Agent 璋冪爺闃舵", "orchestrator")
+                log("info", "启动 Researcher Agent 调研阶段", "orchestrator")
 
                 # 灏?LLM 瀹㈡埛绔厤缃紶缁?Researcher
                 researcher_agent.set_llm_config(self._llm, self._model)
@@ -2227,7 +3365,7 @@ class AgentOrchestrator:
                     self._format_research_report(research_report),
                     encoding="utf-8",
                 )
-                log("success", "馃搵 璋冪爺鎶ュ憡宸茬敓鎴愬苟淇濆瓨", "researcher")
+                log("success", "调研报告已生成并保存", "researcher")
                 task["research_report"] = research_report
 
                 if len(agent_types) == 1 and agent_types[0] == "researcher":
@@ -2241,13 +3379,13 @@ class AgentOrchestrator:
                     }, {"completed": True})
                     return
 
-            # 6. [Agent 鎵ц 鈥?鏀寔鏅鸿兘浠诲姟瑙勫垝]
+            # 6. [Agent 执行 — 支持智能任务规划]
             task["progress"] = 25
             task["current_step"] = "启动 Agent 执行"
 
             exec_agents = [a for a in agent_types if a != "researcher"]
 
-            # 鈹€鈹€ 妫€鏌ユ槸鍚︽湁浠诲姟瑙勫垝 鈹€鈹€
+            # ── 检查是否有任务规划 ──
             chat_continuation_message = str(task.pop("chat_continuation_message", "") or "").strip()
             if chat_continuation_message:
                 task["last_chat_continuation_message"] = chat_continuation_message
@@ -2269,40 +3407,49 @@ class AgentOrchestrator:
                     "AI 助手正在以 Agentic Loop 继续：自主检索、修改、验证。",
                 )
                 actionable_request = is_actionable_development_request(chat_continuation_message)
-                retrieval_plan = plan_retrieval(
-                    ws_path,
-                    chat_continuation_message,
-                    task,
-                    max_files=8 if actionable_request else 3,
-                )
-                retrieval_plan_text = render_retrieval_plan(retrieval_plan)
-                try:
-                    autocode_dir = ws_path / ".autocode"
-                    autocode_dir.mkdir(parents=True, exist_ok=True)
-                    (autocode_dir / "RETRIEVAL_PLAN.md").write_text(retrieval_plan_text, encoding="utf-8")
-                except Exception as exc:
-                    log("warn", f"鍐欏叆妫€绱㈣鍒掑け璐ワ細{exc}", "orchestrator")
-                task["retrieval_plan"] = retrieval_plan.to_dict()
-                task["retrieval_guard"] = {
-                    "active": True,
-                    "candidate_files": retrieval_plan.candidate_files,
-                    "index_docs": retrieval_plan.index_docs,
-                    "read_budget": retrieval_plan.read_budget,
-                    "read_files": [],
-                }
+                reused_retrieval_plan = _reuse_retrieval_plan(task, source="chat_continuation")
+                if reused_retrieval_plan:
+                    retrieval_plan_dict = reused_retrieval_plan
+                else:
+                    retrieval_plan = plan_retrieval(
+                        ws_path,
+                        chat_continuation_message,
+                        task,
+                        max_files=8 if actionable_request else 3,
+                    )
+                    retrieval_plan_text = render_retrieval_plan(retrieval_plan)
+                    try:
+                        autocode_dir = ws_path / ".autocode"
+                        autocode_dir.mkdir(parents=True, exist_ok=True)
+                        (autocode_dir / "RETRIEVAL_PLAN.md").write_text(retrieval_plan_text, encoding="utf-8")
+                    except Exception as exc:
+                        log("warn", f"写入检索计划失败：{exc}", "orchestrator")
+                    retrieval_plan_dict = retrieval_plan.to_dict()
+                    retrieval_plan_dict["system_context_epoch"] = task.get("system_context_epoch")
+                    task["retrieval_plan"] = retrieval_plan_dict
+                    previous_guard = task.get("retrieval_guard") if isinstance(task.get("retrieval_guard"), dict) else {}
+                    task["retrieval_guard"] = {
+                        "active": True,
+                        "candidate_files": retrieval_plan.candidate_files,
+                        "index_docs": retrieval_plan.index_docs,
+                        "read_budget": retrieval_plan.read_budget,
+                        "read_files": list(previous_guard.get("read_files") or []),
+                    }
                 self._persist_task(task_id)
                 await h_event("execution", "agentic_loop_start", {
                     "mode": "agentic",
                     "source": "chat_continuation",
                     "actionable": actionable_request,
-                    "candidate_files": retrieval_plan.candidate_files,
+                    "candidate_files": task.get("retrieval_guard", {}).get("candidate_files") or [],
+                    "retrieval_plan_reused": bool(reused_retrieval_plan),
                     "guardrails": task.get("guardrails"),
                 })
                 append_event(task, "agentic_loop_start", {
                     "mode": "agentic",
                     "source": "chat_continuation",
                     "actionable": actionable_request,
-                    "candidate_files": retrieval_plan.candidate_files,
+                    "candidate_files": task.get("retrieval_guard", {}).get("candidate_files") or [],
+                    "retrieval_plan_reused": bool(reused_retrieval_plan),
                     "guardrails": task.get("guardrails"),
                 }, source="orchestrator")
                 before_snapshot = _workspace_file_snapshot(ws_path)
@@ -2318,13 +3465,13 @@ class AgentOrchestrator:
                     task_plan=task_plan,
                 )
                 if _agent_needs_auto_continuation(task):
-                    log("info", "Agentic Loop 达到单段迭代上限，已交给后台队列自动续跑。", "orchestrator")
+                    log("info", "Agentic Loop 达到续跑保险丝，已交给后台队列处理。", "orchestrator")
                     _set_agentic_finish(
                         task,
                         status="checkpoint",
                         reason="iteration_limited",
                         retryable=True,
-                        message="Agentic Loop reached the per-run iteration budget and will continue automatically.",
+                        message="Agentic Loop reached the hard continuation safety gate and will continue through the queue.",
                     )
                     self._persist_task(task_id)
                     return
@@ -2332,15 +3479,18 @@ class AgentOrchestrator:
                 changed_result_files = _agent_changed_files(changed)
                 if changed_result_files:
                     changed_files = list(dict.fromkeys([*changed_files, *changed_result_files]))
-                if not changed_files and actionable_request:
+                meaningful_changed_files = _meaningful_changed_file_list(changed_files)
+                if not meaningful_changed_files and actionable_request:
                     _mark_agentic_no_change_retryable(task)
                     await h_event("execution", "agentic_loop_no_change_retryable", {
                         "message": chat_continuation_message[:1000],
                         "retrieval_plan": task.get("retrieval_plan"),
+                        "ignored_auxiliary_changes": changed_files[:100],
                     })
                     append_event(task, "agentic_loop_no_change_retryable", {
                         "message": chat_continuation_message[:1000],
                         "retrieval_plan": task.get("retrieval_plan"),
+                        "ignored_auxiliary_changes": changed_files[:100],
                     }, source="orchestrator")
                     self._persist_task(task_id)
                     return
@@ -2349,22 +3499,28 @@ class AgentOrchestrator:
                     task,
                     ws_path,
                     log,
-                    "AI 鍔╂墜 Agentic 澧為噺淇敼",
+                    "AI 助手 Agentic 增量修改",
                     [],
-                    changed_files,
+                    meaningful_changed_files,
                     guardrail_kind="agentic",
                 )
-                if not review_ok:
+                if not review_ok and _unrestricted_dev_mode(task):
+                    append_event(task, "review_advisory_finished", {
+                        "phase": "AI 助手 Agentic 增量修改",
+                        "blocking": False,
+                        "review": (task.get("phase_reviews") or [])[-1] if task.get("phase_reviews") else None,
+                    }, source="reviewer")
+                elif not review_ok:
                     _set_agentic_finish(
                         task,
                         status="blocked",
                         reason="guardrail_review_failed",
-                        changed_files=changed_files,
+                        changed_files=meaningful_changed_files,
                         review_passed=False,
                         blocked=True,
                         message="Agentic changes did not pass the review guardrail.",
                     )
-                    await h_fail("chat_continuation_review_failed", "AI 鍔╂墜 Agentic 澧為噺淇敼鏈€氳繃瀹℃煡", "high", {
+                    await h_fail("chat_continuation_review_failed", "AI 助手增量修改未通过产物审查", "high", {
                         "review": (task.get("phase_reviews") or [])[-1] if task.get("phase_reviews") else None,
                     })
                     self._persist_task(task_id)
@@ -2373,7 +3529,7 @@ class AgentOrchestrator:
                     task,
                     status="completed",
                     reason="changed_and_guardrails_passed",
-                    changed_files=changed_files,
+                    changed_files=meaningful_changed_files,
                     review_passed=True,
                     message="Agentic continuation produced changes and passed guardrail review.",
                 )
@@ -2385,31 +3541,46 @@ class AgentOrchestrator:
                 log("info", "AI 助手增量执行：基于当前工作区和用户最新指令继续修改。", "orchestrator")
                 self._push_phase_progress(task_id, "chat_continuation", "AI 助手正在基于当前工作区增量执行...")
                 actionable_request = is_actionable_development_request(chat_continuation_message)
-                retrieval_plan = plan_retrieval(
-                    ws_path,
-                    chat_continuation_message,
-                    task,
-                    max_files=8 if actionable_request else 3,
-                )
-                retrieval_plan_text = render_retrieval_plan(retrieval_plan)
-                try:
-                    autocode_dir = ws_path / ".autocode"
-                    autocode_dir.mkdir(parents=True, exist_ok=True)
-                    (autocode_dir / "RETRIEVAL_PLAN.md").write_text(retrieval_plan_text, encoding="utf-8")
-                except Exception as exc:
-                    log("warn", f"鍐欏叆妫€绱㈣鍒掑け璐ワ細{exc}", "orchestrator")
-                task["retrieval_plan"] = retrieval_plan.to_dict()
-                task["retrieval_guard"] = {
-                    "active": True,
-                    "candidate_files": retrieval_plan.candidate_files,
-                    "index_docs": retrieval_plan.index_docs,
-                    "read_budget": retrieval_plan.read_budget,
-                    "read_files": [],
-                }
+                reused_retrieval_plan = _reuse_retrieval_plan(task, source="single_agent_chat_continuation")
+                if reused_retrieval_plan:
+                    retrieval_plan_text = render_retrieval_plan(RetrievalPlan(
+                        intent=str(reused_retrieval_plan.get("intent") or "continue_development"),
+                        search_terms=list(reused_retrieval_plan.get("search_terms") or []),
+                        candidate_files=list(reused_retrieval_plan.get("candidate_files") or []),
+                        index_docs=list(reused_retrieval_plan.get("index_docs") or []),
+                        read_budget=int(reused_retrieval_plan.get("read_budget") or 12),
+                        rationale=list(reused_retrieval_plan.get("rationale") or []),
+                        total_files=int(reused_retrieval_plan.get("total_files") or 0),
+                    ))
+                else:
+                    retrieval_plan = plan_retrieval(
+                        ws_path,
+                        chat_continuation_message,
+                        task,
+                        max_files=8 if actionable_request else 3,
+                    )
+                    retrieval_plan_text = render_retrieval_plan(retrieval_plan)
+                    try:
+                        autocode_dir = ws_path / ".autocode"
+                        autocode_dir.mkdir(parents=True, exist_ok=True)
+                        (autocode_dir / "RETRIEVAL_PLAN.md").write_text(retrieval_plan_text, encoding="utf-8")
+                    except Exception as exc:
+                        log("warn", f"写入检索计划失败：{exc}", "orchestrator")
+                    retrieval_plan_dict = retrieval_plan.to_dict()
+                    retrieval_plan_dict["system_context_epoch"] = task.get("system_context_epoch")
+                    task["retrieval_plan"] = retrieval_plan_dict
+                    previous_guard = task.get("retrieval_guard") if isinstance(task.get("retrieval_guard"), dict) else {}
+                    task["retrieval_guard"] = {
+                        "active": True,
+                        "candidate_files": retrieval_plan.candidate_files,
+                        "index_docs": retrieval_plan.index_docs,
+                        "read_budget": retrieval_plan.read_budget,
+                        "read_files": list(previous_guard.get("read_files") or []),
+                    }
                 self._persist_task(task_id)
                 log(
                     "info",
-                    f"妫€绱㈣鍒掑凡鐢熸垚锛氬€欓€夋枃浠?{len(retrieval_plan.candidate_files)} 涓紝璇诲彇棰勭畻 {retrieval_plan.read_budget}",
+                    f"检索计划已{'复用' if reused_retrieval_plan else '生成'}：候选文件 {len((task.get('retrieval_guard') or {}).get('candidate_files') or [])} 个，读取预算 {(task.get('retrieval_guard') or {}).get('read_budget')}",
                     "orchestrator",
                     retrieval_plan_text,
                 )
@@ -2450,7 +3621,8 @@ class AgentOrchestrator:
                 changed_result_files = _agent_changed_files(changed)
                 if changed_result_files:
                     changed_files = list(dict.fromkeys([*changed_files, *changed_result_files]))
-                if not changed_files:
+                meaningful_changed_files = _meaningful_changed_file_list(changed_files)
+                if not meaningful_changed_files:
                     if actionable_request:
                         retry_prompt = continuation_prompt + "\n\n" + "\n".join([
                             "## 强制续改",
@@ -2481,16 +3653,17 @@ class AgentOrchestrator:
                         changed_result_files = _agent_changed_files(changed)
                         if changed_result_files:
                             changed_files = list(dict.fromkeys([*changed_files, *changed_result_files]))
-                    if not changed_files:
+                        meaningful_changed_files = _meaningful_changed_file_list(changed_files)
+                    if not meaningful_changed_files:
                         if actionable_request:
-                            log("error", "鏄庣‘淇敼娓呭崟鎵ц鍚庝粛鏃犳枃浠跺彉鏇达紝鏍囪涓?Agent 鎵ц澶辫触", "orchestrator")
+                            log("error", "执行明确修改清单后仍无文件变更，标记为 Agent 执行失败", "orchestrator")
                             task["status"] = "failed"
-                            task["current_step"] = "AI 鍔╂墜鏈兘鎵ц鏄庣‘淇敼娓呭崟"
+                            task["current_step"] = "AI 助手未能执行明确修改清单"
                             task["needs_continuation"] = True
                             if isinstance(task.get("retrieval_guard"), dict):
                                 task["retrieval_guard"]["active"] = False
                             self._persist_task(task_id)
-                            await h_fail("chat_continuation_no_changes", "AI 鍔╂墜鏈兘鎵ц鏄庣‘淇敼娓呭崟", "medium", {
+                            await h_fail("chat_continuation_no_changes", "AI 助手未能执行明确修改清单", "medium", {
                                 "reason": "actionable_request_produced_no_changes",
                                 "message": chat_continuation_message[:1000],
                                 "retrieval_plan": task.get("retrieval_plan"),
@@ -2501,7 +3674,7 @@ class AgentOrchestrator:
                             "我检查了当前工作区记忆、项目地图和最近会话，但这次没有得到足够明确的修改目标，"
                             "因此没有强行改文件。请直接描述具体想改变的行为、报错、输出格式或页面效果，我会继续基于当前项目处理。"
                         )
-                        log("warn", "AI 鍔╂墜澧為噺鎵ц鏈骇鐢熸枃浠跺彉鏇达紝宸茬瓑寰呮洿鍏蜂綋鍙嶉", "orchestrator")
+                        log("warn", "AI 助手增量执行未产生文件变更，已等待更具体的反馈", "orchestrator")
                         self._push_agent_response(task_id, clarification)
                         task["status"] = "completed"
                         task["progress"] = max(task.get("progress", 0), 100)
@@ -2525,12 +3698,18 @@ class AgentOrchestrator:
                     task,
                     ws_path,
                     log,
-                    "AI 鍔╂墜澧為噺淇敼",
+                    "AI 助手增量修改",
                     [],
-                    changed_files,
+                    meaningful_changed_files,
                 )
-                if not review_ok:
-                    await h_fail("chat_continuation_review_failed", "AI 鍔╂墜澧為噺淇敼鏈€氳繃瀹℃煡", "high", {
+                if not review_ok and _unrestricted_dev_mode(task):
+                    append_event(task, "review_advisory_finished", {
+                        "phase": "AI 助手增量修改",
+                        "blocking": False,
+                        "review": (task.get("phase_reviews") or [])[-1] if task.get("phase_reviews") else None,
+                    }, source="reviewer")
+                elif not review_ok:
+                    await h_fail("chat_continuation_review_failed", "AI 助手增量修改未通过产物审查", "high", {
                         "review": (task.get("phase_reviews") or [])[-1] if task.get("phase_reviews") else None,
                     })
                     self._persist_task(task_id)
@@ -2576,18 +3755,19 @@ class AgentOrchestrator:
                     task_plan=task_plan,
                 )
                 if _agent_needs_auto_continuation(task):
-                    task["current_step"] = "Agentic Loop 达到单段迭代上限，正在自动压缩上下文并继续。"
+                    task["current_step"] = "Agentic Loop 达到续跑保险丝，正在保存上下文并交给后台队列。"
                     _set_agentic_finish(
                         task,
                         status="checkpoint",
                         reason="iteration_limited",
                         retryable=True,
-                        message="Agentic Loop reached the per-run iteration budget and will continue automatically.",
+                        message="Agentic Loop reached the hard continuation safety gate and will continue through the queue.",
                     )
                     self._persist_task(task_id)
                     self._push_phase_progress(task_id, "auto_continuation_checkpoint", task["current_step"])
                     return
-                if not changed and is_actionable_development_request(description):
+                agentic_changed_files = _meaningful_changed_file_list(_agent_changed_files(changed))
+                if not agentic_changed_files and is_actionable_development_request(description):
                     _mark_agentic_no_change_retryable(task)
                     await h_event("execution", "agentic_loop_no_change_retryable", {
                         "message": description[:1000],
@@ -2603,12 +3783,12 @@ class AgentOrchestrator:
                     task,
                     status="checkpoint",
                     reason="agentic_run_completed_pending_final_guardrails",
-                    changed_files=_agent_changed_files(changed),
+                    changed_files=agentic_changed_files,
                     message="Agentic execution finished its active loop; final task guardrails will decide completion.",
                 )
 
             elif task_plan and task_plan.subtasks:
-                # 鈹€鈹€ 璁″垝椹卞姩妯″紡锛氭寜鎵ц鍒嗙粍渚濇鎵ц瀛愪换鍔?鈹€鈹€
+                # ── 计划驱动模式：按执行分组依次执行子任务 ──
                 log("info", f"进入计划驱动模式：{len(task_plan.subtasks)} 个子任务，{len(task_plan.execution_groups)} 个执行组", "orchestrator")
                 await h_event("planning", "plan_ready", {
                     "subtask_count": len(task_plan.subtasks),
@@ -2616,8 +3796,8 @@ class AgentOrchestrator:
                 })
                 self._push_phase_progress(task_id, "plan_execution", f"开始执行 {len(task_plan.subtasks)} 个子任务...")
 
-                # 鈹€鈹€ 6.0 鍘熷瀷鐢熸垚涓庣‘璁わ紙璁″垝纭鍚庛€佸瓙浠诲姟鎵ц鍓嶏級鈹€鈹€
-                # 鍘熷瀷椹卞姩寮€鍙戯細鍏堟牴鎹鍒掔敓鎴?UI 鍘熷瀷锛岀敤鎴风‘璁ゅ悗鍐嶆墽琛屼唬鐮佸紑鍙?
+                # ── 6.0 原型生成与确认（计划确认后、子任务执行前）──
+                # 原型驱动开发：先根据计划生成 UI 原型，用户确认后再执行代码开发
                 recon_requires_prototype = task.get("prototype_required")
                 requires_prototype = (
                     bool(recon_requires_prototype)
@@ -2642,7 +3822,7 @@ class AgentOrchestrator:
                         "当前任务不需要 UI 原型，继续进入开发。"
                     )
 
-                # 妫€鏌ユ槸鍚﹁鍙栨秷鎴栬秴鏃?
+                # 检查是否被取消或超时
                 if task.get("status") == "cancelled":
                     return
 
@@ -2686,14 +3866,14 @@ class AgentOrchestrator:
                     self._push_phase_progress(task_id, "group_start", f"{group_label}: {', '.join(s.title for s in group_subtasks)}")
                     group_before_snapshot = _workspace_file_snapshot(ws_path)
 
-                    # 鏇存柊瑙勫垝涓殑瀛愪换鍔＄姸鎬?
+                    # 更新规划中的子任务状态
                     for st in group_subtasks:
                         st.status = SubTaskStatus.running
                         st.progress = 0
                         task["current_subtask_id"] = st.id
                     self._sync_plan_to_task(task_id, task_plan)
 
-                    # 鍚岀粍鍐呭苟琛屾墽琛?
+                    # 同组内并行执行
                     if len(group_subtasks) == 1:
                         st = group_subtasks[0]
                         await self._execute_subtask(
@@ -2716,12 +3896,14 @@ class AgentOrchestrator:
                             return_exceptions=True,
                         )
                         for result in results:
+                            if isinstance(result, AgentWaitingForUserInput):
+                                raise result
                             if isinstance(result, Exception):
                                 log("error", f"{group_label} subtask raised: {result}", "orchestrator")
                         completed_count += sum(1 for st in group_subtasks if st.status == SubTaskStatus.completed)
 
                     if _agent_needs_auto_continuation(task):
-                        task["current_step"] = f"{group_label} 杈惧埌鍗曟杩唬涓婇檺锛屾鍦ㄨ嚜鍔ㄥ帇缂╀笂涓嬫枃骞剁画璺?.."
+                        task["current_step"] = f"{group_label} 达到单段迭代上限，正在自动压缩上下文并续跑..."
                         self._sync_plan_to_task(task_id, task_plan)
                         self._persist_task(task_id)
                         self._push_phase_progress(
@@ -2735,7 +3917,7 @@ class AgentOrchestrator:
                     if failed_subtasks:
                         task["status"] = "failed"
                         task["current_subtask_id"] = failed_subtasks[0].id
-                        task["current_step"] = f"{group_label}澶辫触: {', '.join(st.title for st in failed_subtasks)}"
+                        task["current_step"] = f"{group_label} 失败: {', '.join(st.title for st in failed_subtasks)}"
                         await h_fail("subtask_failed", task["current_step"], "high", {
                             "group": group_label,
                             "failed_subtasks": [{"id": st.id, "title": st.title} for st in failed_subtasks],
@@ -2744,11 +3926,11 @@ class AgentOrchestrator:
                         self._persist_task(task_id)
                         self._push_phase_progress(
                             task_id, "group_failed",
-                            f"{group_label}澶辫触: {', '.join(st.title for st in failed_subtasks)}"
+                            f"{group_label} 失败: {', '.join(st.title for st in failed_subtasks)}"
                         )
                         return
 
-                    # 鏇存柊杩涘害
+                    # 更新进度
                     task["progress"] = 25 + int((completed_count / total_subtasks) * 50)
                     await h_event("execution", "group_complete", {
                         "group": group_label,
@@ -2757,7 +3939,7 @@ class AgentOrchestrator:
                     })
                     self._push_phase_progress(
                         task_id, "group_complete",
-                        f"鉁?{group_label}瀹屾垚 ({completed_count}/{total_subtasks})"
+                        f"{group_label} 完成 ({completed_count}/{total_subtasks})"
                     )
                     group_changed_files = _snapshot_changed(group_before_snapshot, _workspace_file_snapshot(ws_path))
 
@@ -2769,7 +3951,13 @@ class AgentOrchestrator:
                         "passed": review_ok,
                         "review": (task.get("phase_reviews") or [])[-1] if task.get("phase_reviews") else None,
                     })
-                    if not review_ok:
+                    if not review_ok and _unrestricted_dev_mode(task):
+                        append_event(task, "review_advisory_finished", {
+                            "phase": group_label,
+                            "blocking": False,
+                            "review": (task.get("phase_reviews") or [])[-1] if task.get("phase_reviews") else None,
+                        }, source="reviewer")
+                    elif not review_ok:
                         await h_fail("phase_review_failed", f"{group_label} code review failed", "high", {
                             "group": group_label,
                             "review": (task.get("phase_reviews") or [])[-1] if task.get("phase_reviews") else None,
@@ -2778,27 +3966,27 @@ class AgentOrchestrator:
                         return
 
                 task["current_subtask_id"] = None
-                log("success", f"馃幆 璁″垝椹卞姩鎵ц瀹屾垚: {completed_count}/{total_subtasks} 涓瓙浠诲姟", "orchestrator")
+                log("success", f"计划驱动执行完成: {completed_count}/{total_subtasks} 个子任务", "orchestrator")
 
-                # 鈹€鈹€ 瀛愪换鍔℃墽琛屽畬鎴愬悗锛岀洿鎺ヨ繘鍏ユ瀯寤洪樁娈?鈹€鈹€
-                # 锛堣鍒掓墽琛屾ā寮忎笉闇€瑕佸啀娆¤皟鐢?Agent锛?
+                # ── 子任务执行完成后，直接进入构建阶段 ──
+                # （计划执行模式不需要再次调用 Agent）
 
             elif len(exec_agents) == 1:
-                # 鈹€鈹€ 鏃犺鍒掞紝鍗?Agent 妯″紡 鈹€鈹€
+                # ── 无规划，单 Agent 模式 ──
                 changed = await self._run_single_agent(
                     task_id, description, project_type,
                     workspace_id, exec_agents[0], ws_path, log, research_report,
                 )
                 if _agent_needs_auto_continuation(task):
-                    task["current_step"] = "杈惧埌鍗曟杩唬涓婇檺锛屾鍦ㄨ嚜鍔ㄥ帇缂╀笂涓嬫枃骞剁画璺?.."
+                    task["current_step"] = "达到单段迭代上限，正在自动压缩上下文并续跑..."
                     self._persist_task(task_id)
                     self._push_phase_progress(task_id, "auto_continuation_checkpoint", task["current_step"])
                     return
                 if not changed:
                     raise RuntimeError("Agent produced no file changes; refusing to continue to review/build.")
             else:
-                # 鈹€鈹€ 鏃犺鍒掞紝骞惰 Agent 妯″紡 鈹€鈹€
-                log("info", f"馃殌 骞惰鍚姩 {len(exec_agents)} 涓?Agent", "orchestrator")
+                # ── 无规划，并行 Agent 模式 ──
+                log("info", f"并行启动 {len(exec_agents)} 个 Agent", "orchestrator")
                 task_obj = _tasks.get(task_id)
                 if task_obj:
                     task_obj["agent_progress"] = {a: 0 for a in exec_agents}
@@ -2816,10 +4004,12 @@ class AgentOrchestrator:
                 )
 
                 for result in agent_results:
+                    if isinstance(result, AgentWaitingForUserInput):
+                        raise result
                     if isinstance(result, Exception):
                         raise RuntimeError(f"Agent execution failed: {result}") from result
                 if _agent_needs_auto_continuation(task):
-                    task["current_step"] = "杈惧埌鍗曟杩唬涓婇檺锛屾鍦ㄨ嚜鍔ㄥ帇缂╀笂涓嬫枃骞剁画璺?.."
+                    task["current_step"] = "达到单段迭代上限，正在自动压缩上下文并续跑..."
                     self._persist_task(task_id)
                     self._push_phase_progress(task_id, "auto_continuation_checkpoint", task["current_step"])
                     return
@@ -2827,318 +4017,286 @@ class AgentOrchestrator:
                     raise RuntimeError("Agents produced no file changes; refusing to continue to review/build.")
 
                 for agent_type in exec_agents:
-                    log("info", f"[{agent_type}] Agent 鎵ц瀹屾瘯", "orchestrator")
+                    log("info", f"[{agent_type}] Agent 执行完毕", "orchestrator")
 
-            # 7. 瀹夎渚濊禆 + 鏋勫缓楠岃瘉锛堟櫤鑳藉け璐ユ仮澶嶏級
-            task["progress"] = 80
-            task["current_step"] = "瀹夎椤圭洰渚濊禆"
-            self._persist_task(task_id)
-            self._push_phase_progress(task_id, "install", "姝ｅ湪瀹夎椤圭洰渚濊禆...")
+            # 7. Execute only the stages selected by the universal ExecutionPlan.
+            execution_plan = task.get("active_execution_plan") or {}
+            capability_profile = task.get("task_capability_profile") or build_task_capability_profile(
+                task,
+                ws_path,
+                execution_plan,
+                available_tools=[spec.name for spec in tool_registry.list()],
+            )
+            task["task_capability_profile"] = capability_profile
+            stage_policy = capability_profile.get("stage_policy") or {}
+            artifact_source = str(capability_profile.get("artifact_source") or "workspace")
+            changed_files = _collect_completion_changed_files(task)
+            requires_validation = bool(stage_policy.get("requires_validation"))
+            requires_preview = bool(stage_policy.get("requires_preview"))
+            requires_review = bool(stage_policy.get("requires_review"))
 
-            # 鈹€鈹€ 渚濊禆瀹夎锛堝甫鏅鸿兘璇婃柇鍜屽绛栫暐閲嶈瘯锛夆攢鈹€
-            install_ok = False
-            install_error = ""
-            has_package_json = (ws_path / "package.json").exists()
-            validation_command, validation_reason = _select_validation_command(ws_path, project_type)
-            if not validation_command:
-                install_ok = True
-                log("info", "No package.json found; skipping npm install for non-Node project", "devops")
-                self._push_phase_progress(task_id, "install_skipped", "No Node dependencies detected; skipping npm install...")
-
-            for install_attempt in range(MAX_INSTALL_RETRIES if has_package_json else 0):
-                install_cmd = "npm install --prefer-offline 2>&1" if install_attempt == 0 else \
-                              "npm install 2>&1" if install_attempt == 1 else \
-                              "npm install --legacy-peer-deps 2>&1"
-                log("info", f"安装依赖（尝试 {install_attempt + 1}/{MAX_INSTALL_RETRIES}）: {install_cmd.split(' ')[2] if len(install_cmd.split(' '))>2 else 'npm install'}", "devops")
+            install_command, install_reason = _planned_command(
+                execution_plan, {"install", "dependency", "dependencies", "dependency_install"}
+            )
+            if install_command and artifact_source != "local_connector":
+                task["progress"] = 80
+                task["current_step"] = "安装执行计划声明的依赖"
+                self._persist_task(task_id)
+                self._push_phase_progress(task_id, "install", f"正在执行依赖步骤：{install_reason}")
                 install_result = await docker_manager.execute_in_workspace(
-                    workspace_id, f"{install_cmd} || echo 'INSTALL_FAILED'"
+                    workspace_id, f"{install_command} 2>&1 || echo '__AUTOCODE_INSTALL_FAILED__'"
                 )
                 install_output = install_result.get("stdout", "") or ""
-                if "INSTALL_FAILED" not in install_output and "ERR!" not in install_output:
-                    install_ok = True
-                    log("success", f"依赖安装完成（第 {install_attempt + 1} 次尝试）", "devops")
-                    self._push_phase_progress(task_id, "install_done", "依赖安装完成")
-                    break
-                install_error = install_output
+                if "__AUTOCODE_INSTALL_FAILED__" in install_output:
+                    task["status"] = "failed"
+                    task["error_detail"] = f"依赖步骤失败：{install_command}\n\n{install_output[-1500:]}"
+                    task["needs_continuation"] = True
+                    append_event(task, "task_stop_guard_triggered", {
+                        "reason": "planned_dependency_step_failed", "command": install_command,
+                    }, source="orchestrator")
+                    self._persist_task(task_id)
+                    return
+                self._push_phase_progress(task_id, "install_done", "依赖步骤已完成")
 
-                # 濡傛灉杩樻湁閲嶈瘯鏈轰細锛屽皾璇曟櫤鑳借瘖鏂慨澶?
-                if install_attempt < MAX_INSTALL_RETRIES - 1:
-                    fix_ok, fix_output = await self._diagnose_and_fix_install(
-                        workspace_id, ws_path, log, install_error, install_attempt,
-                    )
-                    if fix_ok:
-                        install_ok = True
-                        break
-                    install_error += f"\n--- 诊断结果 ---\n{fix_output}"
-
-            if not install_ok:
-                # 瀹夎鏈€缁堝け璐?鈫?璁板綍鍒拌蹇嗘枃浠讹紝鏍囪 needs_fix 鐘舵€?
-                self._update_workspace_memory(
-                    ws_path, task_id, status="needs_fix",
-                    phase="依赖安装失败",
-                    issues=[f"npm install 失败: {install_error[-500:]}"],
+            validation_command, validation_reason = _select_validation_command(
+                ws_path, project_type, execution_plan, changed_files
+            )
+            validation_ok = True
+            validation_output = ""
+            if requires_validation and validation_command and artifact_source != "local_connector":
+                task["progress"] = 85
+                task["current_step"] = "验证任务产物"
+                self._push_phase_progress(
+                    task_id, "validation", f"正在验证任务产物：{validation_command}"
                 )
-                log("error", "依赖安装失败（已用尽所有重试策略）", "devops", install_error[-1000:])
-                task["status"] = "failed"
-                task["error_detail"] = f"依赖安装失败，请查看 .autocode/MEMORY.md 获取详细诊断\n\n{install_error[-1500:]}"
-                task["needs_continuation"] = True
-                return
-
-            # 鈹€鈹€ 鏋勫缓楠岃瘉锛堝甫鏅鸿兘璇婃柇鍜?LLM 鑷慨澶嶅惊鐜級鈹€鈹€
-            task["progress"] = 85
-            task["current_step"] = "鏋勫缓椤圭洰"
-            self._push_phase_progress(task_id, "build", "姝ｅ湪鏋勫缓椤圭洰 (npm run build)...")
-            task["current_step"] = "楠岃瘉椤圭洰"
-            self._push_phase_progress(task_id, "validation", f"姝ｅ湪楠岃瘉椤圭洰 ({validation_command or validation_reason})...")
-            build_ok = False
-            build_error = ""
-            if not validation_command:
-                build_ok = True
-                log("info", f"No validation command detected; skipping validation stage ({validation_reason})", "devops")
-                self._push_phase_progress(task_id, "build_skipped", "鏈娴嬪埌鍙敤楠岃瘉鍛戒护锛岀户缁繘鍏ュ鏌?..")
-            max_build_retries = 3 if validation_command else 0
-
-            for build_attempt in range(max_build_retries):
-                log("info", f"馃敤 鎵ц鏋勫缓 (灏濊瘯 {build_attempt + 1}/{max_build_retries})", "devops")
-                log("info", f"馃敤 鎵ц楠岃瘉 (灏濊瘯 {build_attempt + 1}/{max_build_retries}): {validation_command}", "devops")
-                build_result = await docker_manager.execute_in_workspace(
-                    workspace_id, f"{validation_command} 2>&1 || echo 'BUILD_FAILED'"
-                )
-                build_output = build_result.get("stdout", "") or ""
-
-                if "BUILD_FAILED" not in build_output:
-                    build_ok = True
-                    log("success", "鉁?鏋勫缓鎴愬姛", "devops", build_output[-500:])
-                    break
-
-                build_error = build_output
-
-                # 灏濊瘯鏅鸿兘淇
-                if build_attempt < max_build_retries - 1:
-                    diag_ok, diag_msg = await self._diagnose_and_fix_build(
-                        workspace_id, ws_path, log, build_error,
-                        llm=await self._ensure_client(requested_model=task.get("model")), messages=None,
+                max_validation_attempts = 3 if str(execution_plan.get("intent") or "") in {"code_development", "pipeline"} else 1
+                validation_ok = False
+                for validation_attempt in range(max_validation_attempts):
+                    log(
+                        "info",
+                        f"执行验证（{validation_attempt + 1}/{max_validation_attempts}）：{validation_command}",
+                        "devops",
                     )
-                    if diag_ok:
-                        build_ok = True
+                    validation_result = await docker_manager.execute_in_workspace(
+                        workspace_id, f"{validation_command} 2>&1 || echo '__AUTOCODE_VALIDATION_FAILED__'"
+                    )
+                    validation_output = validation_result.get("stdout", "") or ""
+                    if "__AUTOCODE_VALIDATION_FAILED__" not in validation_output:
+                        validation_ok = True
+                        log("success", "验证通过", "devops", validation_output[-500:])
                         break
-
-                    # 濡傛灉鏈?LLM锛屽皾璇曡瀹冭嚜鍔ㄤ慨澶嶆瀯寤洪敊璇?
+                    if validation_attempt >= max_validation_attempts - 1:
+                        break
                     repair_prompt = "\n".join([
                         "## 验证失败自动修复",
+                        f"验证命令 {validation_command} 未通过。",
+                        "根据真实错误输出定位并最小化修复相关文件，然后重新运行同一条验证命令。",
+                        "如果缺少外部能力或环境，请明确报告 capability_unavailable，不要改用无关工具。",
                         "",
-                        f"验证命令 `{validation_command}` 没有通过。",
-                        "你必须基于下面的真实错误输出定位源码或配置问题，修改相关文件，并重新运行同一条验证命令。",
-                        "",
-                        "要求：",
-                        "- 不要只运行 ls/glob 或读取目录后停止。",
-                        "- 先从错误输出提取文件、行号、模块名、测试名或关键报错。",
-                        "- 读取最相关的源码/配置文件，做最小必要修改。",
-                        f"- 修改后必须重跑 `{validation_command}`。",
-                        "- 如果无法修复，说明缺少的外部依赖、环境变量或人工信息。",
-                        "",
-                        "验证输出：",
-                        "```text",
-                        build_output[-4000:],
-                        "```",
+                        validation_output[-4000:],
                     ])
-                    try:
-                        changed = await self._run_agentic_loop(
-                            task_id=task_id,
-                            description=repair_prompt,
-                            project_type=project_type,
-                            workspace_id=workspace_id,
-                            agent_type=agent_types[0] if agent_types else "frontend",
-                            ws_path=ws_path,
-                            log=log,
-                            research_report=research_report,
-                            task_plan=task_plan,
-                        )
-                        log("info", f"Agentic 构建修复已执行，changed={bool(changed)}", "devops")
-                        re_result = await docker_manager.execute_in_workspace(
-                            workspace_id, f"{validation_command} 2>&1 || echo 'BUILD_FAILED'"
-                        )
-                        re_output = re_result.get("stdout", "") or ""
-                        if "BUILD_FAILED" not in re_output:
-                            build_ok = True
-                            log("success", "Agentic 自动修复后构建成功", "devops", re_output[-500:])
-                            break
-                        build_error = re_output
-                        continue
-                    except Exception as exc:
-                        log("warn", f"Agentic 构建修复未完成: {exc}", "devops")
-
-                    llm = await self._ensure_client(requested_model=task.get("model"))
-                    log("info", "正在让 Agent 分析并修复构建错误...", "orchestrator")
-
-                    fix_prompt = "\n".join([
-                        "构建失败了，请根据以下错误输出修复代码：",
-                        "```text",
-                        build_output[-2000:],
-                        "```",
-                        "要求：定位错误原因，修改相关文件，然后运行 npm run build 验证。",
-                    ])
-
-                    try:
-                        fix_response = await llm.chat(
-                            messages=[{"role": "user", "content": fix_prompt}],
-                            tools=AGENT_TOOLS,
-                            system=AGENT_SYSTEM_PROMPTS.get(
-                                agent_types[0] if agent_types else "frontend",
-                                AGENT_SYSTEM_PROMPTS["frontend"]
-                            ),
-                        )
-
-                        if fix_response.has_tool_calls:
-                            for tc in fix_response.tool_calls:
-                                tool_result = await self._execute_tool(
-                                    tc.name, tc.arguments,
-                                    workspace_id, ws_path, task_id, log,
-                                    agent_types[0] if agent_types else "frontend",
-                                )
-                                # 鎺ㄩ€佷慨澶嶈繘搴﹀埌瀵硅瘽 SSE
-                                self._push_tool_progress(task_id, tc.name, tc.arguments, tool_result)
-                                log("info", f"[鑷姩淇] {tc.name}: {tool_result[:200]}", "devops")
-                                # 鎵ц瀹屼慨澶嶅悗閲嶆柊鏋勫缓
-                                re_result = await docker_manager.execute_in_workspace(
-                                    workspace_id, "npm run build 2>&1 || echo 'BUILD_FAILED'"
-                                )
-                                if "BUILD_FAILED" not in (re_result.get("stdout") or ""):
-                                    build_ok = True
-                                    log("success", "鉁?Agent 鑷姩淇鍚庢瀯寤烘垚鍔燂紒", "devops")
-                                    break
-                    except Exception as e:
-                        log("warn", f"鈿狅笍 Agent 鑷姩淇寮傚父: {e}", "devops")
-
-            if not build_ok:
-                # 鏋勫缓鏈€缁堝け璐?鈫?璁板綍鍒拌蹇嗘枃浠讹紝鏍囪 needs_fix 鐘舵€?
-                self._update_workspace_memory(
-                    ws_path, task_id, status="needs_fix",
-                    phase="鏋勫缓澶辫触",
-                    issues=[f"npm run build 澶辫触: {build_error[-500:]}"],
+                    await self._run_agentic_loop(
+                        task_id=task_id,
+                        description=repair_prompt,
+                        project_type=project_type,
+                        workspace_id=workspace_id,
+                        agent_type=agent_types[0] if agent_types else "general",
+                        ws_path=ws_path,
+                        log=log,
+                        research_report=research_report,
+                        task_plan=task_plan,
+                    )
+                task["validation_result"] = {
+                    "status": "passed" if validation_ok else "failed",
+                    "command": validation_command,
+                    "reason": validation_reason,
+                    "output": validation_output[-2000:],
+                }
+                if not validation_ok:
+                    self._update_workspace_memory(
+                        ws_path, task_id, status="needs_fix", phase="产物验证失败",
+                        issues=[f"{validation_command} 失败: {validation_output[-500:]}"],
+                    )
+                    task["status"] = "failed"
+                    task["error_detail"] = f"产物验证失败：{validation_command}\n\n{validation_output[-1500:]}"
+                    task["needs_continuation"] = True
+                    append_event(task, "task_stop_guard_triggered", {
+                        "reason": "validation_failed", "command": validation_command,
+                    }, source="orchestrator")
+                    self._persist_task(task_id)
+                    return
+            elif requires_validation:
+                reason = (
+                    "本地产物由 Local Connector 验证"
+                    if artifact_source == "local_connector"
+                    else validation_reason
                 )
-                log("error", "鉂?鏋勫缓澶辫触锛堝凡鐢ㄥ敖鎵€鏈夐噸璇曠瓥鐣ワ級", "devops", build_error[-1000:])
-                task["status"] = "failed"
-                task["error_detail"] = f"鏋勫缓澶辫触锛岃鏌ョ湅 .autocode/MEMORY.md 鑾峰彇璇︾粏璇婃柇銆俓n\n鍙偣鍑汇€岀户缁€嶆寜閽 Agent 灏濊瘯淇銆俓n\n{build_error[-1500:]}"
-                task["needs_continuation"] = True
-                return
+                task["validation_result"] = {
+                    "status": "artifact_review_pending", "command": None, "reason": reason,
+                }
+                self._push_phase_progress(task_id, "validation_deferred", f"命令验证不适用：{reason}")
 
-            # 鈹€鈹€ 鏋勫缓鎴愬姛 鈫?鍚姩棰勮 + 鏍囪瀹屾垚 鈹€鈹€
-            task["progress"] = 92
-            task["current_step"] = "鍚姩棰勮鏈嶅姟"
-            self._push_phase_progress(task_id, "preview", "鉁?鏋勫缓鎴愬姛锛屽惎鍔ㄩ瑙堟湇鍔?..")
-
-            # 鍏堝仠姝㈡棫鐨?dev server锛堥伩鍏嶇鍙ｅ啿绐併€佺‘淇濅娇鐢ㄦ渶鏂版瀯寤轰骇鐗╋級
-            try:
-                await dev_server_manager.stop_dev_server(workspace_id)
-                log("info", "馃攲 宸插仠姝㈡棫鐨?Dev Server锛堝噯澶囬噸鏂板惎鍔級", "orchestrator")
-            except Exception as stop_err:
-                log("warn", f"鈿狅笍 鍋滄鏃?Dev Server 澶辫触锛堝彲蹇界暐锛? {stop_err}", "orchestrator")
-
-            # 妫€鏌ユ槸鍚︽湁闈欐€佸鍑轰骇鐗╋紙out/ 鎴?dist/锛?
-            # 濡傛灉鏈夛紝浼樺厛浣跨敤闈欐€佹枃浠堕瑙堬紙鏇寸ǔ瀹氾紝鏃犻渶 dev server锛?
-            has_static_out = (ws_path / "out" / "index.html").exists()
-            has_static_dist = (ws_path / "dist" / "index.html").exists()
-
-            if has_static_out or has_static_dist:
-                task["preview_url"] = f"/workspaces/{workspace_id}/preview"
-                log("success", f"静态文件预览: /workspaces/{workspace_id}/preview", "orchestrator")
-            elif not has_package_json:
-                task["preview_url"] = None
-                log("info", "未发现前端预览产物，非 Node 项目跳过预览服务", "orchestrator")
-                self._push_phase_progress(task_id, "preview_skipped", "当前任务不需要页面预览。")
-            else:
-                preview_info = await dev_server_manager.start_dev_server(workspace_id, str(ws_path), project_type)
-                if preview_info and preview_info.get("url"):
-                    proxy_path = f"/api/proxy/{workspace_id}/"
-                    task["preview_url"] = proxy_path
-                    task["dev_server_port"] = preview_info["port"]
-                    task["dev_server_internal_url"] = preview_info["url"]
-                    log("success", f"预览服务已启动: {preview_info['url']}", "orchestrator")
-                else:
+            task["preview_url"] = None
+            if requires_preview:
+                task["progress"] = 92
+                task["current_step"] = "准备执行计划要求的预览"
+                self._push_phase_progress(task_id, "preview", "正在准备产物预览...")
+                has_static_out = (ws_path / "out" / "index.html").exists()
+                has_static_dist = (ws_path / "dist" / "index.html").exists()
+                has_root_html = (ws_path / "index.html").exists()
+                if has_static_out or has_static_dist or has_root_html:
                     task["preview_url"] = f"/workspaces/{workspace_id}/preview"
-                    err_detail = ""
-                    if preview_info:
-                        err_detail = f" (status={preview_info.get('status', 'unknown')})"
-                        try:
-                            ds_session = await dev_server_manager.get_session(workspace_id)
-                            if ds_session and ds_session.output:
-                                err_detail += f"\nDev Server 输出:\n{ds_session.output[-500:]}"
-                        except Exception:
-                            pass
-                    log("warn", f"Dev server 未启动{err_detail}，使用静态文件预览", "orchestrator")
+                    log("success", f"静态产物预览：{task['preview_url']}", "orchestrator")
+                elif (ws_path / "package.json").exists():
+                    preview_info = await dev_server_manager.start_dev_server(
+                        workspace_id, str(ws_path), project_type or "unknown"
+                    )
+                    if preview_info and preview_info.get("url"):
+                        task["preview_url"] = f"/api/proxy/{workspace_id}/"
+                        task["dev_server_port"] = preview_info["port"]
+                        task["dev_server_internal_url"] = preview_info["url"]
+                        log("success", f"预览服务已启动：{preview_info['url']}", "orchestrator")
+                    else:
+                        log("warn", "执行计划要求预览，但预览服务未能启动", "orchestrator")
+                else:
+                    log("info", "执行计划要求格式或渲染验证，但当前没有页面预览入口", "orchestrator")
+                    self._push_phase_progress(task_id, "preview_unavailable", "未发现可启动的页面预览入口")
 
             task["progress"] = 100
-            log("success", "代码开发完成，启动代码审查...", "orchestrator")
-
-            # 鈹€鈹€ 浠ｇ爜瀹℃煡闃舵 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
-            task["status"] = "reviewing"
-            self._persist_task(task_id)
-            self._push_phase_progress(task_id, "reviewing", "正在执行代码审查...")
-
-            review_passed = False
-            try:
-                # 鑾峰彇 LLM 瀹㈡埛绔敤浜?AI 璇勫锛堝彲閫夛級
-                review_llm = None
+            review_passed = True
+            if requires_review:
+                log("success", "执行阶段完成，开始按产物合同审查...", "orchestrator")
+                task["status"] = "reviewing"
+                self._persist_task(task_id)
+                self._push_phase_progress(task_id, "reviewing", "正在执行通用产物审查...")
                 try:
-                    review_llm = await self._ensure_client(requested_model=task.get("model"))
-                except Exception:
-                    pass
-
-                reviewer = ReviewAgent(llm_client=review_llm)
-                review_result = await reviewer.run(
-                    ws_path=ws_path,
-                    task_id=task_id,
-                    task_title=task.get("title", ""),
-                    project_type=task.get("project_type", "nextjs"),
-                    log=log,
-                )
-                task["review"] = review_result.to_dict()
-                review_passed = review_result.passed
-            except Exception as e:
-                logger.warning(f"[{task_id}] 浠ｇ爜瀹℃煡寮傚父锛堥樆姝㈠畬鎴愶級: {e}")
+                    review_llm = None
+                    try:
+                        review_llm = await self._ensure_client(requested_model=task.get("model"))
+                    except Exception:
+                        pass
+                    reviewer = ReviewAgent(llm_client=review_llm)
+                    review_result = await reviewer.run(
+                        ws_path=ws_path,
+                        task_id=task_id,
+                        task_title=task.get("title", ""),
+                        project_type=task.get("project_type", "unknown"),
+                        log=log,
+                        execution_plan=execution_plan,
+                        capability_profile=capability_profile,
+                        changed_files=changed_files,
+                        artifact_sources=task.get("artifact_sources") or {},
+                    )
+                    task["review"] = review_result.to_dict()
+                    review_passed = review_result.passed
+                    append_event(task, "artifact_verified", {
+                        "passed": review_passed,
+                        "score": review_result.score,
+                        "task_family": execution_plan.get("task_family"),
+                        "artifact_contracts": execution_plan.get("artifact_contracts") or [],
+                        "dimensions": review_result.dimensions,
+                    }, source="reviewer")
+                except Exception as exc:
+                    logger.warning(f"[{task_id}] 产物审查异常：{exc}")
+                    task["review"] = {
+                        "passed": False,
+                        "score": 0,
+                        "summary": f"产物审查异常：{exc}",
+                        "issues": [{
+                            "level": "error", "rule": "review/exception", "file": ".", "message": str(exc),
+                        }],
+                        "dimensions": {},
+                    }
+                    review_passed = False
+            else:
                 task["review"] = {
-                    "passed": False,
-                    "score": 0,
-                    "summary": f"浠ｇ爜瀹℃煡寮傚父: {e}",
-                    "issues": [{
-                        "level": "error",
-                        "rule": "review/exception",
-                        "file": ".",
-                        "message": str(e),
-                    }],
-                    "dimensions": {},
+                    "passed": True,
+                    "score": 100,
+                    "summary": "执行计划未要求产物审查。",
+                    "issues": [],
+                    "dimensions": {"status": "not_required"},
                 }
-                review_passed = False
+                append_event(task, "artifact_verified", {
+                    "passed": True, "status": "not_required", "task_family": execution_plan.get("task_family"),
+                }, source="orchestrator")
 
-            # 鈹€鈹€ 纭棬鎺э細瀹℃煡涓嶉€氳繃 鈫?绛夊緟鐢ㄦ埛纭 鈹€鈹€
+            if not review_passed and _unrestricted_dev_mode(task):
+                append_event(task, "review_advisory_finished", {
+                    "passed": False,
+                    "score": (task.get("review") or {}).get("score"),
+                    "issues": len((task.get("review") or {}).get("issues") or []),
+                    "blocking": False,
+                }, source="reviewer")
+                log("warn", "产物审查未通过，但极速开发模式下作为 advisory 记录，不阻塞完成", "orchestrator")
+                review_passed = True
+
+            if review_passed and _requires_real_change_for_completion(task, execution_plan, description):
+                meaningful_changed_files = _meaningful_completion_changed_files(task)
+                if not meaningful_changed_files:
+                    task["status"] = "failed"
+                    task["current_step"] = "代码开发任务没有产生真实文件变更，拒绝标记完成"
+                    task["needs_continuation"] = True
+                    task["agent_iteration_limited"] = True
+                    task["agent_iteration_limit_reason"] = "development_no_meaningful_changes"
+                    task["review"] = {
+                        "passed": False,
+                        "score": 0,
+                        "summary": "代码开发任务没有产生真实业务/源码变更，不能完成。",
+                        "issues": [{
+                            "level": "error",
+                            "rule": "completion/no-meaningful-changes",
+                            "file": ".",
+                            "message": "Code-development requests must modify at least one non-AutoCode artifact before completion.",
+                        }],
+                        "dimensions": {
+                            "completion_gate": {
+                                "status": "fail",
+                                "changed_files": _collect_completion_changed_files(task)[:100],
+                            },
+                        },
+                    }
+                    append_event(task, "completion_gate_failed", {
+                        "reason": "development_no_meaningful_changes",
+                        "changed_files": _collect_completion_changed_files(task)[:100],
+                        "execution_intent": execution_plan.get("intent"),
+                    }, source="orchestrator")
+                    log("error", "代码开发任务没有产生真实文件变更，拒绝标记完成", "orchestrator")
+                    await h_fail("completion_no_meaningful_changes", task["current_step"], "high", {
+                        "review": task.get("review"),
+                        "execution_plan": execution_plan,
+                    })
+                    self._persist_task(task_id)
+                    self.cleanup_chat_queue(task_id)
+                    return
+
+            # ── 确认门控：审查不通过 → 等待用户确认 ──
             if not review_passed:
                 review_score = task["review"].get("score", 0)
                 review_summary = task["review"].get("summary", "")
                 issue_count = len(task["review"].get("issues", []))
 
-                task["review_confirmed"] = None  # 绛夊緟鐢ㄦ埛纭
+                task["review_confirmed"] = None  # 等待用户确认
                 task["status"] = "waiting_review_confirm"
-                task["current_step"] = f"代码审查未通过（{review_score} 分 / {issue_count} 个问题），等待您确认..."
+                task["current_step"] = f"产物审查未通过（{review_score} 分 / {issue_count} 个问题），等待您确认..."
                 self._persist_task(task_id)
 
-                log("warn", f"代码审查未通过（{review_score} 分 / {issue_count} 个问题），等待用户确认", "orchestrator")
+                log("warn", f"产物审查未通过（{review_score} 分 / {issue_count} 个问题），等待用户确认", "orchestrator")
                 compacted_this_iteration = True
                 self._push_phase_progress(
                     task_id, "review_failed",
-                    f"代码审查未通过 - 得分 {review_score}，{issue_count} 个问题"
+                    f"产物审查未通过 - 得分 {review_score}，{issue_count} 个问题"
                 )
 
-                # 杞绛夊緟鐢ㄦ埛纭锛堝弬鐓?_generate_and_confirm_prototype 妯″紡锛?
-                max_wait_seconds = 3600  # 鏈€澶氱瓑寰?1 灏忔椂
-                wait_interval = 2        # 姣?2 绉掓鏌ヤ竴娆?
+                # 轮询等待用户确认（参照 _generate_and_confirm_prototype 模式）
+                max_wait_seconds = 3600  # 最多等待 1 小时
+                wait_interval = 2        # 每 2 秒检查一次
                 waited = 0
 
                 while waited < max_wait_seconds:
                     await asyncio.sleep(wait_interval)
                     waited += wait_interval
 
-                    # 妫€鏌ヤ换鍔℃槸鍚﹁鍙栨秷
+                    # 检查任务是否被取消
                     t_check = _tasks.get(task_id)
                     if not t_check or t_check.get("status") == "cancelled":
                         log("info", "用户取消任务，退出审查等待", "orchestrator")
@@ -3146,23 +4304,23 @@ class AgentOrchestrator:
                         self._persist_task(task_id)
                         return
 
-                    # 妫€鏌ョ敤鎴锋槸鍚﹀凡纭/鎷掔粷
+                    # 检查用户是否已确认/拒绝
                     confirmed = t_check.get("review_confirmed")
                     if confirmed is not None:
                         if confirmed:
-                            # 鐢ㄦ埛纭锛氬鏌ヤ笉閫氳繃浣嗕粛缁х画瀹屾垚
+                            # 用户确认：审查不通过但仍继续完成
                             task["status"] = "completed"
                             task["current_step"] = "用户已确认审查结果，任务完成"
                             log("success", "用户确认审查结果，任务完成", "orchestrator")
                         else:
-                            # 鐢ㄦ埛鎷掔粷锛氳涓轰唬鐮佷笉鍚堟牸锛屼换鍔″け璐?
+                            # 用户拒绝：认为代码不合格，任务失败
                             task["status"] = "failed"
                             task["current_step"] = "用户拒绝了审查结果，任务标记为失败"
                             log("warn", "用户拒绝审查结果，任务失败", "orchestrator")
                         self._persist_task(task_id)
                         break
                 else:
-                    # 瓒呮椂鏈‘璁わ細鏍规嵁寰楀垎鍐冲畾
+                    # 超时未确认：根据得分决定
                     if review_score >= 50:
                         log("warn", f"审查确认超时（得分 {review_score} >= 50），自动完成", "orchestrator")
                         task["status"] = "completed"
@@ -3173,7 +4331,7 @@ class AgentOrchestrator:
                         task["current_step"] = "审查确认超时且得分过低，标记失败"
                     self._persist_task(task_id)
 
-                # 濡傛灉鐢ㄦ埛鎷掔粷浜嗭紙task["status"] == "failed"锛夛紝璺宠繃鍚庣画瀹屾垚閫昏緫
+                # 如果用户拒绝了（task["status"] == "failed"），跳过后续完成逻辑
                 if task.get("status") == "failed":
                     await h_fail("review_rejected", task.get("current_step", "Review rejected"), "high", {
                         "review": task.get("review"),
@@ -3182,16 +4340,16 @@ class AgentOrchestrator:
                     self._persist_task(task_id)
                     return
             else:
-                # 瀹℃煡閫氳繃锛岀洿鎺ュ畬鎴?
+                # 审查通过，直接完成
                 task["status"] = "completed"
                 log("success", "任务全部完成", "orchestrator")
 
-            # 鏇存柊璁板繂鏂囦欢锛氭爣璁板畬鎴?
+            # 更新记忆文件：标记完成
             agent_iter = task.get("agent_iteration", 60)
             self._update_workspace_memory(
                 ws_path, task_id, status="completed",
                 phase="任务完成",
-                completed_items=["需求分析", "代码实现", "依赖安装", "构建通过", "预览就绪"],
+                completed_items=["需求理解", "执行计划", "产物生成", "计划内验证", "产物审查"],
                 decisions=[f"共执行 {agent_iter} 轮迭代"],
                 iteration=agent_iter,
             )
@@ -3199,6 +4357,14 @@ class AgentOrchestrator:
 
             git_manager.auto_commit(ws_path, ["."], f"完成: {task['title']}")
             task["commit_history"] = git_manager.log(ws_path, max_count=10)
+            append_event(task, "self_check_started", {
+                "changed_files": _collect_completion_changed_files(task)[:100],
+                "review_score": (task.get("review") or {}).get("score"),
+            }, source="orchestrator")
+            completion_report = _build_completion_report(task, ws_path)
+            task["completion_report"] = completion_report
+            append_event(task, "self_check_completed", completion_report, source="orchestrator")
+            append_event(task, "completion_report_generated", completion_report, source="orchestrator")
             completion_summary = _build_completion_summary(task, ws_path)
             task["completion_summary"] = completion_summary
             if _execution_mode(task) == "agentic":
@@ -3224,14 +4390,22 @@ class AgentOrchestrator:
                 "final_review_passed": bool((task.get("review") or {}).get("passed", True)),
             })
 
-            # 娓呯悊瀵硅瘽闃熷垪锛堜换鍔＄粨鏉熷悗涓嶅啀闇€瑕侊級
+            # 清理对话队列（任务结束后不再需要）
             self.cleanup_chat_queue(task_id)
 
+        except AgentWaitingForUserInput:
+            task = _tasks.get(task_id) or task
+            task["status"] = "waiting_user_input"
+            task["execution_active"] = False
+            task["needs_continuation"] = False
+            log("info", "任务已暂停，等待用户选择或补充信息", "agent_blocker")
+            self._persist_task(task_id)
+            return
         except asyncio.CancelledError:
             if task.get("cancel_requested"):
                 task["status"] = "cancelled"
                 task["execution_active"] = False
-                log("warn", "浠诲姟宸茬敱鐢ㄦ埛鍙栨秷", "orchestrator")
+                log("warn", "任务已由用户取消", "orchestrator")
                 await h_fail("cancelled", "Task was cancelled by user", "medium", {
                     "workspace_id": workspace_id,
                     "current_step": task.get("current_step"),
@@ -3259,11 +4433,22 @@ class AgentOrchestrator:
             self._persist_task(task_id)
         finally:
             _usage_context.reset(usage_token)
+            try:
+                await self._cancel_background_subagents(task_id)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(f"[spawn_subagent] background cleanup skipped for {task_id}: {exc}")
             self._active_tasks[task_id] = False
             current_task = _tasks.get(task_id)
             if current_task:
                 current_task["execution_active"] = False
                 self._persist_task(task_id)
+            # Tear down any language servers spawned for this workspace so we do
+            # not leak subprocesses across tasks. Best-effort; never raises.
+            try:
+                from runtime.lsp.lsp_manager import lsp_registry
+                await lsp_registry.shutdown(workspace_id)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(f"[LSP] shutdown skipped for {workspace_id}: {exc}")
 
     def _format_research_report(self, report: dict) -> str:
         """Format a technology research report as Markdown."""
@@ -3369,7 +4554,7 @@ class AgentOrchestrator:
             task,
             command,
             "running",
-            label=f"{group_label} CI 楠岃瘉",
+            label=f"{group_label} CI 验证",
             source="phase_ci",
         )
         self._persist_task(task_id)
@@ -3617,7 +4802,7 @@ class AgentOrchestrator:
                 await self._run_single_agent(
                     task_id=task_id,
                     description=repair_prompt,
-                    project_type=task.get("project_type", "default"),
+                    project_type=task.get("project_type") or "unknown",
                     workspace_id=task["workspace_id"],
                     agent_type=primary_agent,
                     ws_path=ws_path,
@@ -3718,11 +4903,11 @@ class AgentOrchestrator:
             source="reviewer",
         )
         task["status"] = "reviewing"
-        task["current_step"] = f"{group_label} guardrail review" if is_agentic_guardrail else f"{group_label} code review"
+        task["current_step"] = f"{group_label} guardrail review" if is_agentic_guardrail else f"{group_label} artifact review"
         task.setdefault("phase_reviews", [])
         self._persist_task(task_id)
         progress_type = "guardrail_review" if is_agentic_guardrail else "phase_review"
-        progress_message = f"{group_label}: guardrail review" if is_agentic_guardrail else f"{group_label}: code review"
+        progress_message = f"{group_label}: guardrail review" if is_agentic_guardrail else f"{group_label}: artifact review"
         self._push_phase_progress(task_id, progress_type, progress_message)
 
         try:
@@ -3742,7 +4927,7 @@ class AgentOrchestrator:
                     "guardrail_kind": guardrail_kind,
                     "passed": False,
                     "score": 0,
-                    "summary": "阶段没有产生任何工作区文件变更，拒绝通过代码审查。",
+                    "summary": "阶段没有产生任何目标产物或可验证文件变更，拒绝通过产物审查。",
                     "issues": [{
                         "level": "error",
                         "rule": "review/no-phase-changes",
@@ -3861,7 +5046,7 @@ class AgentOrchestrator:
                     "guardrail_kind": guardrail_kind,
                     "passed": False,
                     "score": 20,
-                    "summary": "阶段 CI/验证未通过，拒绝进入代码审查通过状态。",
+                    "summary": "阶段 CI/验证未通过，拒绝进入产物审查通过状态。",
                     "issues": [{
                         "level": "error",
                         "rule": "ci/failed",
@@ -3910,14 +5095,27 @@ class AgentOrchestrator:
             except Exception:
                 pass
             reviewer = ReviewAgent(llm_client=review_llm)
-            review_project_type = "docs" if _is_documentation_phase(group_subtasks, changed_files) else task.get("project_type", "nextjs")
+            active_plan = task.get("active_execution_plan") or {}
+            changed_names = {
+                str(path).replace("\\", "/").lower().rsplit("/", 1)[-1]
+                for path in changed_files
+            }
+            phase_contracts = [
+                contract for contract in (active_plan.get("artifact_contracts") or [])
+                if str(contract.get("path") or "").replace("\\", "/").lower().rsplit("/", 1)[-1] in changed_names
+            ]
+            phase_plan = {**active_plan, "artifact_contracts": phase_contracts}
             with usage_agent("reviewer"):
                 review_result = await reviewer.run(
                     ws_path=ws_path,
                     task_id=task_id,
                     task_title=f"{task.get('title', '')} - {group_label}",
-                    project_type=review_project_type,
+                    project_type=task.get("project_type", "unknown"),
                     log=log,
+                    execution_plan=phase_plan,
+                    capability_profile=task.get("task_capability_profile") or {},
+                    changed_files=changed_files,
+                    artifact_sources=task.get("artifact_sources") or {},
                 )
             review_dict = review_result.to_dict()
             review_dict["phase"] = group_label
@@ -4037,7 +5235,7 @@ class AgentOrchestrator:
             token in text
             for token in (
                 "usage", "smoke", "readme", "document", "docs",
-                "浣跨敤璇存槑", "鍐掔儫娴嬭瘯", "璇存槑", "鏂囨。",
+                "使用说明", "冒烟测试", "说明", "文档",
             )
         )
 
@@ -4076,10 +5274,10 @@ class AgentOrchestrator:
             else:
                 path.write_text(f"# {subtask.title}\n{section}", encoding="utf-8")
             rel = path.resolve().relative_to(ws_path.resolve()).as_posix()
-            log("success", f"宸茬敓鎴?鏇存柊浣跨敤璇存槑鏂囦欢: {rel}", "orchestrator")
+            log("success", f"已生成或更新使用说明文件: {rel}", "orchestrator")
             return rel
         except Exception as exc:
-            log("warn", f"鐢熸垚浣跨敤璇存槑鏂囦欢澶辫触: {exc}", "orchestrator")
+            log("warn", f"生成使用说明文件失败: {exc}", "orchestrator")
             return None
 
     def _materialize_documentation_subtask(
@@ -4097,14 +5295,14 @@ class AgentOrchestrator:
             return self._write_usage_notes_artifact(ws_path, subtask, original_description, log)
         is_doc_phase = any(
             token in title or token in desc
-            for token in ("contract", "濂戠害", "璇存槑", "鏂囨。", "姊崇悊", "map", "鍏ュ彛")
+            for token in ("contract", "契约", "说明", "文档", "梳理", "map", "入口")
         ) or any(path.endswith(".md") for path in estimated)
         if not is_doc_phase:
             return None
 
         target = next((p for p in estimated if p.endswith(".md")), "")
         if not target:
-            if "script" in title or "濂戠害" in title or "contract" in title:
+            if "script" in title or "契约" in title or "contract" in title:
                 target = "SCRIPT_CONTRACT.md"
             else:
                 return None
@@ -4151,7 +5349,7 @@ class AgentOrchestrator:
             log("success", f"已生成兜底工作文件: {rel}", "orchestrator")
             return rel
         except Exception as exc:
-            log("warn", f"鐢熸垚鍏滃簳宸ヤ綔鏂囦欢澶辫触: {exc}", "orchestrator")
+            log("warn", f"生成兜底工作文件失败: {exc}", "orchestrator")
             return None
 
     async def _execute_subtask(
@@ -4171,12 +5369,12 @@ class AgentOrchestrator:
         if not task:
             return
 
-        log("info", f"鈻讹笍 寮€濮嬪瓙浠诲姟 [{subtask.id}] {subtask.title}", "orchestrator")
+        log("info", f"开始子任务 [{subtask.id}] {subtask.title}", "orchestrator")
         phase_record = _append_command_record(
             task,
             f"autocode subtask {subtask.id}",
             "running",
-            label=f"瀛愪换鍔?{subtask.id}: {subtask.title}",
+            label=f"子任务 {subtask.id}: {subtask.title}",
             source="agent_phase",
         )
         self._persist_task(task_id)
@@ -4189,16 +5387,16 @@ class AgentOrchestrator:
         })
         self._push_phase_progress(
             task_id, "subtask_start",
-            f"鈻讹笍 [{subtask.id}] {subtask.title} 鈥?{subtask.agent_type}"
+            f"[{subtask.id}] {subtask.title} - {subtask.agent_type}"
         )
 
         try:
-            # 鏇存柊瀛愪换鍔＄姸鎬?
+            # 更新子任务状态
             subtask.status = SubTaskStatus.running
             task["current_subtask_id"] = subtask.id
             self._sync_plan_to_task(task_id, task_plan)
 
-            # 濡傛灉鏈変緷璧栵紝娉ㄥ叆渚濊禆瀛愪换鍔＄殑涓婁笅鏂?
+            # 如果有依赖，注入依赖子任务的上下文
             dep_context = ""
             if subtask.dependencies:
                 if task_plan:
@@ -4208,9 +5406,9 @@ class AgentOrchestrator:
                         if dep_st:
                             dep_info.append(f"- {dep_st.title}: {dep_st.description[:100]}")
                     if dep_info:
-                        dep_context = f"\n\n馃搸 **鍓嶇疆宸插畬鎴愮殑浠诲姟**锛堣繖浜涗换鍔″凡瀹屾垚锛岃鍩轰簬瀹冧滑鐨勬垚鏋滅户缁級锛歕n" + "\n".join(dep_info)
+                        dep_context = f"\n\n**前置已完成的任务**（请基于这些任务的成果继续）：\n" + "\n".join(dep_info)
 
-            # 鏋勫缓瀛愪换鍔′笓鐢ㄦ弿杩?
+            # 构建子任务专用描述
             estimated_files_text = ", ".join(subtask.estimated_files) if subtask.estimated_files else "根据需求确定"
             subtask_desc = "\n".join([
                 f"## 子任务：{subtask.title}",
@@ -4224,7 +5422,7 @@ class AgentOrchestrator:
                 "",
                 "注意：这是整个项目的一部分。请专注此子任务；需要代码时必须修改真实文件并运行验证。",
             ])
-            # 璋冪敤 Agent 鎵ц
+            # 调用 Agent 执行
             before_snapshot = _workspace_file_snapshot(ws_path)
             command_count_before = len((_tasks.get(task_id) or {}).get("command_history") or [])
             changed_by_agent = await self._run_single_agent(
@@ -4242,7 +5440,7 @@ class AgentOrchestrator:
             command_count_after = len((_tasks.get(task_id) or {}).get("command_history") or [])
             subtask_text = f"{subtask.title or ''} {subtask.description or ''}".lower()
             validation_only_phase = any(token in subtask_text for token in (
-                "楠岃瘉", "鍐掔儫", "娴嬭瘯", "浣跨敤璇存槑", "validation", "smoke", "test", "usage", "review",
+                "验证", "冒烟", "测试", "使用说明", "validation", "smoke", "test", "usage", "review",
             ))
             if (
                 not changed_files
@@ -4397,7 +5595,7 @@ class AgentOrchestrator:
                     changed_by_agent = True
                     log(
                         "warn",
-                        f"瀛愪换鍔℃湭浜х敓鏂囦欢鍙樻洿锛屽凡鑷姩鐢熸垚鍏滃簳宸ヤ綔鏂囦欢: {fallback_file}",
+                        f"子任务未产生文件变更，已自动生成兜底工作文件: {fallback_file}",
                         "orchestrator",
                     )
                     await asyncio.to_thread(harness_repository.add_event, trace_id, "execution", "subtask_fallback_file", {
@@ -4433,7 +5631,7 @@ class AgentOrchestrator:
                     "Agent returned text/empty response without writing files."
                 )
 
-            # 妫€鏌ユ墽琛岀粨鏋?
+            # 检查执行结果
             task = _tasks.get(task_id)
             if task and task.get("status") not in ("failed", "cancelled"):
                 subtask.status = SubTaskStatus.completed
@@ -4454,15 +5652,15 @@ class AgentOrchestrator:
                 })
                 self._push_phase_progress(
                     task_id, "subtask_complete",
-                    f"鉁?[{subtask.id}] {subtask.title} 鈥?瀹屾垚"
+                    f"[{subtask.id}] {subtask.title} - 完成"
                 )
             else:
                 subtask.status = SubTaskStatus.failed
                 self._sync_plan_to_task(task_id, task_plan)
-                log("error", f"鉂?瀛愪换鍔″け璐?[{subtask.id}] {subtask.title}", "orchestrator")
+                log("error", f"子任务失败 [{subtask.id}] {subtask.title}", "orchestrator")
                 phase_record.update({
                     "status": "failed",
-                    "output": f"浠诲姟鐘舵€佸彉涓?{task.get('status') if task else 'unknown'}",
+                    "output": f"任务状态变为 {task.get('status') if task else 'unknown'}",
                     "exit_code": 1,
                     "finished_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
                 })
@@ -4473,13 +5671,23 @@ class AgentOrchestrator:
                 })
                 self._push_phase_progress(
                     task_id, "subtask_failed",
-                    f"鉂?[{subtask.id}] {subtask.title} 鈥?澶辫触"
+                    f"[{subtask.id}] {subtask.title} - 失败"
                 )
 
+        except AgentWaitingForUserInput:
+            phase_record.update({
+                "status": "paused",
+                "output": "等待用户选择或补充信息。",
+                "exit_code": 0,
+                "finished_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+            })
+            self._sync_plan_to_task(task_id, task_plan)
+            self._persist_task(task_id)
+            raise
         except Exception as e:
             subtask.status = SubTaskStatus.failed
             self._sync_plan_to_task(task_id, task_plan)
-            log("error", f"鉂?瀛愪换鍔″紓甯?[{subtask.id}] {subtask.title}: {e}", "orchestrator")
+            log("error", f"子任务异常 [{subtask.id}] {subtask.title}: {e}", "orchestrator")
             try:
                 phase_record.update({
                     "status": "failed",
@@ -4496,7 +5704,7 @@ class AgentOrchestrator:
             })
             self._push_phase_progress(
                 task_id, "subtask_error",
-                f"鉂?[{subtask.id}] {subtask.title} 鈥?寮傚父: {str(e)[:100]}"
+                f"[{subtask.id}] {subtask.title} - 异常: {str(e)[:100]}"
             )
 
     def _requires_prototype_confirmation(
@@ -4504,27 +5712,11 @@ class AgentOrchestrator:
         project_type: str,
         task_plan: Optional[TaskPlan] = None,
     ) -> bool:
-        normalized_type = (project_type or "").strip().lower()
-        ui_project_types = {
-            "nextjs", "react", "vue", "nuxt", "vite", "svelte", "astro",
-            "website", "frontend", "miniapp", "uniapp", "taro",
-        }
-        non_ui_project_types = {
-            "api", "tool", "script", "python", "go", "java", "node",
-            "backend", "fastapi", "express", "spring", "springboot",
-            "nestjs", "gin", "default",
-        }
-
-        if normalized_type in ui_project_types:
-            return True
-        if normalized_type in non_ui_project_types:
-            return False
-
         if not task_plan or not task_plan.subtasks:
             return False
 
         ui_keywords = (
-            "ui", "椤甸潰", "鐣岄潰", "鍓嶇", "frontend", "component", "缁勪欢",
+            "ui", "页面", "界面", "前端", "frontend", "component", "组件",
             "view", "page", "screen", "layout", "style", "css",
         )
         ui_file_suffixes = (
@@ -4618,11 +5810,11 @@ Required behavior:
         )
 
         task["progress"] = 60
-        task["current_step"] = "馃帹 姝ｅ湪鐢熸垚 UI 鍘熷瀷..."
+        task["current_step"] = "正在生成 UI 原型..."
         self._persist_task(task_id)
-        self._push_phase_progress(task_id, "prototyping", "姝ｅ湪鐢熸垚 UI 绾挎鍥?..")
+        self._push_phase_progress(task_id, "prototyping", "正在生成 UI 线框图...")
 
-        # 鈹€鈹€ Phase 1: 鐢熸垚 Excalidraw 鍘熷瀷锛堢嫭绔?try/except锛屽け璐ュ垯璺宠繃鍘熷瀷纭锛夆攢鈹€
+        # ── Phase 1: 生成 Excalidraw 原型（独立 try/except，失败则跳过原型确认）──
         prototype_result = None
         try:
             llm_client = await self._ensure_client(requested_model=task.get("model"))
@@ -4634,7 +5826,7 @@ Required behavior:
                 llm_client=llm_client,
             )
 
-            # 淇濆瓨鍘熷瀷鍒板伐浣滅┖闂?
+            # 保存原型到工作空间
             excalidraw_data = prototype_result.get("excalidraw", {})
             save_prototype_excalidraw(ws_path, excalidraw_data)
             prototype_record = save_prototype_record(
@@ -4652,9 +5844,9 @@ Required behavior:
             self._persist_task(task_id)
             return
 
-        # 鈹€鈹€ Phase 2: 璁剧疆绛夊緟纭鐘舵€侊紙涓嶅湪 try/except 涓紝纭繚涓€瀹氶樆濉炵瓑寰咃級鈹€鈹€
-        task["prototype"] = prototype_result  # 瀹屾暣缁撴灉锛堝寘鍚?title, description, excalidraw, features锛?
-        task["prototype_confirmed"] = None  # 绛夊緟纭
+        # ── Phase 2: 设置等待确认状态（不在 try/except 中，确保一定阻塞等待）──
+        task["prototype"] = prototype_result  # 完整结果包含 title、description、excalidraw 和 features
+        task["prototype_confirmed"] = None  # 等待确认
         task["status"] = "waiting_prototype_confirm"
         task["progress"] = 65
         prototype_title = prototype_result.get("title", "UI 线框图")
@@ -4669,32 +5861,32 @@ Required behavior:
             f"原型已生成: {prototype_result.get('title', '')}"
         )
 
-        # 鈹€鈹€ Phase 3: 杞绛夊緟鐢ㄦ埛纭锛堢嫭绔嬩簬鐢熸垚闃舵锛屼笉鍙楀紓甯稿奖鍝嶏級鈹€鈹€
-        max_wait_seconds = 3600  # 鏈€澶氱瓑寰?1 灏忔椂
-        wait_interval = 2  # 姣?2 绉掓鏌ヤ竴娆?
+        # ── Phase 3: 轮询等待用户确认（独立于生成阶段，不受异常影响）──
+        max_wait_seconds = 3600  # 最多等待 1 小时
+        wait_interval = 2  # 每 2 秒检查一次
         waited = 0
 
         while waited < max_wait_seconds:
             await asyncio.sleep(wait_interval)
             waited += wait_interval
 
-            # 妫€鏌ヤ换鍔℃槸鍚﹁鍙栨秷
+            # 检查任务是否被取消
             t_check = _tasks.get(task_id)
             if not t_check or t_check.get("status") == "cancelled":
                 log("info", "用户取消任务，退出", "orchestrator")
                 return
 
-            # 妫€鏌ョ敤鎴锋槸鍚﹀凡纭/鎷掔粷
+            # 检查用户是否已确认/拒绝
             confirmed = t_check.get("prototype_confirmed")
             if confirmed is not None:
                 if confirmed:
-                    # 鐢ㄦ埛纭浜嗗師鍨嬶紝缁х画鎵ц
+                    # 用户确认了原型，继续执行
                     task["status"] = "running"
                     task["progress"] = 70
-                    task["current_step"] = "用户已确认原型，开始构建项目..."
+                    task["current_step"] = "用户已确认原型，继续执行计划..."
                     log("success", "用户确认原型，继续执行", "orchestrator")
                 else:
-                    # 鐢ㄦ埛鎷掔粷鍘熷瀷锛岄噸鏂扮敓鎴?
+                    # 用户拒绝原型，重新生成
                     log("info", "用户拒绝原型，继续执行后续流程", "orchestrator")
                     task["status"] = "running"
                     task["progress"] = 70
@@ -4702,7 +5894,7 @@ Required behavior:
                 self._persist_task(task_id)
                 return
 
-        # 瓒呮椂鏈‘璁わ紝瑙嗕负缁х画鎵ц
+        # 超时未确认，视为继续执行
         log("warn", "原型确认超时，继续执行", "orchestrator")
         task["status"] = "running"
         task["progress"] = 70
@@ -4738,11 +5930,11 @@ Required behavior:
         log,
         research_report: dict | None = None,
     ):
-        system = AGENT_SYSTEM_PROMPTS.get(agent_type, AGENT_SYSTEM_PROMPTS["frontend"])
+        system = AGENT_SYSTEM_PROMPTS.get(agent_type, AGENT_SYSTEM_PROMPTS["general"])
         system = system + "\n\n" + _agent_ownership_prompt(agent_type)
         system = system + "\n\n" + tool_registry.agent_usage_prompt()
 
-        # 娉ㄥ叆鐢ㄦ埛鑷畾涔?SPEC.md 瑙勮寖
+        # 注入用户自定义 SPEC.md 规范
         try:
             from core.spec_manager import build_spec_prompt
             spec_prompt = build_spec_prompt(ws_path)
@@ -4761,7 +5953,7 @@ Required behavior:
         except Exception as e:
             logger.warning(f"[Harness] 注入失败: {e}")
 
-        # 鈹€鈹€ 涓哄綋鍓?Agent 鏋勫缓鐙珛璺敱涓婁笅鏂?+ 閫夋嫨鏈€浼樻ā鍨?鈹€鈹€
+        # ── 为当前 Agent 构建独立路由上下文 + 选择最优模型 ──
         task_ctx = self._task_contexts.get(task_id)
         if task_ctx is None:
             task_ctx = TaskContext(agent_type=agent_type, task_phase="implementation",
@@ -4781,9 +5973,42 @@ Required behavior:
             llm = await self._ensure_client(task_ctx, requested_model=requested_model)
         except Exception as e:
             logger.warning(f"[{agent_type}] 智能路由失败，使用默认模型: {e}")
-            llm = await self._ensure_client(requested_model=requested_model)  # 鍥為€€鍒板厹搴曢€夋嫨
+            llm = await self._ensure_client(requested_model=requested_model)  # 回退到兜底选择
 
-        # 娉ㄥ叆璋冪爺鎶ュ憡涓婁笅鏂?
+        task = _tasks.get(task_id)
+        if task is not None:
+            routing_mode = "explicit" if requested_model and str(requested_model).lower() != "auto" else "auto"
+            if isinstance(llm, FailoverLLMClient):
+                candidate = next(
+                    (item for item in llm._candidates if item.model_id == llm.current_model),
+                    llm._candidates[0] if llm._candidates else None,
+                )
+                resolved_model = candidate.model_id if candidate else None
+                api_model = (candidate.api_model or candidate.model_id) if candidate else None
+                provider = candidate.provider if candidate else None
+                channel_id = None
+            else:
+                resolved_model = getattr(llm, "billing_model", None) or requested_model or getattr(llm, "model", None)
+                api_model = getattr(llm, "model", None)
+                provider = getattr(llm, "source_provider", None) or getattr(llm, "provider", None)
+                channel_id = getattr(llm, "channel_id", None)
+            append_event(
+                task,
+                "model_execution_selected",
+                {
+                    "agent": agent_type,
+                    "requested_model": requested_model,
+                    "resolved_model": resolved_model,
+                    "api_model": api_model,
+                    "provider": provider,
+                    "channel_id": channel_id,
+                    "routing_mode": routing_mode,
+                },
+                source=agent_type,
+            )
+            self._persist_task(task_id)
+
+        # 注入调研报告上下文
         research_context = ""
         if research_report:
             tech_stack = research_report.get("tech_stack", {})
@@ -4803,7 +6028,7 @@ Required behavior:
                 "完整报告见 /workspace/RESEARCH_REPORT.md",
             ])
 
-        # 妫€鏌ユ槸鍚︽湁鏂偣缁窇璁板繂锛圡EMORY.md 涓褰曚簡涓婃鐘舵€侊級
+        # 检查是否有断点续跑记忆（MEMORY.md 中记录了上次状态）
         memory_context = ""
         mem_file = ws_path / ".autocode" / "MEMORY.md"
         if mem_file.exists():
@@ -4898,7 +6123,10 @@ Required behavior:
             solution_context,
             "",
             "## 工作方式：Agentic Loop",
+            "- 先读取/利用 .autocode/SURFACE_MAP.md 和 PROJECT_MAP.md；用户说“页面/软件界面/看不到功能”时默认定位运行时 GUI(app_gui)，只有明确说官网/文档页才改 docs。",
             "- 先观察项目结构，使用 glob/search_code 定位相关文件。",
+            "- 已有明确 candidate_files 或 SURFACE_MAP 命中时，不要继续全量 glob **/*；直接读取目标文件附近内容。",
+            "- 大 HTML/模板/长源码文件优先用 search_code + read_lines(path,start,end)，不要用 shell 临时脚本数行或切片。",
             "- 只读取与当前任务相关的文件，不要全量读取项目。",
             "- 优先用 apply_patch 精准修改已有文件；需要新文件时再用 write_file。",
             "- 写入后必须运行合适验证命令；失败则继续分析并修复。",
@@ -4910,6 +6138,7 @@ Required behavior:
 
         before_snapshot = _workspace_file_snapshot(ws_path)
         writes_count = 0
+        aggregate_written_files: list[str] = []
         commands_count = 0
         workspace_version = 0
         validated_after_write = False
@@ -4917,18 +6146,42 @@ Required behavior:
         repeated_tool_suppressed = 0
         tool_cache: dict[str, str] = {}
         tool_call_counts: dict[str, int] = {}
+        discovery_result_counts: dict[str, int] = {}
+        pending_user_messages_seen = 0
         validation_reminded_at_write_count = -1
         validation_failure_reminded_at_command_count = -1
+        discovery_only_streak = 0
+        edit_intent_without_tool_count = 0
         iteration = 0
         empty_response_retries = 0
-        # 鑷€傚簲杩唬涓婇檺锛歋0/杞婚噺鑴氭湰浣跨敤鐭祦绋嬶紝澶嶆潅浠诲姟淇濈暀榛樿闀挎祦绋嬨€?
+        # 上次压缩时的消息条数：用于按体积触发压缩后，避免体积持续超阈值时每轮重复压缩。
+        last_compaction_iteration = 0
+        # 自适应迭代上限：S0/轻量脚本使用短流程，复杂任务保留默认长流程。
         max_iterations, compress_interval = _agent_iteration_policy(
             _tasks.get(task_id),
             description,
             bool(memory_context),
         )
-        log("info", f"[{agent_type}] 迭代上限: {max_iterations}{' (续跑模式)' if memory_context else ''}", agent_type)
-        # 杩涘害鑼冨洿锛氭瘡涓?Agent 鐙珛鎺ㄨ繘 27鈫?7锛?5%鈫?0% 涓棿55%鍒嗛厤缁欏悇Agent锛?
+        hard_iteration_cap = _remaining_absolute_iteration_budget(_tasks.get(task_id))
+        log(
+            "info",
+            f"[{agent_type}] 迭代参考: {max_iterations}，硬安全上限: {hard_iteration_cap}{' (续跑模式)' if memory_context else ''}",
+            agent_type,
+        )
+        if _unrestricted_dev_mode(_tasks.get(task_id)):
+            task_for_event = _tasks.get(task_id)
+            if task_for_event is not None:
+                append_event(
+                    task_for_event,
+                    "unrestricted_mode_enabled",
+                    {
+                        "agent": agent_type,
+                        "mode": "unrestricted_dev",
+                        "permissions": ["write_file", "apply_patch", "code_editor", "bash"],
+                    },
+                    source="agent_efficiency",
+                )
+        # 进度范围：每个 Agent 独立进度映射到全局进度中段（中间 55% 分配给各 Agent）
         _base_progress = 27
         _progress_range = 50
 
@@ -4938,45 +6191,56 @@ Required behavior:
             t = _tasks.get(task_id)
             if not t:
                 return
-            # 杩唬杩涘害锛氱N娆?/ max_iterations
+            # 迭代进度使用原策略作为 UI 参考；真正停止由 watchdog/hard cap 决定。
             pct = _base_progress + min(iteration / max_iterations, 1.0) * _progress_range
             t["progress"] = int(pct)
             t["current_step"] = f"[{agent_type}] {step_msg}"
-            # 鍚屾鏇存柊骞惰 Agent 杩涘害杩借釜
+            # 同步更新并行 Agent 进度追踪
             if "agent_progress" in t and agent_type in t["agent_progress"]:
                 t["agent_progress"][agent_type] = int(pct)
 
-        while iteration < max_iterations and self._active_tasks.get(task_id, False):
+        while iteration < hard_iteration_cap and self._active_tasks.get(task_id, False):
             iteration += 1
             task = _tasks.get(task_id)
             if task and task["status"] == "cancelled":
                 break
 
-            _update_progress(f"第 {iteration}/{max_iterations} 轮思考中...")
+            _update_progress(f"第 {iteration} 轮思考中（参考 {max_iterations}，硬上限 {hard_iteration_cap}）...")
             log("info", f"Agent [{agent_type}] 第 {iteration} 次迭代", agent_type)
 
-            # 姣?10 杞洿鏂颁竴娆¤蹇嗘枃浠?
+            # 每 10 轮更新一次记忆文件
             if iteration % 10 == 0:
                 self._update_workspace_memory(
                     ws_path, task_id, status="running",
-                    phase=f"[{agent_type}] 迭代中 ({iteration}/{max_iterations})",
+                    phase=f"[{agent_type}] 迭代中 ({iteration}，参考 {max_iterations})",
                     iteration=iteration,
                 )
 
-            # 鈹€鈹€ 妫€鏌ョ敤鎴峰彂鏉ョ殑瀵硅瘽娑堟伅 鈹€鈹€
+            # ── 检查用户发来的对话消息 ──
             pending_msgs = self._get_pending_user_messages(task_id)
             if pending_msgs:
+                pending_user_messages_seen += len(pending_msgs)
                 log("info", f"收到 {len(pending_msgs)} 条用户消息，注入 Agent", agent_type)
                 for um in pending_msgs:
                     messages.append({
                         "role": "user",
                         "content": um["content"],
                     })
-                # 鐢ㄦ埛娑堟伅娉ㄥ叆鍚庨噸缃凯浠ｈ鏁帮紝閬垮厤鍥犱氦浜掓氮璐瑰お澶氳疆娆?
-                # 鏈€澶氶澶栫粰 20 杞鐞嗙敤鎴锋寚浠?
+                # 用户消息注入后重置迭代计数，避免因交互浪费太多轮次
+                # 最多额外给 20 轮处理用户指令
 
             compacted_this_iteration = False
-            if iteration > 1 and iteration % compress_interval == 0 and len(messages) > 18:
+            # 按上下文体积触发压缩（而非固定轮次）：累计字符数超阈值才压，
+            # 且距上次压缩至少间隔 compress_interval 轮，避免体积持续超阈值时每轮重压。
+            _compact_threshold = int(os.getenv("AUTOCODE_COMPACT_THRESHOLD_CHARS", "80000"))
+            _context_chars = sum(len(str(m.get("content") or "")) for m in messages)
+            _compact_cooldown_passed = (iteration - last_compaction_iteration) >= compress_interval
+            if (
+                iteration > 1
+                and len(messages) > 18
+                and _context_chars >= _compact_threshold
+                and _compact_cooldown_passed
+            ):
                 task_for_event = _tasks.get(task_id)
                 if task_for_event is not None:
                     append_event(
@@ -4991,13 +6255,26 @@ Required behavior:
                         source="context",
                     )
                 summary = _write_context_summary(ws_path, task_id, agent_type, iteration, messages)
+                task_snapshot = _tasks.get(task_id) or {}
+                compact_state = _build_compact_context_state(task_snapshot)
+                summary_excerpt = ""
+                try:
+                    summary_excerpt = (ws_path / ".autocode" / "CONTEXT_SUMMARY.md").read_text(encoding="utf-8", errors="replace")[:2500]
+                except Exception:
+                    summary_excerpt = str(summary or "")[:2500]
                 messages = [
                     messages[0],
                     {
                         "role": "user",
                         "content": (
-                            "上下文已压缩到 .autocode/CONTEXT_SUMMARY.md。"
-                            "请读取该摘要并结合最近消息继续执行，不要重复已完成的工作。"
+                            "上下文已压缩，下面直接给出恢复状态；不要重新扫描项目结构，"
+                            "不要重新读取已读文件，继续当前目标。\n\n"
+                            "## 压缩摘要\n"
+                            f"{summary_excerpt}\n\n"
+                            "## 保留执行状态\n"
+                            f"{json.dumps(compact_state, ensure_ascii=False, indent=2)}\n\n"
+                            "请优先使用 candidate_files 和 read_files 中已有上下文；"
+                            "只有项目上下文 epoch 变化或候选文件不足以完成任务时，才做新的搜索。"
                         ),
                     },
                     *messages[-8:],
@@ -5008,8 +6285,10 @@ Required behavior:
                     "context_compress",
                     f"正在压缩上下文，保留最近状态继续执行（第 {iteration} 轮）",
                 )
+                compacted_this_iteration = True
+                last_compaction_iteration = iteration
 
-            # 鈹€鈹€ v2.0: 浣跨敤 LLMClient 鍙戦€佽姹?鈹€鈹€
+            # ── v2.0: 使用 LLMClient 发送请求 ──
             task_for_event = _tasks.get(task_id)
             if task_for_event is not None and compacted_this_iteration:
                 append_event(
@@ -5026,7 +6305,7 @@ Required behavior:
 
             response: LLMResponse = await llm.chat(
                 messages=messages,
-                tools=AGENT_TOOLS,
+                tools=_effective_agent_tools(_tasks.get(task_id)),
                 system=system,
             )
             if isinstance(llm, FailoverLLMClient) and llm.current_model:
@@ -5062,13 +6341,19 @@ Required behavior:
                     f"finish={getattr(response, 'finish_reason', '')}"
                 )
 
-            # 鈹€鈹€ 澶勭悊宸ュ叿璋冪敤 鈹€鈹€
+            # ── 处理工具调用 ──
             if response.has_tool_calls:
+                edit_intent_without_tool_count = 0
                 iteration_before_snapshot = _workspace_file_snapshot(ws_path)
                 iteration_written_files: list[str] = []
                 iteration_ran_bash = False
                 iteration_bash_exit_code: int | None = None
                 iteration_bash_output: str = ""
+                iteration_had_discovery_tool = False
+                iteration_had_new_discovery = False
+                iteration_duplicate_discovery = False
+                iteration_validation_command = ""
+                iteration_failed_writes: list[dict[str, str]] = []
                 for tc in response.tool_calls:
                     tool_name = tc.name
                     tool_args = tc.arguments
@@ -5082,8 +6367,19 @@ Required behavior:
                     cache_key = _tool_cache_key(tool_name, tool_args, workspace_version)
                     stable_tool_key = f"{tool_name}:{_stable_json(tool_args)}"
                     tool_call_counts[stable_tool_key] = tool_call_counts.get(stable_tool_key, 0) + 1
+                    is_discovery_tool = tool_name in {"read_file", "read_lines", "glob", "search_code"} or (
+                        tool_name == "bash" and _is_read_only_bash(str(tool_args.get("command", "")))
+                    ) or (
+                        tool_name == "code_editor" and str(tool_args.get("command") or "").strip() == "view"
+                    )
+                    if is_discovery_tool:
+                        iteration_had_discovery_tool = True
+                        if tool_call_counts[stable_tool_key] == 1:
+                            iteration_had_new_discovery = True
                     if cache_key and cache_key in tool_cache:
                         repeated_tool_suppressed += 1
+                        if is_discovery_tool:
+                            iteration_duplicate_discovery = True
                         result = tool_cache[cache_key]
                         task_for_event = _tasks.get(task_id)
                         if task_for_event is not None:
@@ -5137,8 +6433,11 @@ Required behavior:
                         })
                         continue
 
-                    if tool_call_counts[stable_tool_key] >= 3 and tool_registry.is_cacheable(tool_name):
+                    duplicate_limit = _env_int("AUTOCODE_DUPLICATE_DISCOVERY_LIMIT", 2, minimum=1)
+                    if tool_call_counts[stable_tool_key] >= duplicate_limit and tool_registry.is_cacheable(tool_name):
                         repeated_tool_suppressed += 1
+                        if is_discovery_tool:
+                            iteration_duplicate_discovery = True
                         result = (
                             "[DUPLICATE_TOOL_SUPPRESSED] This same discovery tool was requested repeatedly. "
                             "The workspace has not changed in a way that requires re-reading it. Proceed with the known context, edit the target files, or run validation."
@@ -5274,11 +6573,39 @@ Required behavior:
                     result = await self._execute_tool(
                         tool_name, tool_args, workspace_id, ws_path, task_id, log, agent_type,
                     )
+                    if is_discovery_tool and result:
+                        result_sig = _discovery_result_signature(result)
+                        discovery_result_counts[result_sig] = discovery_result_counts.get(result_sig, 0) + 1
+                        if discovery_result_counts[result_sig] >= _env_int("AUTOCODE_DUPLICATE_DISCOVERY_LIMIT", 2, minimum=1):
+                            iteration_duplicate_discovery = True
+                            task_for_event = _tasks.get(task_id)
+                            if task_for_event is not None:
+                                append_event(
+                                    task_for_event,
+                                    "duplicate_fact_detected",
+                                    {
+                                        "agent": agent_type,
+                                        "iteration": iteration,
+                                        "tool": tool_name,
+                                        "args": tool_args,
+                                        "signature": result_sig,
+                                        "count": discovery_result_counts[result_sig],
+                                    },
+                                    source="agent_efficiency",
+                                )
+                            result += (
+                                "\n\n[DUPLICATE_FACT_DETECTED] 已重复得到相同发现。"
+                                "停止继续读取/搜索，必须基于现有上下文进入编辑、验证，或提出一个具体阻塞问题。"
+                            )
                     if cache_key and result:
                         tool_cache[cache_key] = result
-                    if tool_registry.mutates_workspace(tool_name) and tool_name in {"write_file", "apply_patch"}:
+                    is_mutating_edit = tool_name in {"write_file", "apply_patch"} or (
+                        tool_name == "code_editor"
+                        and str(tool_args.get("command") or "").strip() in {"create", "str_replace", "insert", "undo_edit"}
+                    )
+                    if tool_registry.mutates_workspace(tool_name) and is_mutating_edit:
                         rel_written = str(tool_args.get("path", "")).strip().replace("\\", "/").lstrip("/")
-                        if result.startswith("[OK]") and rel_written:
+                        if _tool_result_indicates_write_success(result) and rel_written:
                             writes_count += 1
                             effective_progress_count += 1
                             workspace_version += 1
@@ -5302,11 +6629,33 @@ Required behavior:
                             except Exception:
                                 pass
                             iteration_written_files.append(rel_written)
+                            if rel_written not in aggregate_written_files:
+                                aggregate_written_files.append(rel_written)
+                            task_for_write_event = _tasks.get(task_id)
+                            if task_for_write_event is not None and _unrestricted_dev_mode(task_for_write_event):
+                                append_event(
+                                    task_for_write_event,
+                                    "workspace_write_unrestricted",
+                                    {
+                                        "agent": agent_type,
+                                        "tool": tool_name,
+                                        "path": rel_written,
+                                        "iteration": iteration,
+                                    },
+                                    source="agent_efficiency",
+                                )
+                        elif rel_written:
+                            iteration_failed_writes.append({
+                                "tool": tool_name,
+                                "path": rel_written,
+                                "result": result[:1600],
+                            })
                     elif tool_name == "git_commit":
                         commands_count += 1
                     elif tool_name == "bash":
                         commands_count += 1
                         iteration_ran_bash = True
+                        iteration_validation_command = str(tool_args.get("command", ""))
                         if "[exit_code=" in result:
                             try:
                                 idx = result.rfind("[exit_code=")
@@ -5359,7 +6708,7 @@ Required behavior:
                                 except Exception as exc:
                                     logger.debug(f"[CacheLedger] save validated solution skipped for {task_id}: {exc}")
 
-                    # 灏嗗伐鍏锋墽琛岃繘搴︽帹閫佸埌瀵硅瘽 SSE锛堢敤鎴峰彲瑙侊級
+                    # 将工具执行进度推送到对话 SSE（用户可见）
                     output_meta = bound_tool_output(ws_path, result, tool_name=tool_name)
                     result_for_event = output_meta["preview"]
                     result_for_model = output_meta["model_preview"]
@@ -5384,8 +6733,8 @@ Required behavior:
                             source=agent_type,
                         )
 
-                    # 浣跨敤 OpenAI-compatible 鏍煎紡杩藉姞娑堟伅
-                    # DeepSeek 鎺ㄧ悊妯″瀷闇€瑕佷紶鍥?reasoning_content
+                    # 使用 OpenAI-compatible 格式追加消息
+                    # DeepSeek 推理模型需要传回 reasoning_content
                     assistant_msg = {
                         "role": "assistant",
                         "content": response.content or None,
@@ -5399,16 +6748,32 @@ Required behavior:
                         }],
                     }
                     if response.reasoning_content:
-                        # 娴佸紡鎺ㄩ€佹€濊€冭繃绋嬪埌鍓嶇
+                        # 流式推送思考过程到前端
                         self._push_tool_progress(task_id, 'thinking', {'content': response.reasoning_content}, '')
                         assistant_msg["reasoning_content"] = response.reasoning_content
                     messages.append(assistant_msg)
                     messages.append({
                         "role": "tool",
                         "tool_call_id": tc.id,
-                        "content": f"[{tool_name} 鎵ц缁撴灉]\n{result}",
+                        "content": f"[{tool_name} 执行结果]\n{result}",
                     })
                     messages[-1]["content"] = f"[{tool_name} result]\n{result_for_model}"
+
+                if iteration_failed_writes:
+                    failure_lines = "\n\n".join(
+                        f"- {item['tool']} `{item['path']}`:\n{item['result']}"
+                        for item in iteration_failed_writes[:5]
+                    )
+                    messages.append({
+                        "role": "user",
+                        "content": (
+                            "[WRITE_TOOL_FAILED]\n"
+                            "上一轮写入工具没有产生成功写入。不要结束任务，也不要进入审查。\n"
+                            f"{failure_lines}\n\n"
+                            "请立即读取目标附近内容，修正 search/replace，或改用 code_editor 的 "
+                            "str_replace/insert/create 完成实际写入；写入后再运行验证。"
+                        ),
+                    })
 
                 if iteration_written_files:
                     try:
@@ -5478,13 +6843,14 @@ Required behavior:
                     validation_reminded_at_write_count = writes_count
                     messages.append({
                         "role": "user",
-                        "content": "你已经写入了文件，但还没有运行验证命令。请立即运行验证命令（如 python -m py_compile、npm run build 等）确认代码没有语法错误。如果验证失败，分析错误并修复，不要停下来等用户。",
+                        "content": "你已经写入了文件，但还没有完成验证。请根据当前 ExecutionPlan、真实 manifest 和目标产物格式选择匹配的验证方式；没有依据时不要猜测 npm 或其他构建命令。验证失败时分析真实错误并修复。",
                     })
                     log("info", f"[{agent_type}] validation gate: remind Agent to run validation", "orchestrator")
                 elif (
                     iteration_ran_bash
                     and iteration_bash_exit_code is not None
                     and iteration_bash_exit_code != 0
+                    and _is_validation_command(iteration_validation_command)
                     and validation_failure_reminded_at_command_count != commands_count
                 ):
                     validation_failure_reminded_at_command_count = commands_count
@@ -5493,6 +6859,118 @@ Required behavior:
                         "content": f"验证命令失败（退出码 {iteration_bash_exit_code}）。\n输出内容:\n{iteration_bash_output[:1500]}\n\n请分析上面的错误信息，修复代码中的问题，然后重新运行验证。不要停下来等用户，自己修复直到验证通过。",
                     })
                     log("info", f"[{agent_type}] validation gate: validation failed(exit={iteration_bash_exit_code}), asking Agent to fix", "orchestrator")
+
+                current_snapshot_for_watchdog = _workspace_file_snapshot(ws_path)
+                changed_for_watchdog = _snapshot_changed(before_snapshot, current_snapshot_for_watchdog)
+                repeated_discovery_without_progress = (
+                    iteration_had_discovery_tool
+                    and not iteration_written_files
+                    and not validated_after_write
+                    and not iteration_ran_bash
+                    and (not iteration_had_new_discovery or iteration_duplicate_discovery)
+                )
+                if repeated_discovery_without_progress:
+                    discovery_only_streak += 1
+                elif iteration_written_files or validated_after_write or pending_msgs:
+                    discovery_only_streak = 0
+                signature = _progress_watchdog_signature(
+                    _tasks.get(task_id),
+                    changed_files=changed_for_watchdog,
+                    written_files=iteration_written_files,
+                    validation_command=iteration_validation_command if _is_validation_command(iteration_validation_command) else "",
+                    validation_exit_code=iteration_bash_exit_code,
+                    validation_output=iteration_bash_output,
+                    pending_user_messages=pending_user_messages_seen,
+                )
+                watchdog_result = _apply_progress_watchdog(
+                    _tasks.get(task_id) or {},
+                    signature,
+                    iteration=iteration,
+                    agent_type=agent_type,
+                    duplicate_discovery=iteration_duplicate_discovery or discovery_only_streak >= _env_int("AUTOCODE_DUPLICATE_DISCOVERY_LIMIT", 2, minimum=1),
+                    discovery_progress=bool(
+                        iteration_had_discovery_tool
+                        and iteration_had_new_discovery
+                        and not iteration_duplicate_discovery
+                    ),
+                    action_progress=bool(
+                        iteration_written_files
+                        or validated_after_write
+                        or pending_msgs
+                        or (iteration_ran_bash and _is_validation_command(iteration_validation_command))
+                    ),
+                )
+                task_for_event = _tasks.get(task_id)
+                if task_for_event is not None:
+                    event_type = "progress_watchdog_progress" if watchdog_result["made_progress"] else "progress_watchdog_tick"
+                    append_event(
+                        task_for_event,
+                        event_type,
+                        {
+                            "agent": agent_type,
+                            "iteration": iteration,
+                            "signature": signature,
+                            "no_progress_iterations": watchdog_result["watchdog"].get("no_progress_iterations"),
+                            "duplicate_discovery_streak": watchdog_result["watchdog"].get("duplicate_discovery_streak"),
+                            "discovery_progress": bool(
+                                iteration_had_discovery_tool
+                                and iteration_had_new_discovery
+                                and not iteration_duplicate_discovery
+                            ),
+                            "action_progress": bool(
+                                iteration_written_files
+                                or validated_after_write
+                                or pending_msgs
+                                or (iteration_ran_bash and _is_validation_command(iteration_validation_command))
+                            ),
+                        },
+                        source="agent_efficiency",
+                    )
+                if watchdog_result["force_transition"]:
+                    task_for_event = _tasks.get(task_id)
+                    if task_for_event is not None:
+                        append_event(
+                            task_for_event,
+                            "forced_transition_requested",
+                            {
+                                "agent": agent_type,
+                                "iteration": iteration,
+                                "reason": watchdog_result["reason"],
+                                "discovery_only_streak": discovery_only_streak,
+                                "watchdog": watchdog_result["watchdog"],
+                            },
+                            source="agent_efficiency",
+                        )
+                        self._persist_task(task_id)
+                    messages.append({
+                        "role": "user",
+                        "content": (
+                            "[FORCED_TRANSITION_REQUIRED]\n"
+                            "你已经重复读取/搜索或连续没有产生新进展。下一轮禁止继续做相同 discovery。"
+                            "必须三选一：1) 基于已知目标文件直接编辑；2) 运行或修复验证；3) 提出一个具体阻塞问题。"
+                        ),
+                    })
+                    log("warn", f"[{agent_type}] progress watchdog requested forced transition", "agent_efficiency")
+                if watchdog_result["stop"]:
+                    task_for_event = _tasks.get(task_id)
+                    if task_for_event is not None:
+                        task_for_event["needs_continuation"] = False
+                        task_for_event["agent_iteration_limited"] = False
+                        task_for_event["agent_iteration_limit_reason"] = "blocked_by_no_progress"
+                        append_event(
+                            task_for_event,
+                            "agent_paused_no_progress",
+                            {
+                                "agent": agent_type,
+                                "iteration": iteration,
+                                "reason": watchdog_result["reason"],
+                                "watchdog": watchdog_result["watchdog"],
+                            },
+                            source="agent_efficiency",
+                        )
+                        self._persist_task(task_id)
+                    log("warn", f"[{agent_type}] paused by progress watchdog: no progress after forced transition", "agent_efficiency")
+                    break
 
                 if iteration_written_files:
                     current_snapshot = _workspace_file_snapshot(ws_path)
@@ -5536,43 +7014,122 @@ Required behavior:
                     break
 
             if response.content:
-                # 鍙湁鏂囨湰銆佹棤宸ュ叿璋冪敤鏃讹紝杩藉姞鏅€?assistant 娑堟伅
+                # 只有文本、无工具调用时，追加普通 assistant 消息
                 if not response.has_tool_calls:
                     assistant_msg = {"role": "assistant", "content": response.content}
                     if response.reasoning_content:
-                        # 娴佸紡鎺ㄩ€佹€濊€冭繃绋嬪埌鍓嶇
+                        # 流式推送思考过程到前端
                         assistant_msg["reasoning_content"] = response.reasoning_content
                     messages.append(assistant_msg)
 
                 log("success", response.content[:200], agent_type)
-                # 鏇存柊杩涘害锛氭鍦ㄨ鍒?鐢熸垚
-                _update_progress("姝ｅ湪缂栧啓浠ｇ爜鍜岃鍒掓柟妗?..")
+                # 更新进度：正在规划/生成
+                _update_progress("正在整理执行结果和下一步...")
 
-                # 鈹€鈹€ 灏?Agent 鍝嶅簲鎺ㄩ€佸埌瀵硅瘽 SSE 闃熷垪锛堜粎鎺ㄩ€侀潪宸ュ叿璋冪敤鐨勬枃鏈唴瀹癸級鈹€鈹€
+                # ── 将 Agent 响应推送到对话 SSE 队列（仅推送非工具调用的文本内容）──
                 if not response.has_tool_calls:
                     self._push_agent_response(task_id, response.content)
 
-                # 妫€鏌ユ槸鍚﹀畬鎴?
-                content_lower = response.content.lower()
-                if any(kw in content_lower for kw in ["????", "???", "done", "completed", "all done"]):
-                    log("success", f"[{agent_type}] ????", agent_type)
+                if not response.has_tool_calls and _assistant_content_requests_blocking_input(response.content):
+                    task_for_event = _tasks.get(task_id)
+                    if task_for_event is not None:
+                        if (
+                            _autonomy_mode(task_for_event) == "strong"
+                            and _is_soft_entry_blocker(response.content)
+                            and not _is_hard_blocking_input(response.content)
+                        ):
+                            messages.append({
+                                "role": "user",
+                                "content": _auto_decision_for_soft_blocker(
+                                    task_for_event,
+                                    task_id=task_id,
+                                    agent_type=agent_type,
+                                    iteration=iteration,
+                                    content=response.content,
+                                ),
+                            })
+                            self._persist_task(task_id)
+                            log("warn", f"[{agent_type}] soft blocker auto-resolved by strong autonomy", "agent_autonomy")
+                            continue
+                        opened = _open_blocking_input_request(
+                            task_for_event,
+                            task_id=task_id,
+                            agent_type=agent_type,
+                            iteration=iteration,
+                            content=response.content,
+                        )
+                        self._persist_task(task_id)
+                        if opened:
+                            log("warn", f"[{agent_type}] waiting for structured user input", "agent_blocker")
+                        raise AgentWaitingForUserInput(response.content[:500])
                     break
 
-            # 娌℃湁宸ュ叿璋冪敤涔熸病鏈夋枃鏈?鈫?LLM 鍙兘缁撴潫
+                if not response.has_tool_calls and _assistant_content_promises_edit_without_tool(response.content):
+                    edit_intent_without_tool_count += 1
+                    task_for_event = _tasks.get(task_id)
+                    if task_for_event is not None:
+                        append_event(
+                            task_for_event,
+                            "edit_tool_required",
+                            {
+                                "agent": agent_type,
+                                "iteration": iteration,
+                                "count": edit_intent_without_tool_count,
+                                "message": response.content[:1000],
+                            },
+                            source="agent_efficiency",
+                        )
+                        self._persist_task(task_id)
+                    messages.append({
+                        "role": "user",
+                        "content": (
+                            "[EDIT_TOOL_REQUIRED]\n"
+                            "你刚才说要开始编辑/修改文件，但这一轮没有发出任何编辑工具调用。"
+                            "下一轮禁止继续笼统分析或重复读取；必须三选一："
+                            "1) 调用 apply_patch/code_editor/write_file 完成实际写入；"
+                            "2) 如果已经写入，运行验证；"
+                            "3) 给出一个具体阻塞原因（缺哪个文件、哪个符号、哪段内容匹配不上）。"
+                        ),
+                    })
+                    log("warn", f"[{agent_type}] assistant promised edits without tool call; forcing edit tool next", "agent_efficiency")
+                    if edit_intent_without_tool_count <= 1:
+                        continue
+                    break
+
+                # 检查是否完成
+                if _assistant_content_says_complete(response.content):
+                    task_for_event = _tasks.get(task_id)
+                    if task_for_event is not None:
+                        append_event(
+                            task_for_event,
+                            "task_stop_guard_triggered",
+                            {
+                                "reason": "assistant_reported_completion",
+                                "agent": agent_type,
+                                "iteration": iteration,
+                                "message": response.content[:1000],
+                            },
+                            source="agent_guardrail",
+                        )
+                    log("success", f"[{agent_type}] 已报告完成，触发停止护栏", agent_type)
+                    break
+
+            # 没有工具调用也没有文本 → LLM 可能结束
             if not response.has_tool_calls and not response.content:
-                # 鎺ㄧ悊妯″瀷鍙兘鍙繑鍥?reasoning_content 鑰屾棤姝ｆ枃锛屼篃闇€璁板綍
+                # 推理模型可能只返回 reasoning_content 而无正文，也需记录
                 if response.reasoning_content:
-                    # 娴佸紡鎺ㄩ€佹€濊€冭繃绋嬪埌鍓嶇
+                    # 流式推送思考过程到前端
                     assistant_msg = {"role": "assistant", "content": None}
                     assistant_msg["reasoning_content"] = response.reasoning_content
                     messages.append(assistant_msg)
                 else:
-                    log("info", f"[{agent_type}] LLM 杩斿洖绌哄搷搴旓紝缁撴潫", agent_type)
+                    log("info", f"[{agent_type}] LLM 返回空响应，结束本轮", agent_type)
                     break
 
             await asyncio.sleep(0.5)
 
-        # 妫€鏌ユ槸鍚﹀洜杩唬涓婇檺鑰岄€€鍑?
+        task = _tasks.get(task_id) or task or {}
+        # 只有硬安全上限会触发 continuation/人工确认保险丝；低轮次策略仅作 UI 参考。
         after_snapshot_for_limit = _workspace_file_snapshot(ws_path)
         changed_files_for_limit = _snapshot_changed(before_snapshot, after_snapshot_for_limit)
         has_meaningful_progress = bool(
@@ -5580,36 +7137,35 @@ Required behavior:
             or effective_progress_count > 0
             or _has_meaningful_output_artifact(ws_path, changed_files_for_limit)
         )
-        suppress_iteration_limit_continuation = False
-        if iteration >= max_iterations and has_meaningful_progress:
+        hit_hard_iteration_cap = iteration >= hard_iteration_cap
+        if iteration >= max_iterations and has_meaningful_progress and not hit_hard_iteration_cap:
             log(
                 "info",
-                f"[{agent_type}] reached iteration budget after producing artifacts; no auto-continuation needed.",
+                f"[{agent_type}] passed iteration reference after producing progress; continuing under watchdog.",
                 "agent_efficiency",
             )
             task.pop("needs_continuation", None)
             task.pop("agent_iteration_limited", None)
             task.pop("agent_iteration_limit_reason", None)
-            suppress_iteration_limit_continuation = True
 
-        if iteration >= max_iterations and not suppress_iteration_limit_continuation:
-            # 淇濆瓨褰撳墠鐘舵€佸埌 MEMORY.md 鏀寔鏂偣缁窇
+        if hit_hard_iteration_cap:
+            # 保存当前状态到 MEMORY.md 支持断点续跑
             self._update_workspace_memory(
                 ws_path, task_id,
                 status="needs_continuation",
-                phase=f"迭代上限({max_iterations})",
-                issues=[f"达到 {max_iterations} 轮迭代上限，任务可能尚未完全完成"],
+                phase=f"硬安全上限({hard_iteration_cap})",
+                issues=[f"达到 {hard_iteration_cap} 轮硬安全上限，任务可能尚未完全完成"],
                 decisions=[f"共执行 {iteration} 轮 LLM 迭代"],
                 iteration=iteration,
             )
-            # 鍚屾椂淇濆瓨娑堟伅鍘嗗彶鎽樿
+            # 同时保存消息历史摘要
             summary_file = ws_path / ".autocode" / "SESSION_SUMMARY.md"
             summary_lines = [
                 f"# 会话摘要 - {task_id[:8]}",
                 "",
                 f"> 截断时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
                 f"> Agent: {agent_type}",
-                f"> 总轮次: {iteration}/{max_iterations}",
+                f"> 总轮次: {iteration}/{hard_iteration_cap}",
                 "",
                 "## 最后几条消息",
                 "",
@@ -5626,16 +7182,16 @@ Required behavior:
             summary_file.write_text(summary_content, encoding="utf-8")
 
             log("warn",
-                f"[{agent_type}] 达到迭代上限 {max_iterations}，状态已保存到 .autocode/"
-                f"MEMORY.md + SESSION_SUMMARY.md。系统将自动续跑或等待用户点击继续。",
+                f"[{agent_type}] 达到硬安全上限 {hard_iteration_cap}，状态已保存到 .autocode/"
+                f"MEMORY.md + SESSION_SUMMARY.md。系统将自动续跑保险丝或等待用户点击继续。",
                 "orchestrator")
             task["needs_continuation"] = True
 
-        # 璁板綍杩唬娆℃暟渚?execute_task 浣跨敤
-        if task.get("needs_continuation") and iteration >= max_iterations and not suppress_iteration_limit_continuation:
+        # 记录迭代次数供 execute_task 使用
+        if task.get("needs_continuation") and hit_hard_iteration_cap:
             task["agent_iteration_limited"] = True
-            task["agent_iteration_limit_reason"] = "per_run_iteration_budget"
-            task["current_step"] = "达到单段迭代上限，正在自动压缩上下文并继续。"
+            task["agent_iteration_limit_reason"] = "absolute_iteration_cap"
+            task["current_step"] = "达到硬安全上限，正在保存上下文并请求续跑确认。"
             self._push_phase_progress(
                 task_id,
                 "auto_continuation_checkpoint",
@@ -5643,7 +7199,7 @@ Required behavior:
             )
             log(
                 "warn",
-                f"[{agent_type}] 达到单段迭代上限 {max_iterations}，后台队列将自动续跑。",
+                f"[{agent_type}] 达到硬安全上限 {hard_iteration_cap}，后台队列将进入续跑保险丝。",
                 "orchestrator",
             )
         task["agent_iteration"] = iteration
@@ -5658,6 +7214,9 @@ Required behavior:
             logger.debug(f"[SystemContext] final reconcile failed for {task_id}: {exc}")
         after_snapshot = _workspace_file_snapshot(ws_path)
         changed_files = _snapshot_changed(before_snapshot, after_snapshot)
+        if aggregate_written_files:
+            changed_files = list(dict.fromkeys([*changed_files, *aggregate_written_files]))
+        meaningful_changed_files = _meaningful_changed_file_list(changed_files)
         task["last_agent_result"] = {
             "agent_type": agent_type,
             "iterations": iteration,
@@ -5666,10 +7225,298 @@ Required behavior:
             "commands_count": commands_count,
             "repeated_tool_suppressed": repeated_tool_suppressed,
             "validated_after_write": validated_after_write,
-            "changed_files": changed_files[:50],
+            "changed_files": meaningful_changed_files[:50],
+            "raw_changed_files": changed_files[:50],
             "source_files": _count_source_files(ws_path),
         }
-        return bool(changed_files or writes_count > 0)
+        return bool(meaningful_changed_files)
+
+    # Read-only subagent types the parent may spawn. Kept intentionally small:
+    # both are research/review roles with no write mandate, so a spawned run
+    # cannot mutate the workspace beyond what its read-only tool set allows.
+    _SPAWN_SUBAGENT_TYPES = {"researcher", "reviewer"}
+    # Tool subset a spawned subagent is allowed to use. Read/search/intelligence
+    # only — no write_file/apply_patch/code_editor/bash, and no spawn_subagent
+    # (prevents recursive spawning).
+    _SPAWN_SUBAGENT_TOOLS = ["read_file", "read_lines", "list_files", "search_code", "glob", "lsp", "thinking"]
+    _MAX_BACKGROUND_SUBAGENTS = 3
+
+    async def _execute_spawn_subagent(
+        self, args: dict, workspace_id: str, ws_path: Path,
+        parent_task_id: str, project_type: str, log,
+    ) -> str:
+        """Spawn a read-only research/review subagent.
+
+        Foreground mode preserves the existing blocking behavior. Background
+        mode starts an isolated child task and injects its result into the
+        parent's pending message queue when it finishes.
+        """
+        subagent_type = str(args.get("subagent_type") or "").strip().lower()
+        prompt = str(args.get("prompt") or "").strip()
+        description = str(args.get("description") or "").strip() or "subagent task"
+        background = bool(args.get("background"))
+
+        if subagent_type not in self._SPAWN_SUBAGENT_TYPES:
+            allowed = ", ".join(sorted(self._SPAWN_SUBAGENT_TYPES))
+            return f"[错误] 不支持的 subagent_type: {subagent_type or '(空)'}。仅允许只读研究/审查类型：{allowed}。"
+        if not prompt:
+            return "[错误] spawn_subagent 需要 prompt 参数（要交给子 Agent 的任务描述）。"
+
+        if background:
+            return self._start_background_subagent(
+                subagent_type, prompt, description,
+                workspace_id, ws_path, parent_task_id, project_type, log,
+            )
+
+        sub_task_id = f"{parent_task_id}::sub-{uuid.uuid4().hex[:8]}"
+        log("info", f"派生只读子 Agent（{subagent_type}）：{description}", "orchestrator")
+        return await self._run_isolated_subagent(
+            sub_task_id, subagent_type, prompt,
+            workspace_id, ws_path, parent_task_id, project_type, log,
+        )
+
+    def _start_background_subagent(
+        self,
+        subagent_type: str,
+        prompt: str,
+        description: str,
+        workspace_id: str,
+        ws_path: Path,
+        parent_task_id: str,
+        project_type: str,
+        log,
+    ) -> str:
+        live = self._prune_background_subagents(parent_task_id)
+        if live >= self._MAX_BACKGROUND_SUBAGENTS:
+            return (
+                f"[错误] 后台子 Agent 已达到并发上限 "
+                f"{self._MAX_BACKGROUND_SUBAGENTS}，请等待已有子 Agent 完成。"
+            )
+
+        sub_task_id = f"{parent_task_id}::sub-{uuid.uuid4().hex[:8]}"
+        log("info", f"后台派生只读子 Agent（{subagent_type}）：{description}", "orchestrator")
+        task = asyncio.create_task(
+            self._run_background_subagent(
+                sub_task_id, subagent_type, prompt,
+                workspace_id, ws_path, parent_task_id, project_type, log,
+            )
+        )
+        task.add_done_callback(lambda _task: self._prune_background_subagents(parent_task_id))
+        self._background_subagents.setdefault(parent_task_id, []).append(task)
+        return (
+            f'<subagent type="{subagent_type}" state="running">\n'
+            "后台子 agent 已启动，完成后结果会自动送达，不要轮询。\n"
+            "</subagent>"
+        )
+
+    def _prune_background_subagents(self, parent_task_id: str) -> int:
+        tasks = self._background_subagents.get(parent_task_id) or []
+        live = [task for task in tasks if not task.done()]
+        if live:
+            self._background_subagents[parent_task_id] = live
+        else:
+            self._background_subagents.pop(parent_task_id, None)
+        return len(live)
+
+    async def _run_background_subagent(
+        self,
+        sub_task_id: str,
+        subagent_type: str,
+        prompt: str,
+        workspace_id: str,
+        ws_path: Path,
+        parent_task_id: str,
+        project_type: str,
+        log,
+    ) -> None:
+        try:
+            envelope = await self._run_isolated_subagent(
+                sub_task_id, subagent_type, prompt,
+                workspace_id, ws_path, parent_task_id, project_type, log,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"[spawn_subagent:background] {subagent_type} failed: {exc}")
+            envelope = f'<subagent type="{subagent_type}" state="error">\n子 Agent 执行失败：{exc}\n</subagent>'
+        finally:
+            self._prune_background_subagents(parent_task_id)
+
+        self._inject_background_subagent_result(parent_task_id, envelope)
+
+    def _inject_background_subagent_result(self, parent_task_id: str, envelope: str) -> None:
+        message = {
+            "id": f"background-subagent-{uuid.uuid4().hex[:12]}",
+            "content": envelope,
+            "timestamp": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+            "source": "background_subagent",
+        }
+        self._user_message_queues.setdefault(parent_task_id, []).append(message)
+        if parent_task_id in self._message_events:
+            self._message_events[parent_task_id].set()
+
+    async def _cancel_background_subagents(self, parent_task_id: str) -> None:
+        tasks = self._background_subagents.pop(parent_task_id, [])
+        pending = [task for task in tasks if not task.done()]
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+
+    async def _run_isolated_subagent(
+        self,
+        sub_task_id: str,
+        subagent_type: str,
+        prompt: str,
+        workspace_id: str,
+        ws_path: Path,
+        parent_task_id: str,
+        project_type: str,
+        log,
+    ) -> str:
+        parent_task = _tasks.get(parent_task_id) or {}
+        # Minimal isolated task dict: shares workspace + model, but all loop
+        # state (iterations, messages, continuation) starts clean and is thrown
+        # away when the subagent finishes.
+        _tasks[sub_task_id] = {
+            "id": sub_task_id,
+            "parent_task_id": parent_task_id,
+            "workspace_id": workspace_id,
+            "project_type": project_type,
+            "model": parent_task.get("model"),
+            "user_id": parent_task.get("user_id"),
+            "tenant_id": parent_task.get("tenant_id"),
+            "is_subagent": True,
+            # Read-only tool subset — enforced in the chat loop via _effective_agent_tools.
+            "allowed_tools": list(self._SPAWN_SUBAGENT_TOOLS),
+            "logs": [],
+            "events": [],
+        }
+        self._active_tasks[sub_task_id] = True
+
+        sub_prompt = "\n".join([
+            f"## 子 Agent 任务（{subagent_type}，只读模式）",
+            "",
+            "你是被主 Agent 派生的只读子 Agent。严格约束：",
+            "- 只能使用 read_file / read_lines / list_files / search_code / glob / lsp 等只读工具。",
+            "- 禁止任何写入或命令执行（没有 write_file/apply_patch/code_editor/bash 权限）。",
+            "- 不要尝试修改工作区；你的产出是一份结论文本，交回主 Agent。",
+            "",
+            "## 主 Agent 交给你的任务",
+            prompt,
+            "",
+            "## 输出要求",
+            "完成调查后，用中文输出简明、可执行的结论：关键发现、依据文件/位置、风险与建议。",
+            "这段结论就是你的最终返回值，主 Agent 会据此继续工作。",
+        ])
+
+        try:
+            result = await self._run_single_agent_with_usage(
+                sub_task_id, sub_prompt, project_type, workspace_id,
+                subagent_type, ws_path, log, None,
+            )
+            summary = ""
+            if isinstance(result, dict):
+                summary = str(result.get("summary") or "").strip()
+            if not summary:
+                summary = "（子 Agent 未产生结论文本）"
+            state = "completed" if (isinstance(result, dict) and result.get("success")) else "error"
+            return (
+                f'<subagent type="{subagent_type}" state="{state}">\n'
+                f"{summary}\n"
+                f"</subagent>"
+            )
+        except Exception as exc:  # noqa: BLE001 — never propagate into the parent loop
+            logger.warning(f"[spawn_subagent] {subagent_type} failed: {exc}")
+            return f'<subagent type="{subagent_type}" state="error">\n子 Agent 执行失败：{exc}\n</subagent>'
+        finally:
+            self._active_tasks.pop(sub_task_id, None)
+            _tasks.pop(sub_task_id, None)
+
+    async def _execute_lsp_tool(self, args: dict, workspace_id: str, ws_path: Path) -> str:
+        """Handle the ``lsp`` agent tool: query language-server code intelligence.
+
+        Best-effort and fully bounded — any missing server / disabled feature
+        returns a marker string instead of raising into the agent loop.
+        """
+        from runtime.lsp.lsp_manager import lsp_registry
+
+        operation = str(args.get("operation") or "").strip()
+        rel_path = str(args.get("filePath") or args.get("path") or "").strip()
+        if not operation:
+            return "[错误] lsp 需要 operation 参数"
+        if not rel_path:
+            return "[错误] lsp 需要 filePath 参数"
+        try:
+            target = _safe_workspace_path(ws_path, rel_path, must_exist=True)
+        except (PermissionError, FileNotFoundError) as exc:
+            return f"[错误] {exc}"
+
+        mgr = await lsp_registry.get(workspace_id, str(ws_path))
+        if mgr is None:
+            return "[LSP_DISABLED] LSP 已禁用（AUTOCODE_LSP_ENABLED=0）。"
+        file_abs = str(target)
+        if not await mgr.has_clients(file_abs):
+            return "[LSP_UNAVAILABLE] 该文件类型没有可用的语言服务器（可能未安装对应 LSP，或非受支持语言）。"
+
+        # line/character arrive 1-based from the model; LSP wants 0-based.
+        line = max(0, int(args.get("line") or 1) - 1)
+        character = max(0, int(args.get("character") or 1) - 1)
+
+        if operation == "goToDefinition":
+            res = await mgr.definition(file_abs, line, character)
+        elif operation == "findReferences":
+            res = await mgr.references(file_abs, line, character)
+        elif operation == "hover":
+            res = await mgr.hover(file_abs, line, character)
+        elif operation == "goToImplementation":
+            res = await mgr.implementation(file_abs, line, character)
+        elif operation == "documentSymbol":
+            res = await mgr.document_symbol(file_abs)
+        elif operation == "workspaceSymbol":
+            res = await mgr.workspace_symbol(file_abs, str(args.get("query") or ""))
+        else:
+            return f"[错误] 不支持的 lsp operation: {operation}"
+
+        if not res:
+            return f"[无结果] {operation} 未返回任何结果"
+        import json as _json
+        return f"[OK] {operation} 结果:\n" + _json.dumps(res, ensure_ascii=False, indent=2)[:4000]
+
+    async def _diagnostics_feedback(self, workspace_id: str, ws_path: Path, rel_path: str) -> str:
+        """After a successful edit, open the file in its language server and return
+        a compact ``<diagnostics>`` block for any errors it introduced.
+
+        Best-effort and fully bounded: returns an empty string when LSP is
+        disabled, no server matches the file type, the wait times out, or
+        anything goes wrong. Never raises into the tool dispatch path. The
+        returned string (when non-empty) is meant to be appended to the edit
+        tool's success message so the model sees its own compile/type errors on
+        the next turn.
+        """
+        try:
+            rel = str(rel_path or "").strip().replace("\\", "/").lstrip("/")
+            # Skip internal bookkeeping files — never worth diagnosing.
+            if not rel or rel.startswith(".autocode/"):
+                return ""
+            from runtime.lsp.lsp_manager import lsp_registry
+            from runtime.lsp import format_diagnostics
+
+            mgr = await lsp_registry.get(workspace_id, str(ws_path))
+            if mgr is None:
+                return ""
+            file_abs = str((ws_path / rel).resolve())
+            if not await mgr.has_clients(file_abs):
+                return ""
+            diags_map = await mgr.touch_file(file_abs, wait_diagnostics=True)
+            diagnostics = diags_map.get(file_abs) or []
+            block = format_diagnostics(rel, diagnostics)
+            if not block:
+                return ""
+            return "\n\n" + block
+        except Exception as exc:  # noqa: BLE001 — diagnostics must never break edits
+            logger.debug(f"[LSP] diagnostics feedback skipped for {rel_path}: {exc}")
+            return ""
 
     async def _execute_tool(
         self,
@@ -5705,7 +7552,17 @@ Required behavior:
                 log("warn", f"Tool blocked by permission engine: {tool_name} - {permission.reason}", "security")
                 return f"[ERROR] Tool blocked: {permission.reason}"
             spec = tool_registry.get(tool_name)
-            if permission.needs_approval and (spec.requires_confirmation if spec else tool_name in {"bash", "rollback", "start_preview", "spawn_subagent"}):
+            read_only_bash = tool_name == "bash" and _is_read_only_bash(str(args.get("command", "")))
+            unrestricted_workspace_tool = (
+                _unrestricted_dev_mode(task_for_event)
+                and tool_name in {"write_file", "apply_patch", "code_editor", "bash"}
+            )
+            if (
+                permission.needs_approval
+                and not read_only_bash
+                and not unrestricted_workspace_tool
+                and (spec.requires_confirmation if spec else tool_name in {"bash", "rollback", "start_preview", "spawn_subagent"})
+            ):
                 approval_id = f"approval-{uuid.uuid4().hex[:12]}"
                 auto_approve_after = int((permission.approval_payload or {}).get("auto_approve_after_seconds") or 0)
                 manual_required = bool((permission.approval_payload or {}).get("manual_required"))
@@ -5800,16 +7657,52 @@ Required behavior:
                         self._persist_task(task_id)
                     return f"[TIMEOUT] Approval timed out for {tool_name}: {permission.reason}"
 
-            if tool_name == "read_file":
+            read_guard_hint = ""
+            if tool_name in {"read_file", "read_lines"}:
                 task_for_guard = _tasks.get(task_id)
-                blocked = _check_retrieval_read_guard(task_for_guard, str(args.get("path", "")))
-                if blocked:
-                    if task_for_guard is not None:
-                        self._persist_task(task_id)
-                    log("warn", f"retrieval guard blocked read_file: {args.get('path', '')}", "retrieval_guard")
-                    return blocked
+                read_guard_hint = _check_retrieval_read_guard(task_for_guard, str(args.get("path", ""))) or ""
+                if read_guard_hint:
+                    log("info", f"retrieval guard soft hint for {tool_name}: {args.get('path', '')}", "retrieval_guard")
                 if task_for_guard is not None:
                     self._persist_task(task_id)
+            artifact_probe_path = ""
+            if tool_name in {"read_file", "read_lines"}:
+                artifact_probe_path = str(args.get("path") or "")
+            elif tool_name == "code_editor" and str(args.get("command") or "").strip() == "view":
+                artifact_probe_path = str(args.get("path") or "")
+            elif tool_name == "glob":
+                artifact_probe_path = str(args.get("pattern") or "")
+            elif tool_name == "search_code":
+                artifact_probe_path = str(args.get("glob") or args.get("pattern") or "")
+            artifact_block = _generated_artifact_read_block(_tasks.get(task_id), artifact_probe_path)
+            if artifact_block:
+                return artifact_block
+            fast_edit_block = _fast_edit_read_block(_tasks.get(task_id), tool_name, artifact_probe_path)
+            if fast_edit_block:
+                task_for_fast_edit = _tasks.get(task_id)
+                if task_for_fast_edit is not None:
+                    append_event(
+                        task_for_fast_edit,
+                        "fast_edit_mode_entered",
+                        {
+                            "agent": agent_type,
+                            "tool": tool_name,
+                            "target": artifact_probe_path,
+                        },
+                        source="agent_efficiency",
+                    )
+                    append_event(
+                        task_for_fast_edit,
+                        "discovery_suppressed_fast_mode",
+                        {
+                            "agent": agent_type,
+                            "tool": tool_name,
+                            "target": artifact_probe_path,
+                        },
+                        source="agent_efficiency",
+                    )
+                    self._persist_task(task_id)
+                return fast_edit_block
 
             task_for_local = _tasks.get(task_id)
             local_session = local_runner_manager.get_by_task(task_id)
@@ -5846,20 +7739,48 @@ Required behavior:
                     self._persist_task(task_id)
                     return f"[LOCAL_RUNNER_UNAVAILABLE] {message}"
 
-                if tool_name in {"write_file", "apply_patch"}:
-                    rel_path = str(args.get("path", "")).strip().replace("\\", "/").lstrip("/")
+                if tool_name in {"write_file", "apply_patch"} or (
+                    tool_name == "code_editor"
+                    and str(args.get("command") or "").strip() in {"create", "str_replace", "insert"}
+                ):
+                    rel_path = _normalize_role_write_path(str(args.get("path", "")))
                     allowed, reason = _role_can_write_path(agent_type, rel_path, ws_path)
                     if not allowed:
-                        await _record_role_write_block(
-                            task_id=task_id,
-                            agent_type=agent_type,
-                            rel_path=rel_path,
-                            reason=reason,
-                            persist=self._persist_task,
-                        )
-                        log("warn", f"鏈湴鎵ц鍐欏叆琚鑹叉枃浠惰竟鐣屾嫤鎴? {rel_path}", agent_type, reason)
-                        return f"[閿欒] {reason}"
-
+                        task_for_grant = _tasks.get(task_id)
+                        if _consume_role_write_grant(task_for_grant, agent_type, rel_path):
+                            allowed = True
+                            self._persist_task(task_id)
+                        elif _should_auto_grant_local_role_write(task_for_grant, rel_path):
+                            _grant_role_write_once(task_for_grant, agent_type, rel_path)
+                            append_event(
+                                task_for_grant,
+                                "role_write_auto_granted",
+                                {"agent": agent_type, "path": rel_path, "tool": tool_name},
+                                source="security",
+                            )
+                            allowed = True
+                            self._persist_task(task_id)
+                        else:
+                            await _record_role_write_block(
+                                task_id=task_id,
+                                agent_type=agent_type,
+                                rel_path=rel_path,
+                                reason=reason,
+                                persist=self._persist_task,
+                            )
+                            allowed = await _await_role_write_confirmation(
+                                task_id=task_id,
+                                agent_type=agent_type,
+                                rel_path=rel_path,
+                                reason=reason,
+                                tool_name=tool_name,
+                                tool_args=args,
+                                persist=self._persist_task,
+                                log=log,
+                            )
+                            if not allowed:
+                                log("warn", f"本地执行写入被角色文件边界阻止: {rel_path}", agent_type, reason)
+                                return f"[错误] {reason}"
                 local_args = dict(args)
                 if tool_name == "bash":
                     local_args["command"] = _normalize_local_bash_command(str(local_args.get("command") or ""))
@@ -5897,13 +7818,19 @@ Required behavior:
                             "exit_code": exit_code,
                             "finished_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
                         })
-                    if tool_name in {"write_file", "apply_patch"} and ok:
+                    mirrored = False
+                    if tool_name in {"write_file", "apply_patch", "code_editor"} and ok:
                         rel_path = str(local_result.get("path") or args.get("path") or "").strip().replace("\\", "/").lstrip("/")
                         content = local_result.get("content")
                         if rel_path and isinstance(content, str):
                             mirror_path = _safe_workspace_path(ws_path, rel_path, must_exist=False)
                             mirror_path.parent.mkdir(parents=True, exist_ok=True)
                             mirror_path.write_text(content, encoding="utf-8")
+                            mirrored = True
+                        elif rel_path and local_result.get("deleted"):
+                            mirror_path = _safe_workspace_path(ws_path, rel_path, must_exist=False)
+                            mirror_path.unlink(missing_ok=True)
+                            mirrored = True
                     append_event(
                         task_for_local,
                         "local_runner_tool_result",
@@ -5918,7 +7845,7 @@ Required behavior:
                             "output_sha256": output_meta["sha256"],
                             "output_chars": output_meta["chars"],
                             "output_lines": output_meta["lines"],
-                            "mirrored_to_workspace": tool_name in {"write_file", "apply_patch"} and ok,
+                            "mirrored_to_workspace": mirrored,
                         },
                         source="local_runner",
                     )
@@ -5927,7 +7854,11 @@ Required behavior:
                     exit_marker = f" [exit_code={exit_code}]" if exit_code != 0 else ""
                     if output:
                         output = output_meta["model_preview"]
-                    return (prefix + output[:4000] + exit_marker) if output else f"{prefix}[完成]"
+                    local_result_text = (prefix + output[:4000] + exit_marker) if output else f"{prefix}[完成]"
+                    # 读取预算软提示（若有）附加到读取结果末尾，不替代内容。
+                    if read_guard_hint:
+                        local_result_text += "\n\n" + read_guard_hint
+                    return local_result_text
                 except Exception as exc:
                     message = (
                         f"本地 Runner 执行失败：{exc}。为避免本地项目与服务器镜像不一致，"
@@ -5941,68 +7872,89 @@ Required behavior:
                     )
                     self._persist_task(task_id)
                     return f"[LOCAL_RUNNER_ERROR] {message}"
-                    log("warn", f"鏈湴 Runner 鎵ц澶辫触锛屽洖閫€鍒版湇鍔″櫒鎵ц: {tool_name} - {exc}", "local_runner")
+                    log("warn", f"本地 Runner 执行失败，回退到服务器执行: {tool_name} - {exc}", "local_runner")
 
             if tool_name == "read_file":
                 path = _safe_workspace_path(ws_path, args.get("path", ""), must_exist=True)
                 if not path.exists():
-                    return f"[閿欒] 鏂囦欢涓嶅瓨鍦? {args['path']}"
+                    return f"[错误] 文件不存在: {args['path']}"
                 if not path.is_file():
-                    return f"[閿欒] 涓嶆槸鏂囦欢: {args['path']}"
-                return path.read_text(encoding="utf-8")[:3000]
+                    return f"[错误] 不是文件: {args['path']}"
+                read_text = path.read_text(encoding="utf-8")[:3000]
+                # 读取预算软提示（若有）附加到读取结果末尾，不替代内容。
+                if read_guard_hint:
+                    read_text += "\n\n" + read_guard_hint
+                return read_text
+
+            if tool_name == "read_lines":
+                path = _safe_workspace_path(ws_path, args.get("path", ""), must_exist=True)
+                if not path.exists():
+                    return f"[错误] 文件不存在: {args['path']}"
+                if not path.is_file():
+                    return f"[错误] 不是文件: {args['path']}"
+                rel_path = str(path.relative_to(ws_path)).replace("\\", "/")
+                try:
+                    start = int(args.get("start") or 1)
+                    end = int(args.get("end") or start)
+                except (TypeError, ValueError):
+                    return "[错误] read_lines 需要整数 start/end 参数"
+                result = _read_lines_result(path, rel_path, start, end)
+                if read_guard_hint:
+                    result += "\n\n" + read_guard_hint
+                return result
 
             elif tool_name == "write_file":
-                rel_path = str(args.get("path", "")).strip().replace("\\", "/").lstrip("/")
+                rel_path = _normalize_role_write_path(str(args.get("path", "")))
                 allowed, reason = _role_can_write_path(agent_type, rel_path, ws_path)
                 if not allowed:
-                    await _record_role_write_block(
-                        task_id=task_id,
-                        agent_type=agent_type,
-                        rel_path=rel_path,
-                        reason=reason,
-                        persist=self._persist_task,
-                    )
-                    log("warn", f"鐟欐帟澹婇弬鍥︽鏉堝湱鏅梼缁橆剾閸愭瑥鍙? {rel_path}", agent_type, reason)
-                    return f"[闁挎瑨顕 {reason}"
-                    task = _tasks.get(task_id)
-                    await asyncio.to_thread(
-                        harness_repository.add_event,
-                        task.get("harness_trace_id") if task else None,
-                        "security",
-                        "role_write_blocked",
-                        {
-                            "agent_type": agent_type,
-                            "path": rel_path,
-                            "reason": reason,
-                        },
-                    )
-                    if task is not None:
+                    task_for_grant = _tasks.get(task_id)
+                    if _consume_role_write_grant(task_for_grant, agent_type, rel_path):
+                        allowed = True
+                        self._persist_task(task_id)
+                    elif _should_auto_grant_local_role_write(task_for_grant, rel_path):
+                        _grant_role_write_once(task_for_grant, agent_type, rel_path)
                         append_event(
-                            task,
-                            "role_write_blocked",
-                            {
-                                "agent": agent_type,
-                                "path": rel_path,
-                                "reason": reason,
-                                "ownership_file": ".autocode/ROLE_OWNERSHIP.md",
-                            },
+                            task_for_grant,
+                            "role_write_auto_granted",
+                            {"agent": agent_type, "path": rel_path, "tool": tool_name},
                             source="security",
                         )
+                        allowed = True
                         self._persist_task(task_id)
-                    log("warn", f"瑙掕壊鏂囦欢杈圭晫闃绘鍐欏叆: {rel_path}", agent_type, reason)
-                    return f"[閿欒] {reason}"
+                    else:
+                        await _record_role_write_block(
+                            task_id=task_id,
+                            agent_type=agent_type,
+                            rel_path=rel_path,
+                            reason=reason,
+                            persist=self._persist_task,
+                        )
+                        allowed = await _await_role_write_confirmation(
+                            task_id=task_id,
+                            agent_type=agent_type,
+                            rel_path=rel_path,
+                            reason=reason,
+                            tool_name=tool_name,
+                            tool_args=args,
+                            persist=self._persist_task,
+                            log=log,
+                        )
+                        if not allowed:
+                            log("warn", f"角色文件边界阻止写入: {rel_path}", agent_type, reason)
+                            return f"[错误] {reason}"
                 path = _safe_workspace_path(ws_path, args.get("path", ""), must_exist=False)
                 parent = path.parent
                 parent.mkdir(parents=True, exist_ok=True)
                 if path.exists():
                     path.resolve(strict=True).relative_to(ws_path.resolve())
                     if path.is_dir():
-                        return f"[閿欒] 涓嶈兘瑕嗙洊鐩綍: {args['path']}"
+                        return f"[错误] 不能覆盖目录: {args['path']}"
                 path.write_text(args["content"], encoding="utf-8")
                 if not str(path.relative_to(ws_path)).replace("\\", "/").startswith(".autocode/"):
                     invalidate_workspace_index(ws_path)
-                log("success", f"宸插啓鍏? {args['path']} ({len(args['content'])} 瀛楃)", agent_type)
-                return f"[OK] 鏂囦欢宸插啓鍏? {args['path']}"
+                log("success", f"已写入 {args['path']} ({len(args['content'])} 字符)", agent_type)
+                feedback = await self._diagnostics_feedback(workspace_id, ws_path, args.get("path", ""))
+                return f"[OK] 文件已写入: {args['path']}" + feedback
 
             elif tool_name == "bash":
                 timeout = args.get("timeout", 120)
@@ -6013,7 +7965,7 @@ Required behavior:
                         task,
                         args["command"],
                         "running",
-                        label=f"{agent_type} 鎵ц鍛戒护",
+                        label=f"{agent_type} 执行命令",
                         source="agent",
                     )
                     self._persist_task(task_id)
@@ -6037,7 +7989,7 @@ Required behavior:
                     })
                     self._persist_task(task_id)
                 if result.get("exit_code", 0) != 0:
-                    log("warn", f"鍛戒护閫€鍑虹爜 {result['exit_code']}: {args.get('command', '')}", agent_type)
+                    log("warn", f"命令退出码 {result['exit_code']}: {args.get('command', '')}", agent_type)
                     if result.get("exit_code") == 126 or "Blocked unsafe workspace command" in output:
                         task = _tasks.get(task_id)
                         await asyncio.to_thread(harness_repository.add_event, task.get("harness_trace_id") if task else None,
@@ -6049,11 +8001,36 @@ Required behavior:
                 exit_marker = f" [exit_code={exit_code}]" if exit_code != 0 else ""
                 if output:
                     output = output_meta["model_preview"]
-                return (output[:2000] + exit_marker) or "[鍛戒护鎵ц瀹屾垚锛屾棤杈撳嚭]"
+                return (output[:2000] + exit_marker) or "[命令执行完成，无输出]"
 
             elif tool_name == "glob":
                 import fnmatch
                 pattern = _safe_glob_pattern(args["pattern"])
+                task_for_guard = _tasks.get(task_id)
+                guard = task_for_guard.get("retrieval_guard") if isinstance(task_for_guard, dict) and isinstance(task_for_guard.get("retrieval_guard"), dict) else {}
+                candidate_files = list((guard or {}).get("candidate_files") or [])
+                surface_candidates = _surface_map_candidates_for_task(ws_path, task_for_guard)
+                broad_patterns = {"**/*", "**/*.py", "src/**/*.py", "src/**/*", "src/features/**/*.py"}
+                focused_files = candidate_files or surface_candidates
+                if focused_files and pattern.replace("\\", "/") in broad_patterns:
+                    append_event(
+                        task_for_guard,
+                        "efficiency_guard_triggered",
+                        {
+                            "agent": agent_type,
+                            "tool": "glob",
+                            "pattern": pattern,
+                            "reason": "broad_glob_suppressed_after_target_files",
+                            "candidate_files": candidate_files[:50],
+                            "surface_candidates": surface_candidates[:50],
+                        },
+                        source="agent_efficiency",
+                    )
+                    self._persist_task(task_id)
+                    return (
+                        "[BROAD_GLOB_SUPPRESSED] 已有明确候选文件或产品表面映射命中，续跑时不要重新全量扫描项目。\n"
+                        + "\n".join(focused_files[:100])
+                    )
                 indexed_matches = glob_workspace_files(ws_path, pattern, limit=100)
                 return "\n".join(indexed_matches[:100]) or "[no matching files]"
                 skip_dirs = {".git", "node_modules", "__pycache__", ".next", "dist", "build", "venv", ".venv"}
@@ -6064,7 +8041,7 @@ Required behavior:
                     and not any(part in skip_dirs for part in p.relative_to(ws_path).parts)
                     and fnmatch.fnmatch(str(p.relative_to(ws_path)), pattern)
                 ]
-                return "\n".join(matches[:100]) or "[鏃犲尮閰嶆枃浠禲"
+                return "\n".join(matches[:100]) or "[无匹配文件]"
 
             elif tool_name == "search_code":
                 import fnmatch as _fn
@@ -6076,7 +8053,7 @@ Required behavior:
                         return "[no matches]"
                     return f"found {len(indexed_results)} matches" + (" (truncated to 50)" if len(indexed_results) >= 50 else "") + "\n" + "\n".join(indexed_results)
                 if not pattern:
-                    return "[閿欒] search_code 闇€瑕?pattern 鍙傛暟"
+                    return "[错误] search_code 需要 pattern 参数"
                 try:
                     regex = re.compile(pattern, re.IGNORECASE)
                 except re.error:
@@ -6112,7 +8089,53 @@ Required behavior:
                 header = f"找到 {total_matches} 个匹配" + ("（已截断至 50 条）" if total_matches >= max_results else "")
                 return header + "\n" + "\n".join(results)
 
+            elif tool_name == "lsp":
+                return await self._execute_lsp_tool(args, workspace_id, ws_path)
+
+            elif tool_name == "spawn_subagent":
+                parent_project_type = str((_tasks.get(task_id) or {}).get("project_type") or "unknown")
+                return await self._execute_spawn_subagent(
+                    args, workspace_id, ws_path, task_id, parent_project_type, log,
+                )
+
             elif tool_name == "apply_patch":
+                rel_input = _normalize_role_write_path(str(args.get("path", "")))
+                allowed, reason = _role_can_write_path(agent_type, rel_input, ws_path)
+                if not allowed:
+                    task_for_grant = _tasks.get(task_id)
+                    if _consume_role_write_grant(task_for_grant, agent_type, rel_input):
+                        self._persist_task(task_id)
+                    elif _should_auto_grant_local_role_write(task_for_grant, rel_input):
+                        _grant_role_write_once(task_for_grant, agent_type, rel_input)
+                        append_event(
+                            task_for_grant,
+                            "role_write_auto_granted",
+                            {"agent": agent_type, "path": rel_input, "tool": tool_name},
+                            source="security",
+                        )
+                        allowed = True
+                        self._persist_task(task_id)
+                    else:
+                        await _record_role_write_block(
+                            task_id=task_id,
+                            agent_type=agent_type,
+                            rel_path=rel_input,
+                            reason=reason,
+                            persist=self._persist_task,
+                        )
+                        allowed = await _await_role_write_confirmation(
+                            task_id=task_id,
+                            agent_type=agent_type,
+                            rel_path=rel_input,
+                            reason=reason,
+                            tool_name=tool_name,
+                            tool_args=args,
+                            persist=self._persist_task,
+                            log=log,
+                        )
+                        if not allowed:
+                            log("warn", f"角色文件边界阻止补丁: {rel_input}", agent_type, reason)
+                            return f"[错误] {reason}"
                 target_path = _safe_workspace_path(ws_path, args.get("path", ""), must_exist=True)
                 if not target_path.exists():
                     return f"[错误] 文件不存在: {args['path']}"
@@ -6124,13 +8147,13 @@ Required behavior:
                 if not search_text:
                     return "[错误] search 参数不能为空"
                 if search_text not in original:
-                    # 灏濊瘯鍘婚櫎棣栧熬绌虹櫧鍚庡尮閰?
+                    # 尝试去除首尾空白后匹配
 
                     stripped = search_text.strip()
                     if stripped and stripped in original:
                         original = original.replace(stripped, replace_text, 1)
                     else:
-                        # 杩斿洖鏂囦欢涓墠鍚?500 瀛楃甯姪瀹氫綅
+                        # 返回文件中前后 500 字符帮助定位
                         preview = original[:500] if len(original) > 500 else original
                         return f"[错误] search 文本未在文件中找到匹配。文件前 500 字符:\n{preview}"
                 else:
@@ -6140,7 +8163,166 @@ Required behavior:
                 if not rel_path.startswith(".autocode/"):
                     invalidate_workspace_index(ws_path)
                 log("success", f"精确编辑: {rel_path}", agent_type)
-                return f"[OK] 已编辑 {rel_path}（search/replace 成功）"
+                return f"[OK] 已编辑 {rel_path}（search/replace 成功）" + await self._diagnostics_feedback(workspace_id, ws_path, rel_path)
+
+            elif tool_name == "code_editor":
+                command = str(args.get("command") or "").strip()
+                rel_input = _normalize_role_write_path(str(args.get("path", "")))
+                if command in ("create", "str_replace", "insert"):
+                    allowed, reason = _role_can_write_path(agent_type, rel_input, ws_path)
+                    if not allowed:
+                        task_for_grant = _tasks.get(task_id)
+                        if _consume_role_write_grant(task_for_grant, agent_type, rel_input):
+                            allowed = True
+                            self._persist_task(task_id)
+                        elif _should_auto_grant_local_role_write(task_for_grant, rel_input):
+                            _grant_role_write_once(task_for_grant, agent_type, rel_input)
+                            append_event(
+                                task_for_grant,
+                                "role_write_auto_granted",
+                                {"agent": agent_type, "path": rel_input, "tool": tool_name},
+                                source="security",
+                            )
+                            allowed = True
+                            self._persist_task(task_id)
+                        else:
+                            await _record_role_write_block(
+                                task_id=task_id,
+                                agent_type=agent_type,
+                                rel_path=rel_input,
+                                reason=reason,
+                                persist=self._persist_task,
+                            )
+                            allowed = await _await_role_write_confirmation(
+                                task_id=task_id,
+                                agent_type=agent_type,
+                                rel_path=rel_input,
+                                reason=reason,
+                                tool_name=tool_name,
+                                tool_args=args,
+                                persist=self._persist_task,
+                                log=log,
+                            )
+                            if not allowed:
+                                log("warn", f"角色文件边界阻止编辑器写入: {rel_input}", agent_type, reason)
+                                return f"[错误] {reason}"
+                undo_key = f"{ws_path}::{rel_input}"
+
+                if command == "view":
+                    target = _safe_workspace_path(ws_path, args.get("path", ""), must_exist=True)
+                    if not target.is_file():
+                        return f"[错误] 不是文件: {args['path']}"
+                    all_lines = target.read_text(encoding="utf-8").splitlines()
+                    start, end = 1, len(all_lines)
+                    view_range = args.get("view_range")
+                    if isinstance(view_range, (list, tuple)) and len(view_range) == 2:
+                        start = max(1, int(view_range[0]))
+                        end = min(len(all_lines), int(view_range[1]))
+                    numbered = "\n".join(f"{i:>6}\t{all_lines[i - 1]}" for i in range(start, end + 1))
+                    return f"[OK] {rel_input} 第 {start}-{end} 行（共 {len(all_lines)} 行）:\n{numbered}"
+
+                if command == "create":
+                    path = _safe_workspace_path(ws_path, args.get("path", ""), must_exist=False)
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    if path.exists() and path.is_dir():
+                        return f"[错误] 不能覆盖目录: {args['path']}"
+                    old_text = path.read_text(encoding="utf-8") if path.is_file() else None
+                    new_text = str(args.get("file_text", ""))
+                    _atomic_write_text(path, new_text)
+                    _code_editor_push_undo(undo_key, old_text)
+                    rel_path = str(path.relative_to(ws_path)).replace("\\", "/")
+                    if not rel_path.startswith(".autocode/"):
+                        invalidate_workspace_index(ws_path)
+                    diff = _unified_diff_text(old_text or "", new_text, rel_path)
+                    log("success", f"编辑器写入: {rel_path} ({len(new_text)} 字符)", agent_type)
+                    diagnostics = await self._diagnostics_feedback(workspace_id, ws_path, rel_path)
+                    return f"[OK] 文件已写入: {rel_path}\n{diff}{diagnostics}"
+
+                if command == "str_replace":
+                    target = _safe_workspace_path(ws_path, args.get("path", ""), must_exist=True)
+                    if not target.is_file():
+                        return f"[错误] 不是文件: {args['path']}"
+                    # newline="" 关闭通用换行翻译，保留文件真实的 \r\n，供下方检测换行风格与撤销还原。
+                    with open(target, "r", encoding="utf-8", newline="") as _fh:
+                        original = _fh.read()
+                    old_str = str(args.get("old_str", ""))
+                    new_str = str(args.get("new_str", ""))
+                    if not old_str:
+                        return "[错误] old_str 参数不能为空"
+                    # 换行符容错：文件可能是 CRLF，而 old_str 经传输被规范化为 LF（反之亦然）。
+                    # 统一到 LF 空间做匹配与替换，写回时保留文件原本的换行风格。
+                    uses_crlf = "\r\n" in original
+                    work = original.replace("\r\n", "\n")
+                    old_norm = old_str.replace("\r\n", "\n")
+                    new_norm = new_str.replace("\r\n", "\n")
+                    occurrences = work.count(old_norm)
+                    if occurrences == 0:
+                        preview = original[:500]
+                        return f"[错误] old_str 未在文件中找到匹配。文件前 500 字符:\n{preview}"
+                    if occurrences > 1:
+                        return f"[错误] old_str 匹配到 {occurrences} 处，必须唯一匹配，请扩大上下文范围"
+                    replaced = work.replace(old_norm, new_norm, 1)
+                    updated = replaced.replace("\n", "\r\n") if uses_crlf else replaced
+                    _atomic_write_text(target, updated)
+                    _code_editor_push_undo(undo_key, original)
+                    rel_path = str(target.relative_to(ws_path)).replace("\\", "/")
+                    if not rel_path.startswith(".autocode/"):
+                        invalidate_workspace_index(ws_path)
+                    diff = _unified_diff_text(original, updated, rel_path)
+                    log("success", f"编辑器替换: {rel_path}", agent_type)
+                    diagnostics = await self._diagnostics_feedback(workspace_id, ws_path, rel_path)
+                    return f"[OK] 已替换 {rel_path} 中唯一匹配段\n{diff}{diagnostics}"
+
+                if command == "insert":
+                    target = _safe_workspace_path(ws_path, args.get("path", ""), must_exist=True)
+                    if not target.is_file():
+                        return f"[错误] 不是文件: {args['path']}"
+                    # newline="" 关闭通用换行翻译，保留文件真实的 \r\n。
+                    with open(target, "r", encoding="utf-8", newline="") as _fh:
+                        original = _fh.read()
+                    new_str = str(args.get("new_str", ""))
+                    if not new_str:
+                        return "[错误] new_str 参数不能为空"
+                    insert_line = int(args.get("insert_line", -1))
+                    # 保留文件原本的换行风格：CRLF 文件插入后仍写回 CRLF。
+                    newline = "\r\n" if "\r\n" in original else "\n"
+                    work = original.replace("\r\n", "\n")
+                    new_norm = new_str.replace("\r\n", "\n")
+                    lines = work.split("\n")
+                    trailing_newline = work.endswith("\n")
+                    if trailing_newline:
+                        lines.pop()
+                    if insert_line < 0 or insert_line > len(lines):
+                        return f"[错误] insert_line 超出范围（0-{len(lines)}，0 表示插入到文件开头）"
+                    lines.insert(insert_line, new_norm)
+                    updated = newline.join(lines) + (newline if trailing_newline else "")
+                    _atomic_write_text(target, updated)
+                    _code_editor_push_undo(undo_key, original)
+                    rel_path = str(target.relative_to(ws_path)).replace("\\", "/")
+                    if not rel_path.startswith(".autocode/"):
+                        invalidate_workspace_index(ws_path)
+                    diff = _unified_diff_text(original, updated, rel_path)
+                    log("success", f"编辑器插入: {rel_path} 第 {insert_line} 行后", agent_type)
+                    return f"[OK] 已在 {rel_path} 第 {insert_line} 行后插入内容\n{diff}" + await self._diagnostics_feedback(workspace_id, ws_path, rel_path)
+
+                if command == "undo_edit":
+                    stack = _CODE_EDITOR_UNDO.get(undo_key)
+                    if not stack:
+                        return f"[错误] 没有可撤销的编辑: {rel_input}"
+                    previous = stack.pop()
+                    path = _safe_workspace_path(ws_path, args.get("path", ""), must_exist=False)
+                    if previous is None:
+                        path.unlink(missing_ok=True)
+                        log("success", f"编辑器撤销: 删除新建文件 {rel_input}", agent_type)
+                        return f"[OK] 已撤销创建，文件已删除: {rel_input}"
+                    _atomic_write_text(path, previous)
+                    rel_path = str(path.relative_to(ws_path)).replace("\\", "/")
+                    if not rel_path.startswith(".autocode/"):
+                        invalidate_workspace_index(ws_path)
+                    log("success", f"编辑器撤销: {rel_path}", agent_type)
+                    return f"[OK] 已恢复上次编辑前的内容: {rel_path}"
+
+                return f"[错误] 未知 code_editor 命令: {command}"
 
             elif tool_name == "git_commit":
                 status = git_manager.status(ws_path)
@@ -6150,30 +8332,82 @@ Required behavior:
                 hash_ = git_manager.auto_commit(ws_path, ["."], message)
                 if not hash_:
                     return "[OK] No commit created; there were no commit-worthy changes after filtering volatile files."
-                log("success", f"Git 鎻愪氦: {message}", agent_type)
-                return f"[OK] 鎻愪氦 {str(hash_)[:12]}: {message}"
+                log("success", f"Git 提交: {message}", agent_type)
+                return f"[OK] 提交 {str(hash_)[:12]}: {message}"
 
             elif tool_name == "request_confirmation":
                 task = _tasks.get(task_id)
+                approval_id = f"approval-{uuid.uuid4().hex[:12]}"
+                event_id = ""
+                confirm_path = _normalize_role_write_path(str(args.get("path") or ""))
+                confirm_reason = str(args.get("reason") or "需要用户确认后继续。")
                 if task:
+                    approval_event = append_event(
+                        task,
+                        "approval_requested",
+                        {
+                            "approval_id": approval_id,
+                            "tool": "request_confirmation",
+                            "action": args.get("action") or "manual_confirmation",
+                            "path": confirm_path,
+                            "agent": agent_type,
+                            "reason": confirm_reason,
+                            "message": confirm_reason,
+                            "payload": dict(args),
+                            "auto_approve_after_seconds": 0,
+                            "manual_required": True,
+                            "high_risk": bool(args.get("high_risk", False)),
+                        },
+                        source="agent",
+                    )
+                    event_id = str(approval_event.get("id") or "")
                     task["status"] = "waiting_confirm"
                     task["pending_confirmation"] = {
-                        "action": args["action"],
-                        "path": args["path"],
-                        "reason": args["reason"],
+                        "action": args.get("action") or "manual_confirmation",
+                        "path": confirm_path,
+                        "reason": confirm_reason,
+                        "event_id": event_id,
+                        "approval_id": approval_id,
+                        "payload": dict(args),
+                        "manual_required": True,
+                        "high_risk": bool(args.get("high_risk", False)),
+                        "auto_approve_after_seconds": 0,
                     }
-                    log("warn", f"Waiting user confirm: {args['action']} {args['path']}", agent_type)
+                    self._persist_task(task_id)
+                    log("warn", f"Waiting user confirm: {args.get('action')} {confirm_path}", agent_type)
 
                 for _ in range(300):
                     await asyncio.sleep(1)
                     conf = _confirmations.get(task_id)
-                    if conf and conf.get("confirmed"):
+                    if conf and (conf.get("approved") or conf.get("confirmed")):
                         _confirmations.pop(task_id, None)
                         task = _tasks.get(task_id)
                         if task:
                             task["status"] = "running"
-                        log("success", f"User confirmed: {conf['path']}", agent_type)
-                        return f"[CONFIRMED] {args['action']} approved by user"
+                            task.pop("pending_confirmation", None)
+                            if confirm_path:
+                                _grant_role_write_once(task, agent_type, confirm_path)
+                            self._persist_task(task_id)
+                        log("success", f"User confirmed: {confirm_path}", agent_type)
+                        original_tool = str(args.get("tool") or "").strip()
+                        original_args = args.get("tool_args") if isinstance(args.get("tool_args"), dict) else None
+                        if original_tool in {"apply_patch", "code_editor", "write_file"} and original_args:
+                            original_path = _normalize_role_write_path(str(original_args.get("path") or confirm_path))
+                            if original_path == confirm_path:
+                                executed = await self._execute_tool(
+                                    original_tool,
+                                    dict(original_args),
+                                    workspace_id,
+                                    ws_path,
+                                    task_id,
+                                    log,
+                                    agent_type,
+                                )
+                                return (
+                                    f"[CONFIRMED_AND_EXECUTED] {args.get('action') or 'manual_confirmation'} approved by user.\n"
+                                    f"[{original_tool} result]\n{executed}"
+                                )
+                        return f"[CONFIRMED] {args.get('action') or 'manual_confirmation'} approved by user"
                     task = _tasks.get(task_id)
                     if task and task["status"] == "cancelled":
                         return "[CANCELLED] Task cancelled by user"
@@ -6183,7 +8417,9 @@ Required behavior:
             elif tool_name == "generate_prototype":
                 from core.prototype_generator import generate_prototype, save_prototype
                 log("info", f"正在生成 UI 原型: {args.get('description', '')[:60]}...", agent_type)
-                result = await generate_prototype(args["description"], llm_client=self._llm)
+                prototype_model = _tasks.get(task_id, {}).get("model")
+                prototype_llm = await self._ensure_client(requested_model=prototype_model)
+                result = await generate_prototype(args["description"], llm_client=prototype_llm)
                 html = result.get("html", "")
                 if html:
                     saved_path = save_prototype(ws_path, html)

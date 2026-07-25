@@ -20,6 +20,9 @@ public class ModelConfig {
     private BigDecimal outputPrice;
     private String capabilities;   // comma-separated
 
+    /** 模型别名，逗号分隔。入站网关（/v1/messages 等）用它把 IDE 工具发来的模型名（如 claude-3-5-sonnet-20241022）映射到本平台 model_id。 */
+    private String aliases;
+
     // 路由所需字段
     private Integer codeQuality;       // 代码质量评分 (1-100)
     private String strengths;          // 优势领域 JSON 数组，如 ["reasoning","code","vision"]

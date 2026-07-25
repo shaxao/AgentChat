@@ -14,7 +14,7 @@ from core.workspace_index import (
 
 
 class WorkspaceIndexTest(unittest.TestCase):
-    def test_retrieval_guard_accounts_and_blocks_non_candidate_reads(self):
+    def test_retrieval_guard_soft_hints_but_never_blocks(self):
         from core.agent_orchestrator import _check_retrieval_read_guard
 
         task = {
@@ -28,17 +28,25 @@ class WorkspaceIndexTest(unittest.TestCase):
             },
         }
 
+        # 预算内的首次读取：放行，无提示。
         self.assertIsNone(_check_retrieval_read_guard(task, "src/first.py"))
-        blocked = _check_retrieval_read_guard(task, "src/second.py")
-        self.assertIsNotNone(blocked)
-        self.assertIn("READ_BUDGET_BLOCKED", blocked)
+        # 超预算的非候选读取：返回软提示，但仍记账（不阻断）。
+        hint = _check_retrieval_read_guard(task, "src/second.py")
+        self.assertIsNotNone(hint)
+        self.assertIn("READ_BUDGET_SOFT", hint)
+        # 候选文件与索引文档：始终放行、无提示。
         self.assertIsNone(_check_retrieval_read_guard(task, "src/allowed.py"))
         self.assertIsNone(_check_retrieval_read_guard(task, ".autocode/MEMORY.md"))
 
-        self.assertEqual(task["retrieval_guard"]["read_files"], ["src/first.py", "src/allowed.py"])
+        # 超预算的文件也被计入 read_files（记账不受阻断影响）。
+        self.assertEqual(
+            task["retrieval_guard"]["read_files"],
+            ["src/first.py", "src/second.py", "src/allowed.py"],
+        )
+        # 所有读取都记为 accounted，没有任何 blocked 事件。
         self.assertEqual(
             [event["type"] for event in task["events"]],
-            ["retrieval_guard_accounted", "retrieval_guard_blocked", "retrieval_guard_accounted"],
+            ["retrieval_guard_accounted", "retrieval_guard_accounted", "retrieval_guard_accounted"],
         )
 
     def test_retrieval_plan_prefers_recent_changed_and_limits_candidates(self):

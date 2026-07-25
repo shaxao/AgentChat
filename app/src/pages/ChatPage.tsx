@@ -30,7 +30,7 @@ import { useAvailableModels } from '@/hooks/useAvailableModels'
 import {
   DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator, DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
-import { sendMessage, apiDeleteConversation, apiClearMessages, apiTogglePin, loadConversations, loadConversationMessages, isDemoMode, aiTranslate, aiTTS, createAutoCodeTask, uploadLedgerFile, chatApi, agentRegistryApi, workflowApi, workflowArtifactApi, buildScenarioWorkflowTag, authApi, memoryApi, type WorkflowBriefVO, type ExecutionVO, type WorkflowArtifactVO } from '@/lib/api'
+import { sendMessage, resumeMessage, apiDeleteConversation, apiClearMessages, apiTogglePin, loadConversations, loadConversationMessages, isDemoMode, aiTranslate, aiTTS, createAutoCodeTask, uploadLedgerFile, chatApi, agentRegistryApi, workflowApi, workflowArtifactApi, buildScenarioWorkflowTag, authApi, memoryApi, type WorkflowBriefVO, type ExecutionVO, type WorkflowArtifactVO } from '@/lib/api'
 import { buildToolsSystemPrompt, parseToolCalls, mcpCallTool } from '@/lib/mcp'
 import { runPluginPreprocess } from '@/lib/plugins'
 import { getFileFromSource } from '@/lib/fileUtils'
@@ -466,6 +466,8 @@ export default function ChatPage({ onOpenAdmin, onOpenSettings, onOpenSubscripti
   const abortControllerRef = useRef<AbortController | null>(null)
   // 🧠 Phase 1: 动态干预 — isGenerating 的 ref 版本，供 useCallback 读取最新值
   const isGeneratingRef = useRef(false)
+  // 断线续传：记录已接入 resume 的对话，避免重复接入同一条正在进行的生成
+  const resumingConvRef = useRef<Set<string>>(new Set())
   // 虚拟滚动：是否还有更早的消息、是否正在加载
   const [hasOlderMessages, setHasOlderMessages] = useState(true)
   const [loadingOlder, setLoadingOlder] = useState(false)
@@ -583,10 +585,71 @@ export default function ChatPage({ onOpenAdmin, onOpenSettings, onOpenSubscripti
     }
   }, [activeConversationId])
 
+  // 断线续传：接入某对话正在后台进行的生成流。复用 streamingUpdate 与实时链路相同的
+  // token 缓冲/节流/工具事件处理，使"回来后逐字继续输出"与首次发送体验一致。
+  const handleResume = useCallback(async (convId: string, streamingMessageId?: string) => {
+    if (resumingConvRef.current.has(convId)) return
+    resumingConvRef.current.add(convId)
+
+    // 找本地正在流式的占位；无则新建一个（另一端/新加载首次接入）。
+    const conv = useChatStore.getState().conversations.find(c => c.id === convId)
+    let aiMsgId = streamingMessageId
+      || conv?.messages.find(m => m.role === 'assistant' && m.isStreaming)?.id
+    if (!aiMsgId) {
+      aiMsgId = `ai-resume-${Date.now()}`
+      useChatStore.getState().addMessage(convId, {
+        id: aiMsgId, role: 'assistant', content: '', isStreaming: true,
+        model: conv?.model, timestamp: new Date().toISOString(),
+      } as Message)
+    }
+    const startingContent = useChatStore.getState().conversations
+      .find(c => c.id === convId)?.messages.find(m => m.id === aiMsgId)?.content || ''
+
+    setIsTyping(true)
+    const ac = new AbortController()
+    abortControllerRef.current = ac
+    try {
+      for await (const event of resumeMessage(convId, aiMsgId, startingContent, streamingUpdate, ac.signal)) {
+        if (event.type === 'tool_call' && event.toolCallId) {
+          const current = useChatStore.getState().conversations.find(c => c.id === convId)?.messages.find(m => m.id === aiMsgId)
+          if (current) {
+            const existing = current.toolCalls || []
+            const toolCallId = event.toolCallId, toolName = event.toolName || '', toolArgs = event.toolArgs
+            startTransition(() => {
+              useChatStore.getState().updateMessage(convId, aiMsgId!, {
+                toolCalls: [...existing, { toolCallId, toolName, status: 'calling' as const, arguments: truncateToolArgs(toolArgs) }],
+              })
+            })
+          }
+        }
+        if (event.type === 'tool_result' && event.toolCallId) {
+          const toolCallId = event.toolCallId, toolName = event.toolName || '', toolResult = event.toolResult
+          const current = useChatStore.getState().conversations.find(c => c.id === convId)?.messages.find(m => m.id === aiMsgId)
+          if (current) {
+            const truncated = truncateToolResult(toolName, toolResult)
+            const updated = (current.toolCalls || []).map(tc =>
+              tc.toolCallId === toolCallId ? { ...tc, status: 'completed' as const, result: truncated } : tc)
+            startTransition(() => {
+              useChatStore.getState().updateMessage(convId, aiMsgId!, { toolCalls: updated })
+            })
+          }
+        }
+        if (event.type === 'done' || event.type === 'error') setIsTyping(false)
+      }
+    } catch (e) {
+      console.warn('[handleResume] failed:', e)
+    } finally {
+      setIsTyping(false)
+      if (abortControllerRef.current === ac) abortControllerRef.current = null
+    }
+  }, [streamingUpdate])
+
   // 🔧 LobeChat 优化：切换对话时清除流式缓冲区（避免旧缓冲区干扰新对话）
   useEffect(() => {
     setStreamingBuffers({})
     streamingBuffersRef.current = {}
+    // 断线续传去重集清空：允许切回对话后对新一轮生成再次接入。
+    resumingConvRef.current.clear()
     // 🛡️ 清除兜底同步定时器
     if (streamingSyncTimerRef.current) {
       clearInterval(streamingSyncTimerRef.current)
@@ -634,11 +697,15 @@ export default function ChatPage({ onOpenAdmin, onOpenSettings, onOpenSubscripti
     loadAbortRef.current?.abort()
     const ac = new AbortController()
     loadAbortRef.current = ac
-    loadConversationMessages(activeConversationId, 50, ac.signal).catch((e: any) => {
+    const convId = activeConversationId
+    loadConversationMessages(convId, 50, ac.signal).then((res: any) => {
+      // 断线续传：后端标记该对话正在后台生成 → 自动接入正在进行的流。
+      if (res?.streaming) handleResume(convId, res.streamingMessageId)
+    }).catch((e: any) => {
       if (e?.name !== 'AbortError') console.warn('[loadConversationMessages] failed:', e)
     })
     return () => ac.abort()
-  }, [activeConversationId, activeMeta?.createdAt, activeMessages.length])
+  }, [activeConversationId, activeMeta?.createdAt, activeMessages.length, handleResume])
 
   // 组件卸载时清理 AbortController 防止 SSE 连接泄漏 + load 请求
   useEffect(() => {
@@ -1649,8 +1716,8 @@ export default function ChatPage({ onOpenAdmin, onOpenSettings, onOpenSubscripti
       const result = await createAutoCodeTask({
         title: description.slice(0, 60),
         description,
-        project_type: 'nextjs',
-        agent_types: ['frontend'],
+        project_type: 'unknown',
+        agent_types: ['general'],
       })
       // 更新消息中的 autocode 数据（任务 ID 和 workspace 来自真实 API）
       const msgIndex = activeMessages.findIndex(m => m.id === taskId)

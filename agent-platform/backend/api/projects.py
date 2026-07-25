@@ -21,6 +21,7 @@ from core.project_recon import run_project_recon
 from core.state import _tasks
 from core.task_planner import plan_task
 from core.agent_orchestrator import agent_orchestrator
+from runtime.session_events import append_event
 from services.task_repository import save_task
 
 router = APIRouter(prefix="/projects", tags=["Projects"])
@@ -38,6 +39,7 @@ MAX_UPLOAD_SIZE_MB = 100
 
 class RegisterProjectTaskRequest(BaseModel):
     enable_smart_planning: bool = False
+    model: str | None = None
 
 
 def _project_index_path() -> Path:
@@ -398,6 +400,9 @@ async def register_project_task(project_id: str, request: Request, payload: Regi
     description = f"基于已导入项目 {pj['name']} 进行开发，请先理解现有结构，再根据用户后续需求制定计划。"
 
     enable_smart_planning = bool(payload.enable_smart_planning) if payload else False
+    requested_model = ((payload.model if payload else None) or "").strip() or None
+    if requested_model and requested_model.lower() == "auto":
+        requested_model = None
     description = f"基于已导入项目 {pj['name']} 继续开发。请先理解现有结构，再根据用户后续需求执行修改、验证和总结。"
 
     recon = await asyncio.to_thread(
@@ -430,6 +435,7 @@ async def register_project_task(project_id: str, request: Request, payload: Regi
         "created_at": pj.get("created_at") or datetime.utcnow().isoformat(),
         "workspace_id": workspace_id,
         "user_id": str(user_id),
+        "model": requested_model,
         "agents": agents,
         "logs": [{
             "timestamp": datetime.utcnow().isoformat(),
@@ -457,7 +463,16 @@ async def register_project_task(project_id: str, request: Request, payload: Regi
         "plan_confirmed": None if enable_smart_planning else True,
         "prototype_confirmed": None if recon.get("should_generate_prototype") else True,
         "review_confirmed": None,
+        "events": [],
     }
+
+    if requested_model:
+        append_event(
+            task,
+            "task_model_selected",
+            {"model": requested_model, "source": "project_import"},
+            source="projects",
+        )
 
     _tasks[task_id] = task
 
@@ -483,12 +498,13 @@ async def register_project_task(project_id: str, request: Request, payload: Regi
             f"- 可用命令: {json.dumps(recon.get('commands') or {}, ensure_ascii=False)}\n"
             f"- 规划建议: {'; '.join(recon.get('plan_guidance') or [])}\n"
         )
+        planning_llm = await agent_orchestrator._ensure_client(requested_model=requested_model)
         plan = await plan_task(
             description=description + recon_summary,
             project_type=project_type,
             agent_types=agents,
-            llm_client=await agent_orchestrator._ensure_client(requested_model=None),
-            model=agent_orchestrator._model or "",
+            llm_client=planning_llm,
+            model=requested_model or agent_orchestrator._model or "",
             project_recon=recon,
         )
         task["plan"] = plan.model_dump()

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, type ComponentType, type ReactNode } from 'react'
+import { useEffect, useMemo, useState, type ComponentProps, type ComponentType, type ReactNode } from 'react'
 import {
   Activity,
   AlertTriangle,
@@ -21,8 +21,11 @@ import {
   type HarnessRegressionCaseVO,
   type HarnessRegressionPreviewVO,
   type HarnessRegressionRunVO,
+  type HarnessTraceEventVO,
   type HarnessTraceVO,
   type HarnessVersionVO,
+  type HarnessVersionMetricsVO,
+  type HarnessVersionMetricVO,
   type PageResult,
 } from '@/lib/api'
 import { useAuthStore } from '@/store'
@@ -30,6 +33,7 @@ import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog'
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
 import { cn } from '@/lib/utils'
 
 const SURFACES = [
@@ -42,10 +46,44 @@ const SURFACES = [
 
 const PAGE_SIZE = 20
 
+const ACTION_HELP = {
+  refresh: '重新从后端拉取 Trace、失败样本、补丁、版本和回归运行，适合确认最新状态。',
+  createRegression: '用当前失败样本创建一次回归运行；创建后不会自动执行，需要再点击开始、预检或真实回放。',
+  createVersionRegression: '为这个候选版本创建回归运行；存在回归样本时，必须真实回放通过后才能激活。',
+  exportCases: '把当前回归样本导出为 JSON，便于离线审查、归档或接入 CI 回放。',
+  viewRun: '打开回归运行详情，查看每个 case 的结果、证据和失败原因。',
+  exportRun: '导出这次回归运行的完整包，包含样本、执行结果和 evidence JSON。',
+  startRun: '把回归运行标记为运行中；通常在人工或 CI 准备开始执行时使用。',
+  preflightRun: '只做结构预检，检查样本格式和必要字段；预检通过不等于候选版本可激活。',
+  executeRun: '执行安全真实回放：允许读文件、解析、检索等只读工具，禁止写入、扣费、发消息等副作用。',
+  passRun: '人工标记为通过；仅在证据确认所有 case 达标后使用。',
+  failRun: '人工标记为失败；失败结果会作为后续分析和补丁生成的证据。',
+  blockRun: '当缺少文件、凭证、样本或安全回放前提时，标记为阻塞。',
+  cancelRun: '取消这次回归运行；取消后的结果不会作为激活候选版本的证据。',
+  generatePatch: '基于该失败模式生成可执行 harness.policy.v1 补丁；批准并生成版本前不会影响线上流量。',
+  promoteRecurring: '为当前范围内反复出现的高频失败批量生成候选补丁。',
+  resolveFailure: '把失败样本标记为已解决，让它不再作为待处理问题出现。',
+  addFailureRegression: '把这个失败样本加入回归样本库，用于以后验证候选策略是否真的修复。',
+  ignoreFailure: '当样本属于噪声或暂不处理时标记为忽略；记录仍保留用于审计。',
+  approvePatch: '批准该补丁进入后续发布流程；单独批准不会改变运行时行为。',
+  markPatchApplied: '把补丁标记为已应用，用于审计已经通过代码或策略落地的改动。',
+  createVersion: '从已批准补丁创建候选 Harness 版本；候选版本默认不接收用户流量。',
+  rejectPatch: '拒绝该补丁，阻止它继续生成候选版本或进入发布流程。',
+  canaryVersion: '让少量稳定哈希命中的流量进入该候选版本，默认 5%，用于和 active 版本对比。',
+  activateVersion: '把该版本提升为正式 active；存在回归样本时必须先通过回归 gate。',
+  rollbackVersion: '把当前 active 回退到上一个稳定版本，并将问题版本归档或拒绝。',
+  loadMoreFailures: '加载下一页失败样本。',
+  loadMorePatches: '加载下一页候选补丁。',
+  loadMoreTraces: '加载下一页执行 Trace。',
+  seedRunDraft: '根据当前回归样本生成可编辑的结果 JSON 草稿，方便人工补充判定。',
+  submitRunResult: '提交结构化回归结果；这些结果可作为激活证据，也可沉淀为新的失败样本。',
+} as const
+
 const SURFACE_LABELS = Object.fromEntries(SURFACES.map(item => [item.value, item.label])) as Record<string, string>
 const STATUS_LABELS: Record<string, string> = {
   active: '已启用',
   candidate: '候选版本',
+  canary: '灰度中',
   retired: '已归档',
   pending: '待开始',
   running: '运行中',
@@ -148,7 +186,7 @@ function statusClass(status?: string) {
   }
   if (['failed', 'rejected'].includes(status || '')) return 'border-rose-200 bg-rose-50 text-rose-700'
   if (status === 'running') return 'border-blue-200 bg-blue-50 text-blue-700'
-  if (['regression', 'candidate'].includes(status || '')) return 'border-indigo-200 bg-indigo-50 text-indigo-700'
+  if (['regression', 'candidate', 'canary'].includes(status || '')) return 'border-indigo-200 bg-indigo-50 text-indigo-700'
   return 'border-amber-200 bg-amber-50 text-amber-700'
 }
 
@@ -213,6 +251,108 @@ function StatBlock({ icon: Icon, label, value, hint }: {
   )
 }
 
+function fmtRate(value?: number | null) {
+  return value === null || value === undefined ? '-' : `${value}%`
+}
+
+function fmtLatency(value?: number | null) {
+  return value === null || value === undefined ? '-' : `${value}ms`
+}
+
+// delta 方向：higherIsBetter=true 时正向为好（绿），false 时负向为好（绿）。
+function DeltaTag({ delta, higherIsBetter, unit }: { delta?: number | null; higherIsBetter: boolean; unit: string }) {
+  if (delta === null || delta === undefined || delta === 0) {
+    return <span className="text-xs text-muted-foreground">持平</span>
+  }
+  const good = higherIsBetter ? delta > 0 : delta < 0
+  const sign = delta > 0 ? '+' : ''
+  return (
+    <span className={cn('text-xs font-medium', good ? 'text-emerald-600' : 'text-rose-600')}>
+      {delta > 0 ? '↑' : '↓'} {sign}{delta}{unit}
+    </span>
+  )
+}
+
+function MetricRow({ label, value, delta }: { label: string; value: string; delta?: ReactNode }) {
+  return (
+    <div className="flex items-center justify-between gap-2 py-1">
+      <span className="text-xs text-muted-foreground">{label}</span>
+      <div className="flex items-center gap-2">
+        <span className="text-sm font-medium tabular-nums">{value}</span>
+        {delta}
+      </div>
+    </div>
+  )
+}
+
+function VersionMetricCard({ metric, comparison }: {
+  metric: HarnessVersionMetricVO
+  comparison?: HarnessVersionMetricsVO['comparison']
+}) {
+  const showDelta = !!comparison && comparison.canaryVersion === metric.version
+  return (
+    <div className="rounded-lg border bg-background p-4">
+      <div className="mb-2 flex flex-wrap items-center gap-2">
+        <Badge variant="outline" className={cn('border', statusClass(metric.status))}>{statusLabel(metric.status)}</Badge>
+        {metric.status === 'canary' && typeof metric.percentage === 'number' && metric.percentage > 0 && (
+          <Badge variant="outline">{metric.percentage}%</Badge>
+        )}
+        <span className="text-xs text-muted-foreground">样本 {metric.total}</span>
+      </div>
+      <p className="truncate text-xs text-muted-foreground">技术标识：{metric.version}</p>
+      <div className="mt-2 divide-y">
+        <MetricRow label="成功率" value={fmtRate(metric.successRate)}
+          delta={showDelta ? <DeltaTag delta={comparison?.successRateDelta} higherIsBetter unit="%" /> : undefined} />
+        <MetricRow label="失败率" value={fmtRate(metric.failureRate)}
+          delta={showDelta ? <DeltaTag delta={comparison?.failureRateDelta} higherIsBetter={false} unit="%" /> : undefined} />
+        <MetricRow label="工具成功率" value={fmtRate(metric.toolSuccessRate)}
+          delta={showDelta ? <DeltaTag delta={comparison?.toolSuccessRateDelta} higherIsBetter unit="%" /> : undefined} />
+        <MetricRow label="空回复率" value={fmtRate(metric.emptyResponseRate)}
+          delta={showDelta ? <DeltaTag delta={comparison?.emptyResponseRateDelta} higherIsBetter={false} unit="%" /> : undefined} />
+        <MetricRow label="平均延迟" value={fmtLatency(metric.avgLatencyMs)}
+          delta={showDelta ? <DeltaTag delta={comparison?.avgLatencyDelta} higherIsBetter={false} unit="ms" /> : undefined} />
+        <MetricRow label="Token（入/出）" value={`${metric.inputTokens} / ${metric.outputTokens}`} />
+      </div>
+    </div>
+  )
+}
+
+function VersionComparePanel({ metrics }: { metrics: HarnessVersionMetricsVO | null }) {
+  if (!metrics) return null
+  const hasData = metrics.active || metrics.canaries.length > 0
+  return (
+    <section className="rounded-lg border bg-background p-4">
+      <SectionTitle
+        title="版本指标对比"
+        action={<span className="text-xs text-muted-foreground">近 {metrics.windowDays} 天 · 按采集契约版本聚合</span>}
+      />
+      {!hasData ? (
+        <p className="py-8 text-center text-sm text-muted-foreground">
+          当前范围内暂无带版本标识的 Trace。激活候选版本并进入灰度后即可对比 active 与 canary 的失败率、工具成功率、延迟和空回复率。
+        </p>
+      ) : (
+        <>
+          {metrics.surface === 'all' && (
+            <p className="mb-3 text-xs text-amber-700">当前为全部范围：多个 surface 若共用同一版本标识会被合并统计。要精确对比 active 与 canary，请在上方切换到具体 surface。</p>
+          )}
+          {!metrics.canaries.length && (
+            <p className="mb-3 text-xs text-muted-foreground">当前没有灰度版本，先让候选版本进入灰度，再回来对比两者指标差异。</p>
+          )}
+          <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
+            {metrics.active && <VersionMetricCard metric={metrics.active} comparison={metrics.comparison} />}
+            {metrics.canaries.map(canary => (
+              <VersionMetricCard key={canary.version} metric={canary} comparison={metrics.comparison} />
+            ))}
+            {metrics.others.map(other => (
+              <VersionMetricCard key={other.version} metric={other} />
+            ))}
+          </div>
+        </>
+      )}
+    </section>
+  )
+}
+
 function SectionTitle({ title, count, action }: { title: string; count?: number; action?: ReactNode }) {
   return (
     <div className="mb-3 flex items-center justify-between gap-3">
@@ -225,6 +365,24 @@ function SectionTitle({ title, count, action }: { title: string; count?: number;
   )
 }
 
+function ExplainedButton({ help, children, className, ...props }: ComponentProps<typeof Button> & { help: string }) {
+  const fullWidth = typeof className === 'string' && className.includes('w-full')
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <span className={cn('inline-flex', fullWidth && 'w-full')}>
+          <Button {...props} className={className} title={help}>
+            {children}
+          </Button>
+        </span>
+      </TooltipTrigger>
+      <TooltipContent className="max-w-72 text-xs leading-relaxed">
+        <p>{help}</p>
+      </TooltipContent>
+    </Tooltip>
+  )
+}
+
 function JsonBlock({ title, value }: { title: string; value?: string }) {
   const parsed = safeJson(value, value || '')
   const text = typeof parsed === 'string' ? parsed : JSON.stringify(parsed, null, 2)
@@ -232,6 +390,43 @@ function JsonBlock({ title, value }: { title: string; value?: string }) {
     <div>
       <p className="mb-1 text-xs font-medium text-muted-foreground">{title}</p>
       <pre className="max-h-56 overflow-auto rounded-md bg-muted p-3 text-xs leading-relaxed">{text || '-'}</pre>
+    </div>
+  )
+}
+
+function TraceEventList({ events }: { events: HarnessTraceEventVO[] }) {
+  return (
+    <div>
+      <div className="mb-2 flex items-center justify-between">
+        <p className="text-xs font-medium text-muted-foreground">Structured events</p>
+        <Badge variant="outline">{events.length}</Badge>
+      </div>
+      <div className="max-h-80 space-y-2 overflow-auto rounded-md border bg-background p-2">
+        {events.map(event => {
+          const payload = safeJson<Record<string, unknown>>(event.payloadJson, {})
+          return (
+            <div key={event.id} className="rounded-md bg-muted/50 p-3">
+              <div className="flex flex-wrap items-center gap-2">
+                <Badge variant="outline">#{event.seq}</Badge>
+                <Badge variant="outline" className={cn('border', statusClass(event.status))}>{event.status || '-'}</Badge>
+                <span className="text-sm font-medium">{event.eventName || event.eventType}</span>
+                {event.toolName && <span className="text-xs text-muted-foreground">tool: {event.toolName}</span>}
+                {event.model && <span className="text-xs text-muted-foreground">model: {event.model}</span>}
+                {event.durationMs !== undefined && <span className="text-xs text-muted-foreground">{event.durationMs}ms</span>}
+              </div>
+              <p className="mt-1 text-xs text-muted-foreground">
+                {event.eventType || '-'} · {fmtDate(event.createdAt)}
+              </p>
+              {event.payloadJson && (
+                <pre className="mt-2 max-h-32 overflow-auto rounded bg-background/80 p-2 text-xs">{JSON.stringify(payload, null, 2)}</pre>
+              )}
+            </div>
+          )
+        })}
+        {events.length === 0 && (
+          <p className="py-8 text-center text-sm text-muted-foreground">No structured events recorded yet.</p>
+        )}
+      </div>
     </div>
   )
 }
@@ -284,11 +479,13 @@ export default function HarnessEvolutionTab() {
   const [recurringFailures, setRecurringFailures] = useState<HarnessRecurringFailureVO[]>([])
   const [regressionPreview, setRegressionPreview] = useState<HarnessRegressionPreviewVO | null>(null)
   const [regressionRuns, setRegressionRuns] = useState<HarnessRegressionRunVO[]>([])
+  const [versionMetrics, setVersionMetrics] = useState<HarnessVersionMetricsVO | null>(null)
   const [loading, setLoading] = useState(false)
   const [loadingMore, setLoadingMore] = useState<'traces' | 'failures' | 'patches' | null>(null)
   const [workingId, setWorkingId] = useState<string | null>(null)
   const [error, setError] = useState('')
   const [selectedTrace, setSelectedTrace] = useState<HarnessTraceVO | null>(null)
+  const [selectedTraceEvents, setSelectedTraceEvents] = useState<HarnessTraceEventVO[]>([])
   const [traceLoading, setTraceLoading] = useState(false)
   const [selectedRun, setSelectedRun] = useState<HarnessRegressionRunVO | null>(null)
   const [runLoading, setRunLoading] = useState(false)
@@ -318,7 +515,11 @@ export default function HarnessEvolutionTab() {
     setLoading(true)
     setError('')
     try {
-      const [summary, versionList, tracePage, failurePage, patchPage, regression, recurring, preview, runs] = await Promise.all([
+      const metricsPromise = harnessApi.versionMetrics(surface, 7).catch(err => {
+        if (import.meta.env.DEV) console.debug('Harness 版本指标接口不可用，已跳过对比看板:', err)
+        return null
+      })
+      const [summary, versionList, tracePage, failurePage, patchPage, regression, recurring, preview, runs, metrics] = await Promise.all([
         harnessApi.overview(surface, 120),
         harnessApi.versions(surface, 80),
         harnessApi.tracePage(surface, 1, PAGE_SIZE),
@@ -328,6 +529,7 @@ export default function HarnessEvolutionTab() {
         harnessApi.recurringFailures({ surface, minCount: 2, limit: 20 }),
         harnessApi.regressionPreview({ surface, limit: 80 }),
         harnessApi.regressionRuns(surface, 30),
+        metricsPromise,
       ])
       setOverview(summary)
       setVersions(versionList)
@@ -338,8 +540,13 @@ export default function HarnessEvolutionTab() {
       setRecurringFailures(recurring)
       setRegressionPreview(preview)
       setRegressionRuns(runs)
+      setVersionMetrics(metrics)
     } catch (e) {
-      setError(e instanceof Error ? e.message : '加载 Harness 数据失败')
+      const message = e instanceof Error ? e.message : '加载 Harness 数据失败'
+      const migrationHint = message.includes('请求处理失败')
+        ? ' 请确认后端已部署最新版本，并执行 migrate_harness_evolution_runtime.sql 数据库迁移。'
+        : ''
+      setError(`${message}${migrationHint}`)
     } finally {
       setLoading(false)
     }
@@ -384,9 +591,12 @@ export default function HarnessEvolutionTab() {
 
   const runAction = async (key: string, action: () => Promise<unknown>) => {
     setWorkingId(key)
+    setError('')
     try {
       await action()
       await load()
+    } catch (e) {
+      setError(e instanceof Error ? e.message : '操作失败，请稍后重试')
     } finally {
       setWorkingId(null)
     }
@@ -424,6 +634,16 @@ export default function HarnessEvolutionTab() {
     runAction(`activate-version:${version.id}`, () => harnessApi.activateVersion(version.id))
   }
 
+  const canaryVersion = (version: HarnessVersionVO) => {
+    if (!canPatch) return
+    runAction(`canary-version:${version.id}`, () => harnessApi.canaryVersion(version.id, { percentage: 5 }))
+  }
+
+  const rollbackVersion = (version: HarnessVersionVO) => {
+    if (!canPatch) return
+    runAction(`rollback-version:${version.id}`, () => harnessApi.rollbackVersion(version.id))
+  }
+
   const updateFailureStatus = (failure: HarnessFailureVO, status: 'resolved' | 'ignored' | 'regression') => {
     if (status === 'regression' && !canRegression) return
     if (status !== 'regression' && !canPatch) return
@@ -446,6 +666,11 @@ export default function HarnessEvolutionTab() {
   const runRegressionPreflight = (run: HarnessRegressionRunVO) => {
     if (!canRegression) return
     runAction(`preflight-regression:${run.id}`, () => harnessApi.runRegressionPreflight(run.id))
+  }
+
+  const executeRegressionRun = (run: HarnessRegressionRunVO) => {
+    if (!canRegression) return
+    runAction(`execute-regression:${run.id}`, () => harnessApi.executeRegressionRun(run.id))
   }
 
   const completeRegressionRun = (run: HarnessRegressionRunVO, status: 'passed' | 'failed' | 'blocked' | 'cancelled') => {
@@ -527,9 +752,15 @@ export default function HarnessEvolutionTab() {
 
   const openTrace = async (trace: HarnessTraceVO) => {
     setSelectedTrace(trace)
+    setSelectedTraceEvents([])
     setTraceLoading(true)
     try {
-      setSelectedTrace(await harnessApi.trace(trace.id))
+      const [fullTrace, events] = await Promise.all([
+        harnessApi.trace(trace.id),
+        harnessApi.traceEvents(trace.id),
+      ])
+      setSelectedTrace(fullTrace)
+      setSelectedTraceEvents(events)
     } finally {
       setTraceLoading(false)
     }
@@ -562,6 +793,7 @@ export default function HarnessEvolutionTab() {
     : 0
 
   return (
+    <TooltipProvider delayDuration={150}>
     <div className="h-full min-h-0 overflow-y-auto overscroll-contain p-4 pb-24 md:p-6 md:pb-6">
       <div className="mb-5 flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
         <div>
@@ -577,15 +809,15 @@ export default function HarnessEvolutionTab() {
               {SURFACES.map(item => <SelectItem key={item.value} value={item.value}>{item.label}</SelectItem>)}
             </SelectContent>
           </Select>
-          <Button variant="outline" onClick={load} disabled={loading}>
+          <ExplainedButton help={ACTION_HELP.refresh} variant="outline" onClick={load} disabled={loading}>
             {loading ? <Loader2 className="mr-1.5 h-4 w-4 animate-spin" /> : <RefreshCw className="mr-1.5 h-4 w-4" />}
             刷新
-          </Button>
+          </ExplainedButton>
         </div>
       </div>
 
       <div className="mb-5 rounded-lg border bg-muted/25 p-4">
-        <div className="grid gap-3 md:grid-cols-4">
+        <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-5">
           <div>
             <p className="text-sm font-medium">1. 自动采集</p>
             <p className="mt-1 text-xs leading-relaxed text-muted-foreground">对话、Agent 对话、同步对话和代码开发执行后，后端会自动记录 Trace、模型、耗时、输入输出摘要与质量信号。</p>
@@ -599,8 +831,12 @@ export default function HarnessEvolutionTab() {
             <p className="mt-1 text-xs leading-relaxed text-muted-foreground">候选版本激活前先创建回归运行，记录每个 case 的通过、失败、阻塞证据，避免修一个问题又引入新问题。</p>
           </div>
           <div>
-            <p className="text-sm font-medium">4. 激活版本</p>
-            <p className="mt-1 text-xs leading-relaxed text-muted-foreground">回归通过后再激活新 Harness 版本，让平台按新的采集和评估契约持续演进。</p>
+            <p className="text-sm font-medium">4. 灰度观察</p>
+            <p className="mt-1 text-xs leading-relaxed text-muted-foreground">候选版本回归通过后先进入 5% 灰度，按用户或会话稳定命中，对比失败率、工具成功率、延迟和空回复率。</p>
+          </div>
+          <div>
+            <p className="text-sm font-medium">5. 激活或回滚</p>
+            <p className="mt-1 text-xs leading-relaxed text-muted-foreground">灰度证据更好时再激活；指标恶化时立即回滚到上一稳定版本，问题版本会归档或拒绝。</p>
           </div>
         </div>
       </div>
@@ -636,7 +872,8 @@ export default function HarnessEvolutionTab() {
                     )}
                   </div>
                   <div className="flex shrink-0 gap-2">
-                    <Button
+                    <ExplainedButton
+                      help={ACTION_HELP.createVersionRegression}
                       size="sm"
                       variant="outline"
                       onClick={() => createRegressionRun(version)}
@@ -644,8 +881,19 @@ export default function HarnessEvolutionTab() {
                     >
                       {workingId === `create-regression:${version.id}` && <Loader2 className="mr-1.5 h-4 w-4 animate-spin" />}
                       回归
-                    </Button>
-                    <Button
+                    </ExplainedButton>
+                    <ExplainedButton
+                      help={ACTION_HELP.canaryVersion}
+                      size="sm"
+                      variant="outline"
+                      onClick={() => canaryVersion(version)}
+                      disabled={!canPatch || !['candidate', 'canary'].includes(version.status) || needsRegressionBeforeActivation(version) || workingId === `canary-version:${version.id}`}
+                    >
+                      {workingId === `canary-version:${version.id}` && <Loader2 className="mr-1.5 h-4 w-4 animate-spin" />}
+                      灰度 5%
+                    </ExplainedButton>
+                    <ExplainedButton
+                      help={ACTION_HELP.activateVersion}
                       size="sm"
                       variant="outline"
                       onClick={() => activateVersion(version)}
@@ -653,7 +901,17 @@ export default function HarnessEvolutionTab() {
                     >
                       {workingId === `activate-version:${version.id}` && <Loader2 className="mr-1.5 h-4 w-4 animate-spin" />}
                       激活
-                    </Button>
+                    </ExplainedButton>
+                    <ExplainedButton
+                      help={ACTION_HELP.rollbackVersion}
+                      size="sm"
+                      variant="ghost"
+                      onClick={() => rollbackVersion(version)}
+                      disabled={!canPatch || !['active', 'canary'].includes(version.status) || workingId === `rollback-version:${version.id}`}
+                    >
+                      {workingId === `rollback-version:${version.id}` && <Loader2 className="mr-1.5 h-4 w-4 animate-spin" />}
+                      回滚
+                    </ExplainedButton>
                   </div>
                 </div>
               </div>
@@ -667,11 +925,11 @@ export default function HarnessEvolutionTab() {
               count={regressionPreview?.caseCount ?? 0}
               action={
                 <div className="flex gap-2">
-                  <Button variant="outline" size="sm" onClick={() => createRegressionRun()} disabled={!canRegression || regressionCases.length === 0 || !!workingId?.startsWith('create-regression')}>
+                  <ExplainedButton help={ACTION_HELP.createRegression} variant="outline" size="sm" onClick={() => createRegressionRun()} disabled={!canRegression || regressionCases.length === 0 || !!workingId?.startsWith('create-regression')}>
                     {workingId?.startsWith('create-regression') && <Loader2 className="mr-1.5 h-4 w-4 animate-spin" />}
                     创建运行
-                  </Button>
-                  <Button variant="outline" size="sm" onClick={exportRegressionCases} disabled={regressionCases.length === 0}>导出样本</Button>
+                  </ExplainedButton>
+                  <ExplainedButton help={ACTION_HELP.exportCases} variant="outline" size="sm" onClick={exportRegressionCases} disabled={regressionCases.length === 0}>导出样本</ExplainedButton>
                 </div>
               }
             />
@@ -701,6 +959,7 @@ export default function HarnessEvolutionTab() {
             <div className="space-y-2">
               {regressionRuns.map(run => {
                 const editable = run.status === 'pending' || run.status === 'running'
+                const executable = ['pending', 'running', 'blocked', 'failed'].includes(run.status)
                 const caseResults = regressionCaseResults(run)
                 return (
                   <div key={run.id} className="rounded-md border p-3">
@@ -721,20 +980,24 @@ export default function HarnessEvolutionTab() {
                         <p className="mt-1 text-xs text-muted-foreground">{fmtDate(run.createdAt)}</p>
                       </div>
                       <div className="flex shrink-0 flex-wrap gap-2">
-                        <Button size="sm" variant="outline" onClick={() => openRegressionRun(run)}>查看结果</Button>
-                        <Button size="sm" variant="outline" onClick={() => exportRegressionRunBundle(run)}>导出</Button>
-                        <Button size="sm" variant="outline" onClick={() => startRegressionRun(run)} disabled={!canRegression || run.status !== 'pending' || workingId === `start-regression:${run.id}`}>
+                        <ExplainedButton help={ACTION_HELP.viewRun} size="sm" variant="outline" onClick={() => openRegressionRun(run)}>查看结果</ExplainedButton>
+                        <ExplainedButton help={ACTION_HELP.exportRun} size="sm" variant="outline" onClick={() => exportRegressionRunBundle(run)}>导出</ExplainedButton>
+                        <ExplainedButton help={ACTION_HELP.startRun} size="sm" variant="outline" onClick={() => startRegressionRun(run)} disabled={!canRegression || run.status !== 'pending' || workingId === `start-regression:${run.id}`}>
                           {workingId === `start-regression:${run.id}` ? <Loader2 className="mr-1.5 h-4 w-4 animate-spin" /> : <PlayCircle className="mr-1.5 h-4 w-4" />}
                           开始
-                        </Button>
-                        <Button size="sm" variant="outline" onClick={() => runRegressionPreflight(run)} disabled={!canRegression || !editable || workingId === `preflight-regression:${run.id}`}>
+                        </ExplainedButton>
+                        <ExplainedButton help={ACTION_HELP.preflightRun} size="sm" variant="outline" onClick={() => runRegressionPreflight(run)} disabled={!canRegression || !editable || workingId === `preflight-regression:${run.id}`}>
                           {workingId === `preflight-regression:${run.id}` && <Loader2 className="mr-1.5 h-4 w-4 animate-spin" />}
                           预检
-                        </Button>
-                        <Button size="sm" variant="outline" onClick={() => completeRegressionRun(run, 'passed')} disabled={!canRegression || !editable}>通过</Button>
-                        <Button size="sm" variant="outline" onClick={() => completeRegressionRun(run, 'failed')} disabled={!canRegression || !editable}>失败</Button>
-                        <Button size="sm" variant="ghost" onClick={() => completeRegressionRun(run, 'blocked')} disabled={!canRegression || !editable}>阻塞</Button>
-                        <Button size="sm" variant="ghost" onClick={() => completeRegressionRun(run, 'cancelled')} disabled={!canRegression || !editable}>取消</Button>
+                        </ExplainedButton>
+                        <ExplainedButton help={ACTION_HELP.executeRun} size="sm" variant="outline" onClick={() => executeRegressionRun(run)} disabled={!canRegression || !executable || workingId === `execute-regression:${run.id}`}>
+                          {workingId === `execute-regression:${run.id}` && <Loader2 className="mr-1.5 h-4 w-4 animate-spin" />}
+                          真实回放
+                        </ExplainedButton>
+                        <ExplainedButton help={ACTION_HELP.passRun} size="sm" variant="outline" onClick={() => completeRegressionRun(run, 'passed')} disabled={!canRegression || !editable}>通过</ExplainedButton>
+                        <ExplainedButton help={ACTION_HELP.failRun} size="sm" variant="outline" onClick={() => completeRegressionRun(run, 'failed')} disabled={!canRegression || !editable}>失败</ExplainedButton>
+                        <ExplainedButton help={ACTION_HELP.blockRun} size="sm" variant="ghost" onClick={() => completeRegressionRun(run, 'blocked')} disabled={!canRegression || !editable}>阻塞</ExplainedButton>
+                        <ExplainedButton help={ACTION_HELP.cancelRun} size="sm" variant="ghost" onClick={() => completeRegressionRun(run, 'cancelled')} disabled={!canRegression || !editable}>取消</ExplainedButton>
                       </div>
                     </div>
                   </div>
@@ -744,6 +1007,8 @@ export default function HarnessEvolutionTab() {
             </div>
           </div>
         </section>
+
+        <VersionComparePanel metrics={versionMetrics} />
 
         <section className="rounded-lg border bg-background p-4">
           <SectionTitle title="失败类型" count={failureTypes.length} />
@@ -757,10 +1022,10 @@ export default function HarnessEvolutionTab() {
                 </div>
                 <div className="flex items-center gap-2">
                   <span className="text-sm text-muted-foreground">{count}</span>
-                  <Button size="sm" variant="ghost" className="h-7 px-2" onClick={() => generatePatch(type)} disabled={!canPatch || workingId === `generate:${type}`}>
+                  <ExplainedButton help={ACTION_HELP.generatePatch} size="sm" variant="ghost" className="h-7 px-2" onClick={() => generatePatch(type)} disabled={!canPatch || workingId === `generate:${type}`}>
                     {workingId === `generate:${type}` && <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />}
                     生成改进
-                  </Button>
+                  </ExplainedButton>
                 </div>
               </div>
             ))}
@@ -771,7 +1036,8 @@ export default function HarnessEvolutionTab() {
               title="高频失败"
               count={recurringFailures.length}
               action={
-                <Button
+                <ExplainedButton
+                  help={ACTION_HELP.promoteRecurring}
                   size="sm"
                   variant="outline"
                   onClick={promoteRecurringFailures}
@@ -779,7 +1045,7 @@ export default function HarnessEvolutionTab() {
                 >
                   {workingId === 'promote-recurring' && <Loader2 className="mr-1.5 h-4 w-4 animate-spin" />}
                   自动生成候选
-                </Button>
+                </ExplainedButton>
               }
             />
             <div className="space-y-2">
@@ -818,19 +1084,31 @@ export default function HarnessEvolutionTab() {
                 </div>
                 <p className="mt-2 line-clamp-3 text-sm text-muted-foreground">{failure.summary || '无摘要'}</p>
                 <div className="mt-3 flex flex-wrap gap-2">
-                  <Button size="sm" variant="outline" className="h-7 px-2 text-xs" onClick={() => generatePatch(failure.failureType)} disabled={!canPatch}>生成改进</Button>
-                  <Button size="sm" variant="ghost" className="h-7 px-2 text-xs" onClick={() => updateFailureStatus(failure, 'resolved')} disabled={!canPatch}>解决</Button>
-                  <Button size="sm" variant="ghost" className="h-7 px-2 text-xs" onClick={() => updateFailureStatus(failure, 'regression')} disabled={!canRegression}>加入回归</Button>
-                  <Button size="sm" variant="ghost" className="h-7 px-2 text-xs" onClick={() => updateFailureStatus(failure, 'ignored')} disabled={!canPatch}>忽略</Button>
+                  <ExplainedButton help={ACTION_HELP.generatePatch} size="sm" variant="outline" className="h-7 px-2 text-xs" onClick={() => generatePatch(failure.failureType)} disabled={!canPatch || !!workingId}>
+                    {workingId === `generate:${failure.failureType}` && <Loader2 className="mr-1 h-3 w-3 animate-spin" />}
+                    生成改进
+                  </ExplainedButton>
+                  <ExplainedButton help={ACTION_HELP.resolveFailure} size="sm" variant="ghost" className="h-7 px-2 text-xs" onClick={() => updateFailureStatus(failure, 'resolved')} disabled={!canPatch || !!workingId}>
+                    {workingId === `failure:${failure.id}:resolved` && <Loader2 className="mr-1 h-3 w-3 animate-spin" />}
+                    解决
+                  </ExplainedButton>
+                  <ExplainedButton help={ACTION_HELP.addFailureRegression} size="sm" variant="ghost" className="h-7 px-2 text-xs" onClick={() => updateFailureStatus(failure, 'regression')} disabled={!canRegression || !!workingId}>
+                    {workingId === `failure:${failure.id}:regression` && <Loader2 className="mr-1 h-3 w-3 animate-spin" />}
+                    加入回归
+                  </ExplainedButton>
+                  <ExplainedButton help={ACTION_HELP.ignoreFailure} size="sm" variant="ghost" className="h-7 px-2 text-xs" onClick={() => updateFailureStatus(failure, 'ignored')} disabled={!canPatch || !!workingId}>
+                    {workingId === `failure:${failure.id}:ignored` && <Loader2 className="mr-1 h-3 w-3 animate-spin" />}
+                    忽略
+                  </ExplainedButton>
                 </div>
               </div>
             ))}
             {failures.list.length === 0 && <p className="py-8 text-center text-sm text-muted-foreground">暂无失败样本</p>}
             {hasMore(failures) && (
-              <Button variant="outline" className="w-full" onClick={() => loadMore('failures')} disabled={loadingMore === 'failures'}>
+              <ExplainedButton help={ACTION_HELP.loadMoreFailures} variant="outline" className="w-full" onClick={() => loadMore('failures')} disabled={loadingMore === 'failures'}>
                 {loadingMore === 'failures' && <Loader2 className="mr-1.5 h-4 w-4 animate-spin" />}
                 加载更多失败样本
-              </Button>
+              </ExplainedButton>
             )}
           </div>
         </section>
@@ -860,13 +1138,22 @@ export default function HarnessEvolutionTab() {
                     )}
                   </div>
                   <div className="flex shrink-0 flex-wrap gap-2 md:justify-end">
-                    <Button size="sm" variant="outline" onClick={() => updatePatchStatus(patch, 'approved')} disabled={!canPatch || patch.status === 'approved'}>批准</Button>
-                    <Button size="sm" variant="outline" onClick={() => updatePatchStatus(patch, 'applied')} disabled={!canPatch || patch.status === 'applied'}>标记应用</Button>
-                    <Button size="sm" variant="outline" onClick={() => createVersionFromPatch(patch)} disabled={!canPatch || !canCreateVersion || workingId === `version-from-patch:${patch.id}`}>
+                    <ExplainedButton help={ACTION_HELP.approvePatch} size="sm" variant="outline" onClick={() => updatePatchStatus(patch, 'approved')} disabled={!canPatch || patch.status === 'approved' || !!workingId}>
+                      {workingId === `patch:${patch.id}:approved` && <Loader2 className="mr-1.5 h-4 w-4 animate-spin" />}
+                      批准
+                    </ExplainedButton>
+                    <ExplainedButton help={ACTION_HELP.markPatchApplied} size="sm" variant="outline" onClick={() => updatePatchStatus(patch, 'applied')} disabled={!canPatch || patch.status === 'applied' || !!workingId}>
+                      {workingId === `patch:${patch.id}:applied` && <Loader2 className="mr-1.5 h-4 w-4 animate-spin" />}
+                      标记应用
+                    </ExplainedButton>
+                    <ExplainedButton help={ACTION_HELP.createVersion} size="sm" variant="outline" onClick={() => createVersionFromPatch(patch)} disabled={!canPatch || !canCreateVersion || !!workingId}>
                       {workingId === `version-from-patch:${patch.id}` && <Loader2 className="mr-1.5 h-4 w-4 animate-spin" />}
                       生成版本
-                    </Button>
-                    <Button size="sm" variant="ghost" onClick={() => updatePatchStatus(patch, 'rejected')} disabled={!canPatch || patch.status === 'rejected'}>拒绝</Button>
+                    </ExplainedButton>
+                    <ExplainedButton help={ACTION_HELP.rejectPatch} size="sm" variant="ghost" onClick={() => updatePatchStatus(patch, 'rejected')} disabled={!canPatch || patch.status === 'rejected' || !!workingId}>
+                      {workingId === `patch:${patch.id}:rejected` && <Loader2 className="mr-1.5 h-4 w-4 animate-spin" />}
+                      拒绝
+                    </ExplainedButton>
                   </div>
                 </div>
               </div>
@@ -874,10 +1161,10 @@ export default function HarnessEvolutionTab() {
           })}
           {patches.list.length === 0 && <div className="rounded-lg border bg-background py-12 text-center text-sm text-muted-foreground">暂无候选改进</div>}
           {hasMore(patches) && (
-            <Button variant="outline" className="w-full" onClick={() => loadMore('patches')} disabled={loadingMore === 'patches'}>
+            <ExplainedButton help={ACTION_HELP.loadMorePatches} variant="outline" className="w-full" onClick={() => loadMore('patches')} disabled={loadingMore === 'patches'}>
               {loadingMore === 'patches' && <Loader2 className="mr-1.5 h-4 w-4 animate-spin" />}
               加载更多候选改进
-            </Button>
+            </ExplainedButton>
           )}
         </section>
       </div>
@@ -909,15 +1196,20 @@ export default function HarnessEvolutionTab() {
         </div>
         {hasMore(traces) && (
           <div className="border-t p-3">
-            <Button variant="outline" className="w-full" onClick={() => loadMore('traces')} disabled={loadingMore === 'traces'}>
+            <ExplainedButton help={ACTION_HELP.loadMoreTraces} variant="outline" className="w-full" onClick={() => loadMore('traces')} disabled={loadingMore === 'traces'}>
               {loadingMore === 'traces' && <Loader2 className="mr-1.5 h-4 w-4 animate-spin" />}
               加载更多 Trace
-            </Button>
+            </ExplainedButton>
           </div>
         )}
       </section>
 
-      <Dialog open={!!selectedTrace} onOpenChange={(open) => !open && setSelectedTrace(null)}>
+      <Dialog open={!!selectedTrace} onOpenChange={(open) => {
+        if (!open) {
+          setSelectedTrace(null)
+          setSelectedTraceEvents([])
+        }
+      }}>
         <DialogContent className="max-h-[85vh] max-w-4xl overflow-y-auto">
           <DialogHeader>
             <DialogTitle>Trace 详情</DialogTitle>
@@ -941,6 +1233,7 @@ export default function HarnessEvolutionTab() {
                 <p className="mb-1 text-xs font-medium text-muted-foreground">输出 / 错误</p>
                 <p className="whitespace-pre-wrap rounded-md bg-muted p-3 text-sm">{selectedTrace.errorMsg || selectedTrace.outputSummary || '-'}</p>
               </div>
+              <TraceEventList events={selectedTraceEvents} />
               <div className="grid gap-3 md:grid-cols-2">
                 <JsonBlock title="Events" value={selectedTrace.eventsJson} />
                 <JsonBlock title="Metrics" value={selectedTrace.metricsJson} />
@@ -1010,7 +1303,7 @@ export default function HarnessEvolutionTab() {
                             <p className="text-xs text-muted-foreground">按 case 记录状态、摘要和证据；提交后会作为版本激活依据，并可沉淀为失败样本。</p>
                           </div>
                           <div className="flex gap-2">
-                            <Button size="sm" variant="outline" onClick={seedSelectedRunCaseResults}>从样本生成草稿</Button>
+                            <ExplainedButton help={ACTION_HELP.seedRunDraft} size="sm" variant="outline" onClick={seedSelectedRunCaseResults}>从样本生成草稿</ExplainedButton>
                             <Select value={runStatusDraft} onValueChange={(value) => setRunStatusDraft(value as typeof runStatusDraft)}>
                               <SelectTrigger className="h-8 w-28">
                                 <SelectValue />
@@ -1039,10 +1332,10 @@ export default function HarnessEvolutionTab() {
                         />
                         {runDraftError && <p className="mt-2 text-xs text-rose-600">{runDraftError}</p>}
                         <div className="mt-3 flex justify-end">
-                          <Button onClick={submitSelectedRunResult} disabled={workingId === `complete-regression:${selectedRun.id}:structured`}>
+                          <ExplainedButton help={ACTION_HELP.submitRunResult} onClick={submitSelectedRunResult} disabled={workingId === `complete-regression:${selectedRun.id}:structured`}>
                             {workingId === `complete-regression:${selectedRun.id}:structured` && <Loader2 className="mr-1.5 h-4 w-4 animate-spin" />}
                             提交结构化结果
-                          </Button>
+                          </ExplainedButton>
                         </div>
                       </div>
                     )}
@@ -1055,5 +1348,6 @@ export default function HarnessEvolutionTab() {
         </DialogContent>
       </Dialog>
     </div>
+    </TooltipProvider>
   )
 }

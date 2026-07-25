@@ -44,6 +44,15 @@ PERSISTED_JSON_FIELDS = (
     "project_recon",
     "pipeline_runs",
     "events",
+    "pending_confirmation",
+    "pending_user_input",
+    "interventions",
+    "completion_report",
+    "active_intent_route",
+    "active_execution_plan",
+    "task_capability_profile",
+    "retrieval_plan",
+    "retrieval_guard",
 )
 
 MAX_LOG_ENTRIES = int(os.getenv("AUTOCODE_TASK_DB_MAX_LOG_ENTRIES", "500"))
@@ -211,7 +220,7 @@ def init_table():
                     `id` VARCHAR(64) NOT NULL,
                     `title` VARCHAR(200) NOT NULL,
                     `description` TEXT NOT NULL,
-                    `project_type` VARCHAR(50) NOT NULL DEFAULT 'nextjs',
+                    `project_type` VARCHAR(50) NOT NULL DEFAULT 'unknown',
                     `status` VARCHAR(20) NOT NULL DEFAULT 'pending',
                     `progress` INT NOT NULL DEFAULT 0,
                     `current_step` VARCHAR(500) DEFAULT '',
@@ -220,6 +229,7 @@ def init_table():
                     `harness_trace_id` BIGINT DEFAULT NULL,
                     `model` VARCHAR(100) DEFAULT NULL,
                     `tool_policy` VARCHAR(32) NOT NULL DEFAULT 'full_access',
+                    `autonomy_mode` VARCHAR(20) NOT NULL DEFAULT 'strong',
                     `agents` JSON DEFAULT NULL,
                     `preview_url` VARCHAR(500) DEFAULT NULL,
                     `logs` JSON DEFAULT NULL,
@@ -243,6 +253,15 @@ def init_table():
                     `command_history` JSON DEFAULT NULL,
                     `pipeline_runs` JSON DEFAULT NULL,
                     `events` JSON DEFAULT NULL,
+                    `pending_confirmation` JSON DEFAULT NULL,
+                    `pending_user_input` JSON DEFAULT NULL,
+                    `interventions` JSON DEFAULT NULL,
+                    `completion_report` JSON DEFAULT NULL,
+                    `active_intent_route` JSON DEFAULT NULL,
+                    `active_execution_plan` JSON DEFAULT NULL,
+                    `task_capability_profile` JSON DEFAULT NULL,
+                    `retrieval_plan` JSON DEFAULT NULL,
+                    `retrieval_guard` JSON DEFAULT NULL,
                     `queued_at` VARCHAR(40) DEFAULT NULL,
                     `lease_owner` VARCHAR(128) DEFAULT NULL,
                     `lease_until` DATETIME DEFAULT NULL,
@@ -276,6 +295,7 @@ def init_table():
             migrations = [
                 ("model", "VARCHAR(100) DEFAULT NULL"),
                 ("tool_policy", "VARCHAR(32) NOT NULL DEFAULT 'full_access'"),
+                ("autonomy_mode", "VARCHAR(20) NOT NULL DEFAULT 'strong'"),
                 ("review", "JSON DEFAULT NULL"),
                 ("phase_reviews", "JSON DEFAULT NULL"),
                 ("prototype", "JSON DEFAULT NULL"),
@@ -295,6 +315,15 @@ def init_table():
                 ("command_history", "JSON DEFAULT NULL"),
                 ("pipeline_runs", "JSON DEFAULT NULL"),
                 ("events", "JSON DEFAULT NULL"),
+                ("pending_confirmation", "JSON DEFAULT NULL"),
+                ("pending_user_input", "JSON DEFAULT NULL"),
+                ("interventions", "JSON DEFAULT NULL"),
+                ("completion_report", "JSON DEFAULT NULL"),
+                ("active_intent_route", "JSON DEFAULT NULL"),
+                ("active_execution_plan", "JSON DEFAULT NULL"),
+                ("task_capability_profile", "JSON DEFAULT NULL"),
+                ("retrieval_plan", "JSON DEFAULT NULL"),
+                ("retrieval_guard", "JSON DEFAULT NULL"),
                 ("queued_at", "VARCHAR(40) DEFAULT NULL"),
                 ("lease_owner", "VARCHAR(128) DEFAULT NULL"),
                 ("lease_until", "DATETIME DEFAULT NULL"),
@@ -344,7 +373,10 @@ def load_all_tasks(user_id: Optional[str] = None) -> list[dict]:
                            recommended_flow, prototype_required,
                            needs_continuation, pipeline_status, preview_status, preview_error,
                            command_history, pipeline_runs, queued_at,
-                           events,
+                           events, autonomy_mode, pending_confirmation, pending_user_input,
+                           interventions, completion_report, active_intent_route,
+                           active_execution_plan, task_capability_profile,
+                           retrieval_plan, retrieval_guard,
                            lease_owner, lease_until, created_at
                     FROM autocode_tasks
                     WHERE user_id = %s
@@ -362,7 +394,10 @@ def load_all_tasks(user_id: Optional[str] = None) -> list[dict]:
                            recommended_flow, prototype_required,
                            needs_continuation, pipeline_status, preview_status, preview_error,
                            command_history, pipeline_runs, queued_at,
-                           events,
+                           events, autonomy_mode, pending_confirmation, pending_user_input,
+                           interventions, completion_report, active_intent_route,
+                           active_execution_plan, task_capability_profile,
+                           retrieval_plan, retrieval_guard,
                            lease_owner, lease_until, created_at
                     FROM autocode_tasks
                     ORDER BY created_at DESC
@@ -384,6 +419,7 @@ def load_all_tasks(user_id: Optional[str] = None) -> list[dict]:
                 "harness_trace_id": row.get("harness_trace_id"),
                 "model": row.get("model"),
                 "tool_policy": row.get("tool_policy") or "full_access",
+                "autonomy_mode": row.get("autonomy_mode") or "strong",
                 "agents": _json_load(row["agents"], []),
                 "preview_url": row["preview_url"],
                 "logs": _json_load(row["logs"], []),
@@ -407,6 +443,15 @@ def load_all_tasks(user_id: Optional[str] = None) -> list[dict]:
                 "command_history": _json_load(row.get("command_history"), []),
                 "pipeline_runs": _json_load(row.get("pipeline_runs"), []),
                 "events": _json_load(row.get("events"), []),
+                "pending_confirmation": _json_load(row.get("pending_confirmation"), None),
+                "pending_user_input": _json_load(row.get("pending_user_input"), None),
+                "interventions": _json_load(row.get("interventions"), []),
+                "completion_report": _json_load(row.get("completion_report"), None),
+                "active_intent_route": _json_load(row.get("active_intent_route"), None),
+                "active_execution_plan": _json_load(row.get("active_execution_plan"), None),
+                "task_capability_profile": _json_load(row.get("task_capability_profile"), None),
+                "retrieval_plan": _json_load(row.get("retrieval_plan"), None),
+                "retrieval_guard": _json_load(row.get("retrieval_guard"), None),
                 "queued_at": row.get("queued_at"),
                 "lease_owner": row.get("lease_owner"),
                 "lease_until": row.get("lease_until").isoformat() if isinstance(row.get("lease_until"), datetime) else row.get("lease_until"),
@@ -459,18 +504,23 @@ def save_task(task: dict):
                 values["pipeline_runs"] = _json_dump([])
             if values["events"] is None:
                 values["events"] = _json_dump([])
+            if values["interventions"] is None:
+                values["interventions"] = _json_dump([])
 
             # 使用 UPSERT (INSERT ... ON DUPLICATE KEY UPDATE)
             cursor.execute("""
                 INSERT INTO autocode_tasks
                     (id, title, description, project_type, status, progress,
-                     current_step, workspace_id, user_id, harness_trace_id, model, tool_policy, agents, preview_url,
+                     current_step, workspace_id, user_id, harness_trace_id, model, tool_policy, autonomy_mode, agents, preview_url,
                      logs, commit_history, plan, review, phase_reviews, prototype,
                      plan_confirmed, prototype_confirmed, review_confirmed, current_subtask_id,
                      project_recon, complexity, recommended_flow, prototype_required,
                      needs_continuation, pipeline_status, preview_status, preview_error,
-                      command_history, pipeline_runs, queued_at, events)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                     command_history, pipeline_runs, queued_at, events,
+                     pending_confirmation, pending_user_input, interventions,
+                     completion_report, active_intent_route, active_execution_plan,
+                     task_capability_profile, retrieval_plan, retrieval_guard)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ON DUPLICATE KEY UPDATE
                     title = VALUES(title),
                     description = VALUES(description),
@@ -483,6 +533,7 @@ def save_task(task: dict):
                     harness_trace_id = VALUES(harness_trace_id),
                     model = VALUES(model),
                     tool_policy = VALUES(tool_policy),
+                    autonomy_mode = VALUES(autonomy_mode),
                     agents = VALUES(agents),
                     preview_url = VALUES(preview_url),
                     logs = VALUES(logs),
@@ -506,7 +557,16 @@ def save_task(task: dict):
                     command_history = VALUES(command_history),
                     pipeline_runs = VALUES(pipeline_runs),
                     queued_at = VALUES(queued_at),
-                    events = VALUES(events)
+                    events = VALUES(events),
+                    pending_confirmation = VALUES(pending_confirmation),
+                    pending_user_input = VALUES(pending_user_input),
+                    interventions = VALUES(interventions),
+                    completion_report = VALUES(completion_report),
+                    active_intent_route = VALUES(active_intent_route),
+                    active_execution_plan = VALUES(active_execution_plan),
+                    task_capability_profile = VALUES(task_capability_profile),
+                    retrieval_plan = VALUES(retrieval_plan),
+                    retrieval_guard = VALUES(retrieval_guard)
             """, (
                 db_task["id"],
                 db_task["title"],
@@ -520,6 +580,7 @@ def save_task(task: dict):
                 db_task.get("harness_trace_id"),
                 db_task.get("model"),
                 db_task.get("tool_policy") or "full_access",
+                db_task.get("autonomy_mode") or "strong",
                 values["agents"],
                 db_task.get("preview_url"),
                 values["logs"],
@@ -544,6 +605,15 @@ def save_task(task: dict):
                 values["pipeline_runs"],
                 db_task.get("queued_at"),
                 values["events"],
+                values["pending_confirmation"],
+                values["pending_user_input"],
+                values["interventions"],
+                values["completion_report"],
+                values["active_intent_route"],
+                values["active_execution_plan"],
+                values["task_capability_profile"],
+                values["retrieval_plan"],
+                values["retrieval_guard"],
             ))
     except Exception as e:
         logger.warning(f"[TaskRepo] MySQL save failed (data kept in memory): {e}")

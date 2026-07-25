@@ -3,6 +3,7 @@ package com.aiplatform.backend.service.provider;
 import com.aiplatform.backend.service.provider.alibaba.AlibabaTextAdapter;
 import com.aiplatform.backend.service.provider.anthropic.AnthropicTextAdapter;
 import com.aiplatform.backend.service.provider.google.GoogleTextAdapter;
+import com.aiplatform.backend.service.provider.openai.OpenAiResponsesAdapter;
 import com.aiplatform.backend.service.provider.openai.OpenAiTextAdapter;
 
 import java.util.Set;
@@ -30,24 +31,26 @@ public class ProviderAdapterFactory {
 
     // 单例适配器（无状态，可安全共享）
     private static final OpenAiTextAdapter OPENAI = new OpenAiTextAdapter();
+    private static final OpenAiResponsesAdapter OPENAI_RESPONSES = new OpenAiResponsesAdapter();
     private static final AlibabaTextAdapter ALIBABA = new AlibabaTextAdapter();
     private static final AnthropicTextAdapter ANTHROPIC = new AnthropicTextAdapter();
     private static final GoogleTextAdapter GOOGLE = new GoogleTextAdapter();
 
     /** 使用 OpenAI 兼容适配器的供应商集合 */
     private static final Set<String> OPENAI_COMPATIBLE = Set.of(
-            "OpenAI", "DeepSeek", "Baidu", "Zhipu",
-            "Mistral", "Cohere", "Custom", "Minimax"
+            "openai", "deepseek", "baidu", "zhipu",
+            "mistral", "cohere", "custom", "minimax",
+            "moonshot", "siliconflow", "openrouter"
     );
 
     /** 使用阿里云 DashScope 适配器的供应商集合 */
-    private static final Set<String> ALIBABA_NATIVE = Set.of("Alibaba");
+    private static final Set<String> ALIBABA_NATIVE = Set.of("alibaba", "dashscope", "qwen");
 
     /** 使用 Anthropic 原生适配器的供应商集合 */
-    private static final Set<String> ANTHROPIC_NATIVE = Set.of("Anthropic");
+    private static final Set<String> ANTHROPIC_NATIVE = Set.of("anthropic", "claude");
 
     /** 使用 Google 原生适配器的供应商集合 */
-    private static final Set<String> GOOGLE_NATIVE = Set.of("Google");
+    private static final Set<String> GOOGLE_NATIVE = Set.of("google", "gemini");
 
     /**
      * 获取供应商对应的适配器
@@ -56,16 +59,17 @@ public class ProviderAdapterFactory {
      * @return 适配器实例，未知供应商降级为 OpenAI 兼容
      */
     public static ProviderAdapter getAdapter(String provider) {
-        if (provider == null || provider.isBlank()) {
+        String normalized = normalizeProvider(provider);
+        if (normalized.isBlank()) {
             return OPENAI;
         }
-        if (ALIBABA_NATIVE.contains(provider)) {
+        if (ALIBABA_NATIVE.contains(normalized)) {
             return ALIBABA;
         }
-        if (ANTHROPIC_NATIVE.contains(provider)) {
+        if (ANTHROPIC_NATIVE.contains(normalized)) {
             return ANTHROPIC;
         }
-        if (GOOGLE_NATIVE.contains(provider)) {
+        if (GOOGLE_NATIVE.contains(normalized)) {
             return GOOGLE;
         }
         // 其余全部降级为 OpenAI 兼容
@@ -73,16 +77,48 @@ public class ProviderAdapterFactory {
     }
 
     /**
+     * 按出站接口格式 + 供应商获取适配器。
+     * <p>
+     * apiFormat 优先级高于 provider：当渠道显式指定 {@code responses} 或 {@code messages} 时，
+     * 无论 provider 是什么都使用对应格式的适配器；{@code chat_completions} 或空则回退到按
+     * provider 选择（{@link #getAdapter(String)}）。
+     *
+     * @param provider  供应商名称
+     * @param apiFormat 出站接口格式：chat_completions / responses / messages
+     * @return 适配器实例
+     */
+    public static ProviderAdapter getAdapter(String provider, String apiFormat) {
+        if (apiFormat != null && !apiFormat.isBlank()) {
+            switch (apiFormat.trim().toLowerCase()) {
+                case "responses":
+                    return OPENAI_RESPONSES;
+                case "messages":
+                    return ANTHROPIC;
+                case "chat_completions":
+                default:
+                    break;
+            }
+        }
+        return getAdapter(provider);
+    }
+
+    /**
      * 判断供应商是否使用 OpenAI 兼容格式
      */
     public static boolean isOpenAiCompatible(String provider) {
-        return provider == null || provider.isBlank() || OPENAI_COMPATIBLE.contains(provider);
+        String normalized = normalizeProvider(provider);
+        return normalized.isBlank() || OPENAI_COMPATIBLE.contains(normalized);
     }
 
     /**
      * 判断供应商是否需要原生适配器
      */
     public static boolean isNativeAdapter(String provider) {
-        return ANTHROPIC_NATIVE.contains(provider) || GOOGLE_NATIVE.contains(provider);
+        String normalized = normalizeProvider(provider);
+        return ANTHROPIC_NATIVE.contains(normalized) || GOOGLE_NATIVE.contains(normalized);
+    }
+
+    private static String normalizeProvider(String provider) {
+        return provider == null ? "" : provider.trim().toLowerCase();
     }
 }

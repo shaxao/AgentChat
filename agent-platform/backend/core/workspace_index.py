@@ -31,6 +31,7 @@ SOURCE_EXTENSIONS = {
 INDEX_DOCS = [
     ".autocode/PROJECT_PROFILE.md",
     ".autocode/PROJECT_MAP.md",
+    ".autocode/SURFACE_MAP.md",
     ".autocode/MEMORY.md",
     ".autocode/SESSION_SUMMARY.md",
     ".autocode/CI_REPORT.md",
@@ -236,16 +237,26 @@ def is_actionable_development_request(message: str) -> bool:
         "修复", "处理", "添加", "增加", "实现", "统一", "改为", "改成",
         "检查", "补全", "支持", "删除", "重命名", "优化", "调整",
         "fix", "add", "implement", "support", "rename", "remove", "update",
+        "\u4fee\u590d", "\u5904\u7406", "\u6dfb\u52a0", "\u589e\u52a0", "\u5b9e\u73b0", "\u5f00\u53d1",
+        "\u7edf\u4e00", "\u6539\u4e3a", "\u6539\u6210", "\u68c0\u67e5", "\u8865\u5168", "\u652f\u6301",
+        "\u5220\u9664", "\u79fb\u9664", "\u91cd\u547d\u540d", "\u4f18\u5316", "\u8c03\u6574", "\u76d1\u6d4b",
+        "\u68c0\u6d4b", "\u8b66\u544a",
     )
     code_markers = (
         "__main__", "parse_args", "validate", "filter_rows", "header_row",
         "args.", "def ", "class ", ".py", ".ts", ".tsx", ".js", ".java",
     )
+    product_markers = (
+        "\u524d\u540e\u7aef", "\u524d\u7aef", "\u540e\u7aef", "\u9875\u9762", "\u754c\u9762",
+        "\u529f\u80fd", "\u65b0\u529f\u80fd", "\u7fa4\u7ec4", "\u6d88\u606f", "\u914d\u7f6e",
+        "\u5165\u53e3", "\u83dc\u5355", "\u6309\u94ae", "\u8fd0\u884c", "\u672c\u5730\u6267\u884c",
+    )
     has_action = any(word.lower() in text.lower() for word in action_words)
     has_code_marker = any(marker.lower() in text.lower() for marker in code_markers)
+    has_product_marker = any(marker in text for marker in product_markers)
     has_identifier = re.search(r"\b[A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_][A-Za-z0-9_]*\b", text) is not None
     has_many_lines = len([line for line in text.splitlines() if line.strip()]) >= 3
-    return bool(has_action and (has_code_marker or has_identifier or has_many_lines))
+    return bool(has_action and (has_code_marker or has_identifier or has_many_lines or has_product_marker))
 
 
 def _changed_files_from_task(task: dict) -> list[str]:
@@ -310,13 +321,13 @@ def _score_file(path: Path, rel: str, terms: list[str], changed_files: list[str]
     return score, reasons
 
 
-def plan_retrieval(ws_path: Path, message: str, task: dict, *, max_files: int = 3) -> RetrievalPlan:
+def plan_retrieval(ws_path: Path, message: str, task: dict, *, max_files: int = 8) -> RetrievalPlan:
     index = load_workspace_index(ws_path)
     files = [ws_path / str(item.get("path")) for item in index.get("files") or [] if item.get("path")]
     terms = _tokenize(message)
     actionable = is_actionable_development_request(message)
     if actionable:
-        max_files = max(max_files, 6)
+        max_files = max(max_files, 12)
     changed_files = _changed_files_from_task(task)
 
     if not terms and changed_files:
@@ -356,7 +367,10 @@ def plan_retrieval(ws_path: Path, message: str, task: dict, *, max_files: int = 
         search_terms=terms,
         candidate_files=candidate_files[:max_files],
         index_docs=existing_docs,
-        read_budget=max(max_files, len(candidate_files[:max_files])),
+        # 读取预算 = 候选文件数 + 固定探索余量。候选是预打分的猜测，agent
+        # 常需读候选的邻居（基类、被 import 的模块、事件定义）才能落地改动，
+        # 预算太紧会逼 agent 用 code_editor view 绕过 read_file，既低效又污染编辑栈。
+        read_budget=max(max_files, len(candidate_files[:max_files])) + 8,
         rationale=rationale,
         total_files=len(files),
     )

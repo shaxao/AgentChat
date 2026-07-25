@@ -38,6 +38,12 @@ public class BillingPolicyResolver {
         }
 
         if (policy == null) policy = new BillingPolicy();
+        // 外部 OpenAI-compatible API 是按量业务：套餐额度耗尽/没有独立 API 额度时，
+        // 默认走用户钱包余额兜底，避免“请求成功但无法扣费”变成免费调用。
+        // 若后续需要禁止 API，可用 enabled=false 关闭整个 api 场景。
+        if ("api".equals(scene) && !policy.isWalletFallbackConfigured()) {
+            policy.setWalletFallbackEnabled(true);
+        }
         if (policy.getQuotaBucket() == null || policy.getQuotaBucket().isBlank()) {
             policy.setQuotaBucket(scene);
         }
@@ -65,6 +71,7 @@ public class BillingPolicyResolver {
             }
             if (node.has("walletFallbackEnabled")) {
                 policy.setWalletFallbackEnabled(node.path("walletFallbackEnabled").asBoolean(false));
+                policy.setWalletFallbackConfigured(true);
             }
             if (node.has("walletFallbackMonthlyLimit") && !node.path("walletFallbackMonthlyLimit").isNull()) {
                 policy.setWalletFallbackMonthlyLimit(new BigDecimal(node.path("walletFallbackMonthlyLimit").asText("0")));

@@ -1101,7 +1101,7 @@ export class AutoCodeIde {
     else if (attachmentPreviewClose) this.hideAttachmentPreview()
     else if (queuedCancel) this.cancelQueuedUserMessage(queuedCancel)
     else if (queuedPromote) this.promoteQueuedUserMessage(queuedPromote)
-    else if (queuedInsert) this.insertQueuedUserMessageIntoCurrentTurn(queuedInsert)
+    else if (queuedInsert) void this.insertQueuedUserMessageIntoCurrentTurn(queuedInsert)
     else if (startBuildPlan) void this.startBuildFromPlan(startBuildPlan)
     else if (planningFollowupAction) void this.handlePlanningFollowup(planningFollowupAction, planningFollowupMessage || '', button)
     else if (skipUpdate) void this.skipUpdateVersion(skipUpdate)
@@ -2318,6 +2318,7 @@ export class AutoCodeIde {
         error: String(call.error || (interrupted ? `会话已${restoredSessionStatus === 'cancelled' ? '停止' : '恢复'}，该工具未收到完成事件。` : '')),
         startedAt: String(call.startedAt || call.started_at || snapshot.updatedAt || new Date().toISOString()),
         finishedAt: String(call.finishedAt || call.finished_at || snapshot.updatedAt || new Date().toISOString()),
+        textAnchor: Number.isFinite(Number(call.textAnchor)) ? Number(call.textAnchor) : undefined,
       }
     }).slice(-80)
     this.state.agentRuntime.pendingPermissions = permissions.map((item: any) => ({
@@ -2491,6 +2492,7 @@ export class AutoCodeIde {
         'checkpoint_created',
         'checkpoint_reverted',
         'cancellation_requested',
+        'agent_injected_message',
         'memory_read',
         'memory_update_preview',
         'subagent_start',
@@ -4078,6 +4080,13 @@ export class AutoCodeIde {
       }
       return
     }
+    if (event.type === 'agent_injected_message') {
+      this.toast('已插入本轮，Agent 会在当前任务继续时读取', 'ok')
+      this.renderAssistant()
+      this.renderComposer()
+      this.scheduleSessionPersist()
+      return
+    }
     if (event.type === 'reasoning_delta') {
       this.state.agentRuntime.thinking = `${this.state.agentRuntime.thinking}${String(payload.content || '')}`.slice(-8000)
       this.activeTurnReasoning = `${this.activeTurnReasoning}${String(payload.content || '')}`.slice(-8000)
@@ -4102,6 +4111,7 @@ export class AutoCodeIde {
         output: payload.output,
         error: '',
         startedAt: event.at,
+        textAnchor: this.currentAssistantTextAnchor(),
         internal: payload.internal === true,
         patchDiagnostics: payload.patchDiagnostics || payload.diagnostics,
         subagent: isSubagentTool,
@@ -4144,6 +4154,7 @@ export class AutoCodeIde {
         error: String(payload.error || ''),
         startedAt: existing?.startedAt || event.at,
         finishedAt: finalStatus === 'ok' || finalStatus === 'error' ? event.at : undefined,
+        textAnchor: existing?.textAnchor ?? this.currentAssistantTextAnchor(),
         internal: Boolean(payload.internal || existing?.internal),
         patchDiagnostics: payload.patchDiagnostics || payload.diagnostics || existing?.patchDiagnostics,
         subagent: isSubagentTool,
@@ -4225,6 +4236,7 @@ export class AutoCodeIde {
           input: { target: permission.target },
           error: decision === 'deny' ? permission.reason : '',
           startedAt: event.at,
+          textAnchor: this.currentAssistantTextAnchor(),
         })
       }
       this.rememberActiveTurnTool(permission.id, event)
@@ -4850,6 +4862,15 @@ export class AutoCodeIde {
     this.pumpAssistantTyping()
   }
 
+  private currentAssistantTextAnchor() {
+    const message = this.activeAssistantMessageId
+      ? this.state.chat.find(item => item.id === this.activeAssistantMessageId)
+      : null
+    const text = String(message?.text || '')
+    const queued = this.assistantTypingMessageId === message?.id ? this.assistantTypingQueue : ''
+    return text.length + queued.length
+  }
+
   private ensureAssistantStreamMessage() {
     let message = this.activeAssistantMessageId
       ? this.state.chat.find(item => item.id === this.activeAssistantMessageId)
@@ -5109,6 +5130,7 @@ export class AutoCodeIde {
   }
 
   private queuedStatusLabel(status: string) {
+    if (status === 'injected') return '已插入本轮'
     if (status === 'processing') return '处理中'
     if (status === 'consumed') return '已处理'
     if (status === 'failed') return '处理失败'
@@ -5299,7 +5321,35 @@ export class AutoCodeIde {
     this.scheduleSessionPersist()
   }
 
-  private insertQueuedUserMessageIntoCurrentTurn(id: string) {
+  private async insertQueuedUserMessageIntoCurrentTurn(id: string) {
+    const queueItem = this.state.agentRuntime.queuedUserMessages.find(item => item.id === id && item.status === 'queued')
+    if (!queueItem) return
+    const sessionId = this.state.agentRuntime.sessionId
+    if (!sessionId) {
+      this.markQueuedMessages([id], 'failed', false, 'No active Agent session for injection.')
+      this.toast('当前没有可插入的 Agent 会话', 'error')
+      return
+    }
+    this.markQueuedMessages([id], 'processing')
+    this.renderAssistant()
+    this.renderComposer()
+    this.scheduleSessionPersist()
+    try {
+      await this.api.agentInject(sessionId, queueItem.text, queueItem.contextRefs || [])
+      this.markQueuedMessages([id], 'injected')
+      this.toast('已插入本轮，当前 Agent 继续时会读取这条补充', 'ok')
+      this.renderAssistant()
+      this.renderComposer()
+      this.scheduleSessionPersist()
+      return
+    } catch (error) {
+      this.markQueuedMessages([id], 'failed', false, String(error))
+      this.toast(`插入本轮失败：${String(error)}`, 'error')
+      this.renderAssistant()
+      this.renderComposer()
+      this.scheduleSessionPersist()
+      return
+    }
     const queue = [...this.state.agentRuntime.queuedUserMessages]
     const index = queue.findIndex(item => item.id === id && item.status === 'queued')
     if (index < 0) return
@@ -5318,7 +5368,7 @@ export class AutoCodeIde {
     this.scheduleSessionPersist()
   }
 
-  private markQueuedMessages(ids: string[] = [], status: 'processing' | 'consumed' | 'failed' | 'queued', removeFromQueue = false, error = '') {
+  private markQueuedMessages(ids: string[] = [], status: 'processing' | 'consumed' | 'failed' | 'queued' | 'injected', removeFromQueue = false, error = '') {
     if (!ids.length) return
     const idSet = new Set(ids)
     this.state.agentRuntime.queuedUserMessages = removeFromQueue
@@ -5773,6 +5823,7 @@ export class AutoCodeIde {
         error: String(call.error || ''),
         startedAt: String(call.startedAt || call.started_at || snapshot.updatedAt || new Date().toISOString()),
         finishedAt: String(call.finishedAt || call.finished_at || snapshot.updatedAt || new Date().toISOString()),
+        textAnchor: Number.isFinite(Number(call.textAnchor)) ? Number(call.textAnchor) : undefined,
       })).slice(-80)
     }
     if (!answer) return null
@@ -9140,6 +9191,88 @@ export class AutoCodeIde {
     return parts.join('\n')
   }
 
+  private renderMessageBodyFragment(raw: string, messageId: string, codeIndexRef: { value: number }, hasPatchPreviews = false) {
+    if (!raw.trim()) return ''
+    const parts = raw.split(/```([^\n`]*)\n([\s\S]*?)```/g)
+    return parts.map((part, index) => {
+      if (index % 3 === 1) return ''
+      if (index % 3 === 2) {
+        const lang = parts[index - 1]?.trim() || 'text'
+        const code = part
+        const id = `${messageId}:${codeIndexRef.value++}`
+        if (lang.toLowerCase() === 'mermaid') return this.renderMermaidBlock(code, 'mermaid')
+        const isDiff = lang.toLowerCase().includes('diff') || code.includes('\n+++ ') || code.includes('\n--- ') || code.includes('*** Begin Patch')
+        const showInlineApply = isDiff && !hasPatchPreviews
+        if (this.isRenderableHtmlSnippet(lang, code)) return this.renderRichText(this.htmlEntityDecode(code))
+        return `
+          <figure class="chat-code-block ${isDiff ? 'diff' : ''}">
+            <figcaption><span>${escapeHtml(lang)}</span><button data-copy-code="${escapeHtml(id)}">复制</button></figcaption>
+            <pre><code>${this.highlightCode(code, lang)}</code></pre>
+            ${showInlineApply ? `<footer class="message-action-bar code-actions"><button data-apply-patch="${escapeHtml(id)}">应用 patch</button></footer>` : ''}
+          </figure>
+        `
+      }
+      return this.renderRichText(part)
+    }).join('')
+  }
+
+  private renderMessageBodyWithInlineTools(message: AppState['chat'][number], raw: string, calls: ToolCallRecord[]) {
+    const unique = calls.filter((call, index, list) => list.findIndex(item => item.id === call.id) === index)
+    const toolCalls = this.normalizeToolTraceForRender(unique.filter(call => call.name !== 'question'))
+    if (!toolCalls.length) {
+      return this.renderMessageBodyFragment(raw, message.id, { value: 0 }, Boolean(message.patchPreviews?.length))
+    }
+    const anchored = toolCalls
+      .filter(call => Number.isFinite(Number(call.textAnchor)))
+      .map(call => ({
+        call,
+        anchor: Math.max(0, Math.min(raw.length, Math.floor(Number(call.textAnchor)))),
+      }))
+    if (!anchored.length) {
+      return [
+        this.renderMessageBodyFragment(raw, message.id, { value: 0 }, Boolean(message.patchPreviews?.length)),
+        this.renderMessageToolCalls(toolCalls),
+      ].join('')
+    }
+    const grouped = new Map<number, ToolCallRecord[]>()
+    for (const item of anchored) {
+      const group = grouped.get(item.anchor) || []
+      group.push(item.call)
+      grouped.set(item.anchor, group)
+    }
+    const anchoredIds = new Set(anchored.map(item => item.call.id))
+    const fallback = toolCalls.filter(call => !anchoredIds.has(call.id))
+    const codeIndexRef = { value: 0 }
+    let cursor = 0
+    let html = ''
+    for (const anchor of [...grouped.keys()].sort((a, b) => a - b)) {
+      html += this.renderMessageBodyFragment(raw.slice(cursor, anchor), message.id, codeIndexRef, Boolean(message.patchPreviews?.length))
+      html += this.renderInlineToolCallGroup(grouped.get(anchor) || [], anchor)
+      cursor = anchor
+    }
+    html += this.renderMessageBodyFragment(raw.slice(cursor), message.id, codeIndexRef, Boolean(message.patchPreviews?.length))
+    if (fallback.length) html += this.renderMessageToolCalls(fallback)
+    return html
+  }
+
+  private renderInlineToolCallGroup(calls: ToolCallRecord[], anchor: number) {
+    const toolCalls = this.normalizeToolTraceForRender(calls.filter(call => call.name !== 'question'))
+    if (!toolCalls.length) return ''
+    const running = toolCalls.some(call => call.status === 'running')
+    const approval = toolCalls.some(call => call.status === 'approval_required')
+    const failed = toolCalls.filter(call => call.status === 'error').length
+    const title = running ? '这段话正在调用工具' : approval ? '这段话需要工具授权' : '这段话调用的工具'
+    const detail = `${toolCalls.length} 个工具${failed ? ` · ${failed} 个失败` : ''}`
+    const groupId = `tools-inline-${toolCalls[0]?.id || anchor}`
+    const groupOpen = !this.collapsedToolGroupIds.has(groupId)
+    return `
+      <details class="message-tools inline ${running ? 'running' : ''}" data-tool-group-id="${escapeHtml(groupId)}" ${groupOpen ? 'open' : ''}>
+        <summary><header><strong>${escapeHtml(title)}</strong><span>${escapeHtml(detail)}</span></header></summary>
+        ${this.renderToolTrace(toolCalls)}
+      </details>
+    `
+  }
+
   private renderChatMessageContent(message: AppState['chat'][number]) {
     const messageId = message.id
     const text = this.repairMojibakeText(message.text)
@@ -9175,6 +9308,9 @@ export class AutoCodeIde {
     const tools = nonQuestionToolCalls.length
       ? this.renderMessageToolCalls(nonQuestionToolCalls)
       : ''
+    const inlineBody = raw.trim()
+      ? this.renderMessageBodyWithInlineTools(message, raw, nonQuestionToolCalls)
+      : tools
     const questions = questionCalls.length ? this.renderAgentQuestionCards(questionCalls) : ''
     const reasoning = message.role === 'assistant' && (message.reasoning || message.compactedSummary)
       ? this.renderMessageReasoning(message.reasoning || '', message.compactedSummary, message)
@@ -9191,7 +9327,7 @@ export class AutoCodeIde {
     const queueRecord = message.queued ? this.state.agentRuntime.queuedUserMessages.find(item => item.id === message.queued?.id) : null
     const insertedQueue = Boolean(message.text.startsWith('【插入本轮】') || queueRecord?.text?.startsWith('【插入本轮】'))
     const queued = message.queued
-      ? `<div class="queued-message-status ${escapeHtml(message.queued.status)}"><span>${escapeHtml(insertedQueue && message.queued.status === 'queued' ? '已插入本轮' : this.queuedStatusLabel(message.queued.status))}</span><small>${message.queued.status === 'queued' ? (insertedQueue ? '当前任务结束后优先作为本轮补充处理，不会打断正在执行的工具。' : '等当前任务完成后自动处理，不会打断正在执行的工具。') : message.queued.status === 'processing' ? '正在作为下一轮补充消息处理。' : message.queued.status === 'failed' ? escapeHtml(queueRecord?.error || '未能自动处理，可编辑后重发。') : '已被下一轮 Agent 消费。'}</small></div>`
+      ? `<div class="queued-message-status ${escapeHtml(message.queued.status)}"><span>${escapeHtml(insertedQueue && message.queued.status === 'queued' ? '已插入本轮' : this.queuedStatusLabel(message.queued.status))}</span><small>${message.queued.status === 'queued' ? (insertedQueue ? '当前任务结束后优先作为本轮补充处理，不会打断正在执行的工具。' : '等当前任务完成后自动处理，不会打断正在执行的工具。') : message.queued.status === 'processing' ? '正在提交到当前 Agent 会话。' : message.queued.status === 'injected' ? '已写入当前运行中的 Agent，本轮继续时会读取。' : message.queued.status === 'failed' ? escapeHtml(queueRecord?.error || '未能自动处理，可编辑后重发。') : '已被下一轮 Agent 消费。'}</small></div>`
       : ''
     const turnActions = message.role === 'assistant' && message.checkpointIds?.length
       ? `
@@ -9211,7 +9347,7 @@ export class AutoCodeIde {
     const planningFollowup = !planCard && !questions && this.shouldRenderPlanningFollowup(message, raw)
       ? this.renderPlanningFollowupCard(message)
       : ''
-    return `${queued}${reasoning}${tools}${planCard || body}${attachments}${turnActions}${patches}${permissions}${planningFollowup}${questions}`
+    return `${queued}${reasoning}${planCard ? `${tools}${planCard}` : inlineBody}${attachments}${turnActions}${patches}${permissions}${planningFollowup}${questions}`
   }
 
   private renderPlanOutputBlockedCard(message: AppState['chat'][number]) {

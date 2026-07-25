@@ -364,6 +364,7 @@ export type ToolCallRecord = {
   error?: string
   startedAt: string
   finishedAt?: string
+  textAnchor?: number
   subagent?: boolean
   subagentId?: string
   internal?: boolean
@@ -402,6 +403,7 @@ export type AgentEvent = {
     | 'checkpoint_created'
     | 'checkpoint_reverted'
     | 'cancellation_requested'
+    | 'agent_injected_message'
     | 'memory_read'
     | 'memory_update_preview'
     | 'memory_update_applied'
@@ -463,7 +465,7 @@ export type QueuedUserMessage = {
   attachments: Attachment[]
   contextRefs: unknown[]
   createdAt: string
-  status: 'queued' | 'processing' | 'consumed' | 'failed'
+  status: 'queued' | 'processing' | 'consumed' | 'failed' | 'injected'
   priority?: number
   error?: string
 }

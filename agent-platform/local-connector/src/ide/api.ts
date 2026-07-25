@@ -141,6 +141,14 @@ export class AutoCodeApi {
     })
   }
 
+  agentInject(sessionId: string, message: string, contextRefs: unknown[] = []) {
+    return invoke<any>('ide_agent_message_inject', {
+      sessionId,
+      message,
+      contextRefs,
+    })
+  }
+
   agentApprove(sessionId: string, approvalId: string, granted: boolean, scope = granted ? 'once' : 'deny') {
     return invoke<any>('ide_agent_tool_approve', {
       sessionId,

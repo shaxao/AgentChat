@@ -5495,6 +5495,320 @@ fn compact_agent_session(app: &AppHandle, session_id: &str, reason: &str) -> Res
     Ok(compacted)
 }
 
+fn compacted_agent_continuation_messages(
+    compacted: &Value,
+    system_prompt: Option<&str>,
+) -> Vec<IdeAiMessage> {
+    let system = system_prompt
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("You are AutoCode local IDE coding agent. Continue from the compacted task state below. Do not repeat tool calls that are already completed.");
+    vec![
+        IdeAiMessage::new("system", system),
+        IdeAiMessage::new(
+            "user",
+            format!(
+                "[compacted continuation]\n{}\n\nContinue the original task. Use tools if needed; output the final answer when complete.",
+                compacted
+                    .get("summary")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+            ),
+        ),
+    ]
+}
+
+fn agent_request_system_prompt(request: &IdeAiRequest) -> Option<&str> {
+    request
+        .messages
+        .iter()
+        .find(|message| message.role == "system" && !message.content.trim().is_empty())
+        .map(|message| message.content.as_str())
+}
+
+fn estimate_agent_request_tokens(request: &IdeAiRequest) -> u64 {
+    let chars = request.messages.iter().fold(0usize, |total, message| {
+        total
+            + message.role.chars().count()
+            + message.content.chars().count()
+            + message.reasoning_content.chars().count()
+            + message.tool_call_id.chars().count()
+            + serde_json::to_string(&message.tool_calls)
+                .map(|value| value.chars().count())
+                .unwrap_or(0)
+            + 32
+    });
+    ((chars + 3) / 4).max(request.messages.len() * 8) as u64
+}
+
+fn provider_model_context_window(provider: &str, model: &str) -> u64 {
+    let provider = provider.trim().to_ascii_lowercase();
+    let model = model.trim().to_ascii_lowercase();
+    if provider.contains("deepseek") || model.contains("deepseek") {
+        return 64_000;
+    }
+    if provider.contains("kimi") || model.contains("kimi") || model.contains("moonshot") {
+        return 128_000;
+    }
+    if provider.contains("anthropic") || model.contains("claude") {
+        return 200_000;
+    }
+    if provider.contains("openai")
+        || model.starts_with("gpt-5")
+        || model.starts_with("o1")
+        || model.starts_with("o3")
+        || model.starts_with("o4")
+    {
+        return 128_000;
+    }
+    64_000
+}
+
+fn value_context_window(value: &Value) -> Option<u64> {
+    for key in [
+        "context_window",
+        "contextWindow",
+        "context_tokens",
+        "contextTokens",
+        "max_context_tokens",
+        "maxContextTokens",
+        "max_input_tokens",
+        "maxInputTokens",
+    ] {
+        if let Some(window) = value.get(key).and_then(Value::as_u64).filter(|value| *value > 0) {
+            return Some(window);
+        }
+    }
+    None
+}
+
+fn model_capability_context_window(capabilities: &Value, model: &str) -> Option<u64> {
+    let model = model.trim();
+    if model.is_empty() {
+        return None;
+    }
+    for key in ["model_context_windows", "modelContextWindows", "contextWindows"] {
+        if let Some(window) = capabilities
+            .get(key)
+            .and_then(|value| value.get(model))
+            .and_then(Value::as_u64)
+            .filter(|value| *value > 0)
+        {
+            return Some(window);
+        }
+    }
+    for key in ["models", "modelCapabilities"] {
+        if let Some(window) = capabilities
+            .get(key)
+            .and_then(|value| value.get(model))
+            .and_then(value_context_window)
+        {
+            return Some(window);
+        }
+    }
+    None
+}
+
+fn channel_context_window(channel: &connector::ProviderChannel, selected_model: &str) -> u64 {
+    let model = selected_model
+        .trim()
+        .is_empty()
+        .then(|| select_channel_model(channel))
+        .flatten()
+        .unwrap_or_else(|| selected_model.trim().to_string());
+    if let Some(value) = model_capability_context_window(&channel.capabilities, &model) {
+        return value;
+    }
+    if let Some(value) = value_context_window(&channel.capabilities) {
+        return value;
+    }
+    provider_model_context_window(&channel.provider_type, &model)
+}
+
+fn channel_compaction_threshold(channel: &connector::ProviderChannel, selected_model: &str) -> u64 {
+    let window = channel_context_window(channel, selected_model).max(8_000);
+    let output_reserve = 8_000u64;
+    let working_window = window.saturating_sub(output_reserve).max(window / 2);
+    (working_window * 7 / 10).clamp(4_000, 1_000_000)
+}
+
+fn agent_compaction_threshold(settings: &connector::IdeSettings) -> u64 {
+    let settings_threshold = (if settings.auto_compact_threshold > 0 {
+        settings.auto_compact_threshold
+    } else if settings.context_budget > 0 {
+        settings.context_budget
+    } else {
+        24_000
+    })
+    .clamp(4_000, 1_000_000);
+    let selected_model = settings.model.trim();
+    let channel_threshold = provider_channel_candidates(settings, "agent", Some(selected_model))
+        .iter()
+        .map(|channel| channel_compaction_threshold(channel, selected_model))
+        .min()
+        .or_else(|| {
+            settings
+                .channels
+                .iter()
+                .filter(|channel| channel.enabled)
+                .map(|channel| channel_compaction_threshold(channel, selected_model))
+                .min()
+        })
+        .unwrap_or_else(|| {
+            let legacy = provider_model_context_window(&settings.provider_type, selected_model);
+            (legacy.saturating_sub(8_000).max(legacy / 2) * 7 / 10).clamp(4_000, 1_000_000)
+        });
+    settings_threshold.min(channel_threshold)
+}
+
+fn summarize_compaction_message_content(content: &str, max_chars: usize) -> String {
+    let count = content.chars().count();
+    if count <= max_chars {
+        return content.to_string();
+    }
+    let head_chars = max_chars / 2;
+    let tail_chars = max_chars.saturating_sub(head_chars);
+    let head = content.chars().take(head_chars).collect::<String>();
+    let tail = content
+        .chars()
+        .rev()
+        .take(tail_chars)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect::<String>();
+    format!("{head}\n...[middle truncated by AutoCode pre-request compaction: {count} chars]...\n{tail}")
+}
+
+fn build_request_compaction_summary(
+    request: &IdeAiRequest,
+    reason: &str,
+    estimated_tokens: u64,
+    threshold: u64,
+) -> Value {
+    let first_user = request
+        .messages
+        .iter()
+        .find(|message| message.role == "user" && !message.content.trim().is_empty());
+    let mut lines = Vec::new();
+    lines.push(format!("Reason: {reason}"));
+    lines.push(format!(
+        "Estimated request tokens before compaction: {estimated_tokens}; threshold: {threshold}"
+    ));
+    lines.push(format!("Message count before compaction: {}", request.messages.len()));
+    if let Some(message) = first_user {
+        lines.push(format!(
+            "\nOriginal user/task context:\n{}",
+            summarize_compaction_message_content(&message.content, 8_000)
+        ));
+    }
+    lines.push("\nRecent conversation and tool state:".to_string());
+    let recent_messages = request
+        .messages
+        .iter()
+        .enumerate()
+        .rev()
+        .take(14)
+        .collect::<Vec<_>>();
+    for (index, message) in recent_messages.into_iter().rev() {
+        if message.role == "system" {
+            continue;
+        }
+        let mut content = summarize_compaction_message_content(&message.content, 4_000);
+        if !message.tool_calls.is_empty() {
+            let tool_calls = serde_json::to_string(&message.tool_calls).unwrap_or_default();
+            if !tool_calls.is_empty() {
+                content.push_str("\n[tool_calls]\n");
+                content.push_str(&summarize_compaction_message_content(&tool_calls, 2_000));
+            }
+        }
+        lines.push(format!("- message #{index} role={}\n{}", message.role, content));
+    }
+    json!({
+        "id": format!("compact-{}", agent_now()),
+        "reason": reason,
+        "summary": lines.join("\n"),
+        "messageCount": request.messages.len(),
+        "estimatedTokens": estimated_tokens,
+        "threshold": threshold,
+        "createdAt": agent_now()
+    })
+}
+
+fn agent_request_already_compacted(request: &IdeAiRequest) -> bool {
+    request.messages.len() <= 2
+        && request
+            .messages
+            .iter()
+            .any(|message| message.content.contains("[compacted continuation]"))
+}
+
+fn compact_agent_request_before_send(
+    app: &AppHandle,
+    session_id: &str,
+    settings: &connector::IdeSettings,
+    request: &mut IdeAiRequest,
+    reason: &str,
+) -> Result<bool, String> {
+    if agent_request_already_compacted(request) {
+        return Ok(false);
+    }
+    let threshold = agent_compaction_threshold(settings);
+    let estimated_tokens = estimate_agent_request_tokens(request);
+    if estimated_tokens < threshold {
+        return Ok(false);
+    }
+    agent_emit(
+        app,
+        session_id,
+        "context_compaction_start",
+        json!({
+            "reason": reason,
+            "estimatedTokens": estimated_tokens,
+            "threshold": threshold
+        }),
+    );
+    let compacted = build_request_compaction_summary(request, reason, estimated_tokens, threshold);
+    let system_prompt = agent_request_system_prompt(request).map(str::to_string);
+    request.messages = compacted_agent_continuation_messages(&compacted, system_prompt.as_deref());
+    update_agent_session(app, session_id, |session| {
+        session["status"] = Value::String("running".to_string());
+        let count = session
+            .get("compactionCount")
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+            + 1;
+        session["compactionCount"] = json!(count);
+        session["compactedSummary"] = compacted.clone();
+        if let Some(items) = session.get_mut("compactions").and_then(Value::as_array_mut) {
+            items.push(compacted.clone());
+        } else {
+            session["compactions"] = json!([compacted.clone()]);
+        }
+        session["updatedAt"] = Value::String(agent_now());
+    });
+    agent_emit(
+        app,
+        session_id,
+        "context_compaction_result",
+        compacted.clone(),
+    );
+    agent_emit(
+        app,
+        session_id,
+        "provider_retry",
+        json!({
+            "channel": "Agent",
+            "model": provider_model(settings),
+            "reason": format!(
+                "Context compacted before provider request: estimated {} tokens exceeded threshold {}.",
+                estimated_tokens, threshold
+            )
+        }),
+    );
+    Ok(true)
+}
+
 fn memory_file_candidate_paths(root_path: &str) -> Vec<(String, String)> {
     let mut paths = vec![
         (
@@ -8248,16 +8562,25 @@ fn deepseek_reasoning_tool_compat_error(error: &str) -> bool {
             || lower.contains("messages"))
 }
 
+fn provider_timeout_error(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    lower.contains("agent stream request timed out")
+        || lower.contains("ai request timed out")
+        || lower.contains("request or operation timed out")
+        || lower.contains("operation timed out")
+}
+
 fn terminal_provider_request_error(error: &str) -> bool {
     let lower = error.to_ascii_lowercase();
     if lower.contains("agent stream completed without text or tool call") {
         return false;
     }
+    if provider_timeout_error(error) {
+        return false;
+    }
     let provider_request_failed = lower.contains("ai provider returned")
         || lower.contains("cannot connect to ai provider")
-        || lower.contains("agent stream request timed out")
         || lower.contains("agent stream request failed")
-        || lower.contains("ai request timed out")
         || lower.contains("ai request failed");
     provider_request_failed
         || lower.contains(" 500")
@@ -11816,6 +12139,7 @@ pub fn ide_agent_session_start(
         "checkpoints": [],
         "todos": [],
         "messages": [],
+        "pendingInjectedMessages": [],
         "toolCalls": [],
         "permissions": [],
         "permissionRules": [],
@@ -11865,6 +12189,7 @@ pub fn ide_agent_session_create(
         "checkpoints": [],
         "todos": [],
         "messages": [],
+        "pendingInjectedMessages": [],
         "toolCalls": [],
         "permissions": [],
         "permissionRules": [],
@@ -12037,6 +12362,72 @@ async fn agent_call_model(
 
 const AGENT_LOOP_MAX_STEPS: usize = 30;
 
+fn drain_pending_agent_injected_messages(
+    app: &AppHandle,
+    session_id: &str,
+) -> Vec<IdeAiMessage> {
+    let mut injected = Vec::new();
+    update_agent_session(app, session_id, |session| {
+        if let Some(items) = session
+            .get_mut("pendingInjectedMessages")
+            .and_then(Value::as_array_mut)
+        {
+            injected = items.drain(..).collect();
+        } else {
+            session["pendingInjectedMessages"] = json!([]);
+        }
+    });
+    injected
+        .into_iter()
+        .filter_map(|item| {
+            let content = item
+                .get("content")
+                .or_else(|| item.get("message"))
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim();
+            if content.is_empty() {
+                return None;
+            }
+            let context_refs = item
+                .get("contextRefs")
+                .or_else(|| item.get("context_refs"))
+                .cloned()
+                .unwrap_or_else(|| json!([]));
+            let mut message = format!(
+                "AutoCode runtime intervention: The user injected this message while the current Agent run was still active. Incorporate it into this same run before continuing. Do not defer it to a later queued turn.\n\n[Injected User Message]\n{}",
+                content
+            );
+            if context_refs.as_array().map(|items| !items.is_empty()).unwrap_or(false) {
+                message.push_str("\n\n[Injected Context References]\n");
+                message.push_str(&tail_chars(&context_refs.to_string(), 20000));
+            }
+            Some(IdeAiMessage::new("user", message))
+        })
+        .collect()
+}
+
+fn append_pending_agent_injected_messages(
+    app: &AppHandle,
+    session_id: &str,
+    ai_request: &mut IdeAiRequest,
+) -> usize {
+    let messages = drain_pending_agent_injected_messages(app, session_id);
+    let count = messages.len();
+    if count > 0 {
+        ai_request.messages.extend(messages);
+        agent_emit_phase(
+            app,
+            session_id,
+            "injected_message",
+            "running",
+            "Injected user message",
+            "User intervention was added to the current Agent turn.",
+        );
+    }
+    count
+}
+
 async fn run_agent_tool_loop(
     app: &AppHandle,
     session_id: &str,
@@ -12060,6 +12451,7 @@ async fn run_agent_tool_loop(
     let mut copy_paste_repair_used = false;
     let mut malformed_patch_repair_count = 0usize;
     let mut force_write_after_bad_patch = false;
+    let mut timeout_compaction_retry_used = false;
     loop {
         set_agent_session_status(app, session_id, "running");
         for step in step_base..AGENT_LOOP_MAX_STEPS {
@@ -12088,6 +12480,14 @@ async fn run_agent_tool_loop(
                 }
                 session["stepCount"] = json!(step + 1);
             });
+            compact_agent_request_before_send(
+                app,
+                session_id,
+                &settings,
+                &mut ai_request,
+                "pre_request_budget",
+            )?;
+            append_pending_agent_injected_messages(app, session_id, &mut ai_request);
             let turn = match agent_call_model(app, session_id, settings.clone(), ai_request.clone())
                 .await
             {
@@ -12104,7 +12504,33 @@ async fn run_agent_tool_loop(
                     finalize_agent_cancellation(app, session_id);
                     return Ok(last_response);
                 }
-                Err(err) => return Err(err),
+                Err(err) => {
+                    if !timeout_compaction_retry_used && provider_timeout_error(&err) {
+                        timeout_compaction_retry_used = true;
+                        agent_emit(
+                            app,
+                            session_id,
+                            "provider_retry",
+                            json!({
+                                "channel": "Agent",
+                                "model": provider_model(&settings),
+                                "reason": format!(
+                                    "{}; compacting oversized context and retrying once.",
+                                    err
+                                ),
+                            }),
+                        );
+                        let compacted = compact_agent_session(app, session_id, "provider_timeout")?;
+                        let system_prompt =
+                            agent_request_system_prompt(&ai_request).map(str::to_string);
+                        ai_request.messages = compacted_agent_continuation_messages(
+                            &compacted,
+                            system_prompt.as_deref(),
+                        );
+                        continue;
+                    }
+                    return Err(err);
+                }
             };
             let response = turn.response;
             let tool_requests = turn.tool_requests;
@@ -12130,6 +12556,26 @@ async fn run_agent_tool_loop(
                         "user",
                         "AutoCode runtime review: your last response included a substantial code block but no tool call. Re-evaluate the task semantics. If the requested outcome should change workspace files, call read_file/apply_patch/write now so the IDE can show a diff and ask for approval. If it is truly only an explanation or standalone snippet, return a final answer without modifying files.",
                     ));
+                    continue;
+                }
+                set_agent_session_status(app, session_id, "finalizing");
+                let injected_messages = drain_pending_agent_injected_messages(app, session_id);
+                if !injected_messages.is_empty() {
+                    if !response.answer.trim().is_empty() {
+                        ai_request
+                            .messages
+                            .push(IdeAiMessage::new("assistant", response.answer.clone()));
+                    }
+                    ai_request.messages.extend(injected_messages);
+                    agent_emit_phase(
+                        app,
+                        session_id,
+                        "injected_message",
+                        "running",
+                        "Injected user message",
+                        "User intervention arrived before finalization; continuing the current Agent turn.",
+                    );
+                    set_agent_session_status(app, session_id, "running");
                     continue;
                 }
                 set_agent_session_status(app, session_id, "completed");
@@ -12743,19 +13189,15 @@ async fn run_agent_tool_loop(
             }
             return Ok(last_response);
         }
-        ai_request.messages = vec![
-            IdeAiMessage::new(
-                "system",
-                "You are AutoCode local IDE coding agent. Continue from the compacted task state below. Do not repeat tool calls that are already completed.",
-            ),
-            IdeAiMessage::new(
-                "user",
-                format!(
-                    "[compacted continuation]\n{}\n\nContinue the original task. Use tools if needed; output the final answer when complete.",
-                    compacted.get("summary").and_then(Value::as_str).unwrap_or("")
+        let system_prompt = agent_request_system_prompt(&ai_request).map(str::to_string);
+        ai_request =
+            IdeAiRequest {
+                messages: compacted_agent_continuation_messages(
+                    &compacted,
+                    system_prompt.as_deref(),
                 ),
-            ),
-        ];
+                ..ai_request
+            };
         step_base = 0;
     }
 }
@@ -13547,6 +13989,103 @@ pub fn ide_agent_message_send(
     context_refs: Value,
 ) -> Result<Value, String> {
     ide_agent_send(app, session_id, settings, message, context_refs)
+}
+
+#[tauri::command]
+pub fn ide_agent_message_inject(
+    app: AppHandle,
+    session_id: String,
+    message: String,
+    context_refs: Value,
+) -> Result<Value, String> {
+    let content = message.trim().to_string();
+    if content.is_empty() {
+        return Err("injected message is empty".to_string());
+    }
+    let now = agent_now();
+    let injected_id = format!("agent-injected-{}", now);
+    let record = json!({
+        "id": injected_id,
+        "role": "user",
+        "content": content,
+        "contextRefs": context_refs,
+        "at": now,
+        "kind": "injected_user_message"
+    });
+    {
+        let state = app.state::<IdeRuntimeState>();
+        let mut sessions = state.agent_sessions.lock().unwrap();
+        let session = sessions
+            .get_mut(&session_id)
+            .ok_or_else(|| "agent session not found".to_string())?;
+        let status = session.get("status").and_then(Value::as_str).unwrap_or("");
+        let active_request_id = session
+            .get("activeRequestId")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let has_continuation = session
+            .get("pendingContinuation")
+            .map(|value| !value.is_null())
+            .unwrap_or(false);
+        if matches!(
+            status,
+            "idle" | "completed" | "cancelled" | "failed" | "finalizing"
+        ) {
+            return Err("agent is not accepting current-turn injections".to_string());
+        }
+        if active_request_id.trim().is_empty()
+            && !has_continuation
+            && !matches!(
+                status,
+                "running"
+                    | "compacting"
+                    | "waiting_permission"
+                    | "waiting_question"
+                    | "paused_step_limit"
+                    | "paused_patch_failed"
+            )
+        {
+            return Err("agent is not running; send a normal queued message instead".to_string());
+        }
+        if !session
+            .get("pendingInjectedMessages")
+            .and_then(Value::as_array)
+            .is_some()
+        {
+            session["pendingInjectedMessages"] = json!([]);
+        }
+        if let Some(items) = session
+            .get_mut("pendingInjectedMessages")
+            .and_then(Value::as_array_mut)
+        {
+            items.push(record.clone());
+        }
+        if let Some(messages) = session.get_mut("messages").and_then(Value::as_array_mut) {
+            messages.push(json!({
+                "role": "user",
+                "content": message,
+                "at": now,
+                "kind": "injected_user_message"
+            }));
+        }
+        session["updatedAt"] = Value::String(agent_now());
+        persist_agent_session_value(session);
+    }
+    agent_emit(
+        &app,
+        &session_id,
+        "agent_injected_message",
+        json!({
+            "id": injected_id,
+            "status": "queued_for_current_turn"
+        }),
+    );
+    Ok(json!({
+        "ok": true,
+        "injected": true,
+        "sessionId": session_id,
+        "id": injected_id
+    }))
 }
 
 #[tauri::command]

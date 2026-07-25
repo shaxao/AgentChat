@@ -4,7 +4,7 @@
 
 基于 **Tauri 2**（Rust 后端）+ **Vite**（TypeScript 前端）构建，内置 CodeMirror 6 编辑器、xterm.js 终端、预览浏览器、Git 面板和技能商店。
 
-- **版本：** 0.4.12
+- **版本：** 0.4.14
 - **标识符：** `com.muhuo.autocode.localconnector`
 - **产品名称：** AutoCode IDE
 
@@ -129,7 +129,7 @@ npm run build
 预期的 Windows 安装包路径：
 
 ```text
-src-tauri/target/release/bundle/nsis/AutoCode IDE_0.4.12_x64-setup.exe
+src-tauri/target/release/bundle/nsis/AutoCode IDE_0.4.14_x64-setup.exe
 ```
 
 #### 旧版 Python Runner

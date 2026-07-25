@@ -1700,7 +1700,8 @@ async fn stream_agent_model_turn(
     let model = provider_model(&settings);
     let url = endpoint_for(&settings)?;
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(180))
+        .connect_timeout(Duration::from_secs(20))
+        .timeout(Duration::from_secs(1800))
         .build()
         .map_err(|err| format!("failed to create agent stream client: {err}"))?;
     let mut payload = build_ai_payload(&settings, &request);

@@ -3409,33 +3409,49 @@ pub fn search_workspace(
 }
 
 pub fn open_workspace_in_explorer(path: &str) -> Result<(), String> {
-    let root = resolve_authorized_root(path)?;
-    open_folder(&root)
+    let target = PathBuf::from(path.trim())
+        .canonicalize()
+        .map_err(|err| format!("path is not accessible: {err}"))?;
+    open_path_in_explorer(&target)
 }
 
-fn open_folder(path: &Path) -> Result<(), String> {
+fn open_path_in_explorer(path: &Path) -> Result<(), String> {
     #[cfg(target_os = "windows")]
     {
-        Command::new("explorer")
-            .arg(path)
+        let mut command = Command::new("explorer");
+        if path.is_file() {
+            command.arg(format!("/select,{}", path.display()));
+        } else {
+            command.arg(path);
+        }
+        command
             .spawn()
-            .map_err(|err| format!("failed to open folder: {err}"))?;
+            .map_err(|err| format!("failed to open path in Explorer: {err}"))?;
         return Ok(());
     }
     #[cfg(target_os = "macos")]
     {
-        Command::new("open")
+        let mut command = Command::new("open");
+        if path.is_file() {
+            command.arg("-R");
+        }
+        command
             .arg(path)
             .spawn()
-            .map_err(|err| format!("failed to open folder: {err}"))?;
+            .map_err(|err| format!("failed to open path in Finder: {err}"))?;
         return Ok(());
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
+        let open_target = if path.is_file() {
+            path.parent().unwrap_or(path)
+        } else {
+            path
+        };
         Command::new("xdg-open")
-            .arg(path)
+            .arg(open_target)
             .spawn()
-            .map_err(|err| format!("failed to open folder: {err}"))?;
+            .map_err(|err| format!("failed to open path: {err}"))?;
         return Ok(());
     }
 }

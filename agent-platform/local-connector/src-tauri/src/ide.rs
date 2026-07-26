@@ -11288,25 +11288,13 @@ fn apply_question_answer_session_effects(
         && prompt_allows_global_scan_v2(answer)
         && question_answer_allows_v2(answer);
     if !focus_paths.is_empty() {
-        let mut merged = session
-            .get("focusPaths")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|item| item.as_str().map(normalize_agent_rel_path))
-            .filter(|item| !item.is_empty())
-            .collect::<Vec<_>>();
-        for path in &focus_paths {
-            if !merged.iter().any(|item| item == path) {
-                merged.push(path.clone());
-            }
-        }
-        merged.truncate(12);
-        session["focusPaths"] = json!(merged);
+        let mut next_focus = focus_paths.clone();
+        next_focus.truncate(12);
+        session["focusPaths"] = json!(next_focus);
     }
+    session["turnAllowGlobalScan"] = Value::Bool(allow_global);
     if allow_global {
-        session["turnAllowGlobalScan"] = Value::Bool(true);
+        session["focusPaths"] = json!([]);
     }
     json!({
         "answer": answer,
@@ -13620,22 +13608,11 @@ async fn run_agent_send_task(
     let allow_global_scan = prompt_allows_global_scan_v2(&message);
     update_agent_session(&app, &session_id, |session| {
         if !inferred_focus.is_empty() {
-            let mut merged = session
-                .get("focusPaths")
-                .and_then(Value::as_array)
-                .cloned()
-                .unwrap_or_default()
-                .into_iter()
-                .filter_map(|item| item.as_str().map(normalize_agent_rel_path))
-                .filter(|item| !item.is_empty())
-                .collect::<Vec<_>>();
-            for path in &inferred_focus {
-                if !merged.iter().any(|item| item == path) {
-                    merged.push(path.clone());
-                }
-            }
-            merged.truncate(8);
-            session["focusPaths"] = json!(merged);
+            let mut next_focus = inferred_focus.clone();
+            next_focus.truncate(8);
+            session["focusPaths"] = json!(next_focus);
+        } else {
+            session["focusPaths"] = json!([]);
         }
         session["turnToolBudget"] = json!({});
         session["turnToolCache"] = json!({});

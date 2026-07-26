@@ -1,10 +1,10 @@
 {
     "version":  "0.4.14",
-    "notes":  "AutoCode IDE 0.4.14 release.",
-    "pub_date":  "2026-07-25T15:05:18Z",
+    "notes":  "Fix wallet usage provider display and workspace focus handling.",
+    "pub_date":  "2026-07-26T04:13:29Z",
     "platforms":  {
                       "windows-x86_64":  {
-                                             "signature":  "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVTWGFKMkJpWC9wdG53emZBQlh2Y0xDaWhlekFneFZVWGU0Y2hMTGFCdjFqZk5ia21NckdZaHgvTUVQRlJSbjdxaHFEeTRueHByNURKRmdiSmVRU1EzY1p0VEFLcUc1S0E0PQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg0OTkxOTE3CWZpbGU6QXV0b0NvZGUgSURFXzAuNC4xNF94NjQtc2V0dXAuZXhlCitYeDJuL0NYNUtZdW5uMjhSVW9NWUFZRnZKeE9PK1B6ZVZlRVlzbHZteVVKSWs4QmtTS1h5V2hSTW1LazIrZEg0cEZTOWlFUUFKbTlLYVlIZ29uREFnPT0K",
+                                             "signature":  "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVTWGFKMkJpWC9wdGtOeDVWc1lSMzVKYzZHWmhKYkllRW0yWERPaWRmcFM2VHQrK25rRW9KczFlUndPbm03RjR3WUFzdlQ4Qlp6bXdHSDlCMzJMMmdVcHhicHYvaXZsQVFFPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg1MDM5MjA5CWZpbGU6QXV0b0NvZGUgSURFXzAuNC4xNF94NjQtc2V0dXAuZXhlClpEeEp2TDhGR3VDTURhbDVWNDFUdkR1STVYTjlkM3BXeThDY1p2RFdCckloamRLVy9ZcnU0WVZtc2NXREtZUTV4SG9BeURTZ0M0RXE5LzdsbWc4bkJ3PT0K",
                                              "url":  "https://muhuo.site/downloads/autocode/AutoCode-IDE-0.4.14-x64-setup.exe"
                                          }
                   }

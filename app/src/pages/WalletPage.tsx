@@ -314,7 +314,7 @@ export default function WalletPage({ onNavigate }: WalletPageProps) {
                   <thead className="bg-muted/50 border-b">
                     <tr>
                       <th className="px-4 py-3 text-left text-xs font-medium text-muted-foreground">模型</th>
-                      <th className="px-4 py-3 text-left text-xs font-medium text-muted-foreground">来源/渠道</th>
+                      <th className="px-4 py-3 text-left text-xs font-medium text-muted-foreground">来源/供应商</th>
                       <th className="px-4 py-3 text-left text-xs font-medium text-muted-foreground">输入</th>
                       <th className="px-4 py-3 text-left text-xs font-medium text-muted-foreground">缓存</th>
                       <th className="px-4 py-3 text-left text-xs font-medium text-muted-foreground">输出</th>
@@ -331,7 +331,7 @@ export default function WalletPage({ onNavigate }: WalletPageProps) {
                         <td className="px-4 py-2.5 font-mono text-xs">{log.model}</td>
                         <td className="px-4 py-2.5 text-xs">
                           <div>{SCENE_LABEL[log.sceneType] || log.sceneType || '对话'}</div>
-                          <div className="text-muted-foreground font-mono">{[log.provider, log.channelName || log.channelId].filter(Boolean).join(' / ') || '-'}</div>
+                          <div className="text-muted-foreground font-mono">{log.provider || '-'}</div>
                         </td>
                         <td className="px-4 py-2.5 font-mono text-xs">{tokens(log.inputTokens)}</td>
                         <td className="px-4 py-2.5 font-mono text-xs">{tokens(log.cachedInputTokens)}</td>
@@ -421,7 +421,7 @@ export default function WalletPage({ onNavigate }: WalletPageProps) {
                   ['输入价', price(detailLog.inputPrice)],
                   ['缓存输入价', price(detailLog.cachedInputPrice)],
                   ['输出价', price(detailLog.outputPrice)],
-                  ['渠道', [detailLog.provider, detailLog.channelName || detailLog.channelId].filter(Boolean).join(' / ') || '-'],
+                  ['供应商', detailLog.provider || '-'],
                 ].map(([label, value]) => (
                   <div key={label} className="bg-muted/50 rounded-lg p-3 min-w-0">
                     <p className="text-xs text-muted-foreground mb-1">{label}</p>
